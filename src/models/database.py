@@ -1,55 +1,48 @@
+"""v1.13 compatibility facade for the legacy function API.
+
+New code should use ``src.services`` and the repository/query modules.  The
+functions in this module remain available for one compatibility release.
 """
-数据库模型定义：机型、批次库存、客户、报价记录
-"""
 
-import sqlite3
-import os
-import sys
-import shutil
-from datetime import datetime
+from pathlib import Path
 
-BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "backup")
-MAX_BACKUPS = 30
+from src.models.connection import (
+    BACKUP_DIR,
+    DB_PATH,
+    MAX_BACKUPS,
+    connect,
+    create_backup,
+    get_app_path,
+    get_data_dir,
+)
+from src.models.migrations import DatabaseMigrationError, migrate_database
+from src.models.repositories import (
+    add_allocation,
+    audit,
+    cents_to_yuan,
+    insert_payment,
+    soft_delete,
+    sync_quote_payment_state,
+    yuan_to_cents,
+)
 
-def get_app_path():
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-
-APP_DATA_DIR = os.path.join(get_app_path(), "data")
-DB_PATH = os.path.join(APP_DATA_DIR, "diaohuo.db")
+APP_DATA_DIR = str(get_data_dir())
 
 
 def get_connection():
-    os.makedirs(APP_DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    # Keep DB_PATH patchable for existing integrations and tests.
+    return connect(DB_PATH)
 
 
 def backup_database():
-    """自动备份数据库，保留最近MAX_BACKUPS个备份"""
+    """Create a WAL-safe backup while preserving the legacy return shape."""
     try:
-        os.makedirs(BACKUP_DIR, exist_ok=True)
-        
-        if not os.path.exists(DB_PATH):
+        info = create_backup(DB_PATH)
+        if info is None:
             return True, "数据库文件不存在，跳过备份"
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = os.path.join(BACKUP_DIR, f"diaohuo_backup_{timestamp}.db")
-        
-        shutil.copy2(DB_PATH, backup_path)
-        
-        backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("diaohuo_backup_")], reverse=True)
-        if len(backups) > MAX_BACKUPS:
-            for old_backup in backups[MAX_BACKUPS:]:
-                os.remove(os.path.join(BACKUP_DIR, old_backup))
-        
-        return True, f"备份成功: {os.path.basename(backup_path)}"
-    except Exception as e:
-        return False, f"备份失败: {str(e)}"
+        return True, f"备份成功: {info.path.name}"
+    except Exception as exc:
+        return False, f"备份失败: {exc}"
 
 
 def verify_data_integrity():
@@ -86,7 +79,7 @@ def verify_data_integrity():
 
         # 检查负数供应商余额
         neg_supplier = conn.execute(
-            "SELECT id, name, balance FROM suppliers WHERE balance < 0"
+            "SELECT id, name, balance FROM suppliers WHERE balance_cents < -1"
         ).fetchall()
         for ns in neg_supplier:
             issues.append(f"负数供应商余额: supplier_id={ns['id']}, name={ns['name']}, balance={ns['balance']}")
@@ -99,245 +92,16 @@ def verify_data_integrity():
 
 
 def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.executescript("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            series TEXT NOT NULL,          -- 系列，如 Y7000P、小新Pro16
-            cpu TEXT,                      -- CPU 型号
-            ram TEXT,                      -- 内存
-            storage TEXT,                  -- 硬盘
-            gpu TEXT,                      -- 显卡
-            screen TEXT,                   -- 屏幕尺寸
-            note TEXT,                     -- 备注（颜色、新品等）
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS batches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            purchase_price REAL NOT NULL,  -- 购入价
-            quantity INTEGER NOT NULL,     -- 进货数量
-            remaining INTEGER NOT NULL,    -- 剩余数量
-            date TEXT NOT NULL,            -- 入库日期 YYYY-MM-DD
-            remark TEXT,                   -- 备注（含税/未税等）
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS customers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            wechat TEXT,
-            qq TEXT,
-            phone TEXT,
-            note TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS suppliers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            wechat TEXT,
-            qq TEXT,
-            phone TEXT,
-            note TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS quotes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            batch_id INTEGER NOT NULL,
-            customer_id INTEGER,
-            quote_price REAL NOT NULL,      -- 对外报价
-            quote_quantity INTEGER NOT NULL DEFAULT 1,  -- 报价数量
-            quote_date TEXT NOT NULL,       -- 报价日期 YYYY-MM-DD
-            remark TEXT,                    -- 备注
-            paid TEXT,                      -- 是否打款（是/否）
-            status TEXT DEFAULT '待确认',   -- 状态：待确认/已报价/已出库/已收款/已取消
-            received_amount REAL DEFAULT 0, -- 已收金额
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (batch_id) REFERENCES batches(id),
-            FOREIGN KEY (customer_id) REFERENCES customers(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            quote_id INTEGER,
-            customer_id INTEGER,
-            supplier_id INTEGER,
-            type TEXT NOT NULL,             -- 'receivable' 收款 / 'payable' 付款
-            amount REAL NOT NULL,
-            pay_date TEXT,
-            method TEXT,                    -- 现金/转账/微信/支付宝
-            remark TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (quote_id) REFERENCES quotes(id),
-            FOREIGN KEY (customer_id) REFERENCES customers(id),
-            FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
-        );
-    """)
-    
-    cursor.execute("PRAGMA table_info(quotes)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if "paid" not in columns:
-        try:
-            cursor.execute("ALTER TABLE quotes ADD COLUMN paid TEXT")
-            cursor.execute("UPDATE quotes SET paid='否' WHERE paid IS NULL")
-        except:
-            pass
-    
-    if "quote_quantity" not in columns:
-        try:
-            cursor.execute("ALTER TABLE quotes ADD COLUMN quote_quantity INTEGER DEFAULT 1")
-            cursor.execute("UPDATE quotes SET quote_quantity=1 WHERE quote_quantity IS NULL")
-        except:
-            pass
-    
-    cursor.execute("PRAGMA table_info(batches)")
-    batch_columns = [col[1] for col in cursor.fetchall()]
-    if "remark" not in batch_columns:
-        try:
-            cursor.execute("ALTER TABLE batches ADD COLUMN remark TEXT")
-        except:
-            pass
-
-    if "supplier_id" not in batch_columns:
-        try:
-            cursor.execute("ALTER TABLE batches ADD COLUMN supplier_id INTEGER REFERENCES suppliers(id)")
-        except:
-            pass
-
-    if "sn_list" not in batch_columns:
-        try:
-            cursor.execute("ALTER TABLE batches ADD COLUMN sn_list TEXT")
-        except:
-            pass
-
-    if "status" not in columns:
-        try:
-            cursor.execute("ALTER TABLE quotes ADD COLUMN status TEXT DEFAULT '待确认'")
-            cursor.execute("UPDATE quotes SET status='待确认' WHERE status IS NULL")
-        except:
-            pass
-
-    if "received_amount" not in columns:
-        try:
-            cursor.execute("ALTER TABLE quotes ADD COLUMN received_amount REAL DEFAULT 0")
-        except:
-            pass
-
-    if "sn_list" not in columns:
-        try:
-            cursor.execute("ALTER TABLE quotes ADD COLUMN sn_list TEXT")
-        except:
-            pass
-
-    cursor.execute("PRAGMA table_info(customers)")
-    customer_cols = [col[1] for col in cursor.fetchall()]
-    if "balance" not in customer_cols:
-        try:
-            cursor.execute("ALTER TABLE customers ADD COLUMN balance REAL DEFAULT 0")
-        except:
-            pass
-
-    cursor.execute("PRAGMA table_info(suppliers)")
-    supplier_cols = [col[1] for col in cursor.fetchall()]
-    if "balance" not in supplier_cols:
-        try:
-            cursor.execute("ALTER TABLE suppliers ADD COLUMN balance REAL DEFAULT 0")
-        except:
-            pass
-    
-    try:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS operation_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                operation TEXT NOT NULL,
-                table_name TEXT NOT NULL,
-                record_id INTEGER,
-                description TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    except:
-        pass
-
-    # 价格快照表（Skill 2: 价格异动哨兵）
-    try:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS price_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                import_date TEXT NOT NULL,
-                item_count INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS price_snapshot_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_id INTEGER NOT NULL,
-                series TEXT,
-                cpu TEXT,
-                ram TEXT,
-                storage TEXT,
-                gpu TEXT,
-                note TEXT,
-                norm_key TEXT,
-                FOREIGN KEY (snapshot_id) REFERENCES price_snapshots(id) ON DELETE CASCADE
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_date ON price_snapshots(import_date)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_items ON price_snapshot_items(snapshot_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_normkey ON price_snapshot_items(norm_key)")
-    except:
-        pass
-    
-    try:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_products_series ON products(series)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_quotes_date ON quotes(quote_date)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_quotes_customer ON quotes(customer_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_logs_time ON operation_logs(created_at)")
-    except:
-        pass
-    
-    # v1.11 价税覆盖层
-    cursor.execute("PRAGMA table_info(quotes)")
-    quote_cols = [col[1] for col in cursor.fetchall()]
-    for col, col_def in [
-        ("tax_rate", "REAL DEFAULT NULL"),
-        ("purchase_tax_inclusive", "INTEGER DEFAULT 0"),
-        ("quote_tax_inclusive", "INTEGER DEFAULT 0"),
-    ]:
-        if col not in quote_cols:
-            try:
-                cursor.execute(f"ALTER TABLE quotes ADD COLUMN {col} {col_def}")
-            except sqlite3.OperationalError:
-                pass
-
-    cursor.execute("PRAGMA table_info(customers)")
-    cust_cols = [col[1] for col in cursor.fetchall()]
-    if "default_tax_rate" not in cust_cols:
-        try:
-            cursor.execute("ALTER TABLE customers ADD COLUMN default_tax_rate REAL DEFAULT NULL")
-        except sqlite3.OperationalError:
-            pass
-
-    conn.commit()
-    conn.close()
-
-    # 启动时自动备份
-    backup_database()
-
-    # 启动时数据完整性检查
+    """Migrate automatically, fail closed, then create a normal startup backup."""
+    backup = migrate_database(Path(DB_PATH))
     is_clean, issues = verify_data_integrity()
     if not is_clean:
-        for issue in issues:
-            print(f"[数据完整性] {issue}", file=sys.stderr)
-
-    return True, "数据库初始化成功"
+        raise DatabaseMigrationError("；".join(issues), backup)
+    ok, message = backup_database()
+    if not ok:
+        return True, f"数据库初始化成功；{message}"
+    migration_note = f"；迁移备份: {backup.path.name}" if backup else ""
+    return True, f"数据库初始化成功{migration_note}；{message}"
 
 
 # ---------- 机型管理 ----------
@@ -365,38 +129,35 @@ def update_product(pid, series, cpu, ram, storage, gpu, screen, note):
 
 
 def delete_product(pid):
-    """
-    删除机型，级联删除关联数据
-
-    特殊处理：
-    - 回滚各关联批次的供应商欠款
-    - 级联删除报价和付款记录
-    """
+    """Soft-delete a product and its active batches without erasing history."""
     conn = get_connection()
     try:
-        conn.execute("PRAGMA foreign_keys = OFF")
-
-        # 先回滚各批次的供应商欠款
-        batch_rows = conn.execute(
-            "SELECT supplier_id, purchase_price, quantity FROM batches WHERE product_id=? AND supplier_id IS NOT NULL",
-            (pid,)
-        ).fetchall()
-        for row in batch_rows:
-            total = row["purchase_price"] * row["quantity"]
-            conn.execute(
-                "UPDATE suppliers SET balance = balance - ? WHERE id=?",
-                (total, row["supplier_id"])
-            )
-
-        conn.execute("DELETE FROM payments WHERE quote_id IN (SELECT id FROM quotes WHERE batch_id IN (SELECT id FROM batches WHERE product_id=?))", (pid,))
-        conn.execute("DELETE FROM quotes WHERE batch_id IN (SELECT id FROM batches WHERE product_id=?)", (pid,))
-        conn.execute("DELETE FROM batches WHERE product_id=?", (pid,))
-        conn.execute("DELETE FROM products WHERE id=?", (pid,))
-        conn.execute("PRAGMA foreign_keys = ON")
+        soft_delete(conn, "products", pid, "用户删除机型")
+        for row in conn.execute(
+            "SELECT id,supplier_id,purchase_price,purchase_price_cents,quantity "
+            "FROM batches WHERE product_id=? AND deleted_at IS NULL", (pid,)
+        ):
+            if row["supplier_id"]:
+                conn.execute(
+                    "UPDATE suppliers SET balance=balance-?, balance_cents=balance_cents-? "
+                    "WHERE id=?",
+                    (
+                        row["purchase_price"] * row["quantity"],
+                        row["purchase_price_cents"] * row["quantity"],
+                        row["supplier_id"],
+                    ),
+                )
+            soft_delete(conn, "batches", row["id"], "所属机型已删除")
+            for quote in conn.execute(
+                "SELECT id,status FROM quotes WHERE batch_id=? AND deleted_at IS NULL",
+                (row["id"],),
+            ):
+                if quote["status"] in ("待确认", "已取消"):
+                    soft_delete(conn, "quotes", quote["id"], "所属机型已删除")
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        raise e
+        raise
     finally:
         conn.close()
 
@@ -408,7 +169,8 @@ def search_products(keyword):
         """
         SELECT id, series, cpu, ram, storage, gpu, screen, note
         FROM products
-        WHERE series LIKE ? OR cpu LIKE ? OR ram LIKE ? OR storage LIKE ? OR gpu LIKE ? OR screen LIKE ? OR note LIKE ?
+        WHERE deleted_at IS NULL AND
+              (series LIKE ? OR cpu LIKE ? OR ram LIKE ? OR storage LIKE ? OR gpu LIKE ? OR screen LIKE ? OR note LIKE ?)
         ORDER BY series, cpu
         """,
         (like, like, like, like, like, like, like),
@@ -420,7 +182,8 @@ def search_products(keyword):
 def get_all_products():
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, series, cpu, ram, storage, gpu, screen, note FROM products ORDER BY series, cpu"
+        "SELECT id, series, cpu, ram, storage, gpu, screen, note "
+        "FROM products WHERE deleted_at IS NULL ORDER BY series, cpu"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -430,14 +193,16 @@ def get_all_products():
 
 def add_batch(product_id, purchase_price, quantity, remaining, date_str, remark="", supplier_id=None, sn_list=""):
     conn = get_connection()
+    price_cents = yuan_to_cents(purchase_price)
     conn.execute(
-        "INSERT INTO batches (product_id, purchase_price, quantity, remaining, date, remark, supplier_id, sn_list) VALUES (?,?,?,?,?,?,?,?)",
-        (product_id, purchase_price, quantity, remaining, date_str, remark, supplier_id, sn_list),
+        "INSERT INTO batches (product_id, purchase_price, purchase_price_cents, quantity, remaining, date, remark, supplier_id, sn_list) VALUES (?,?,?,?,?,?,?,?,?)",
+        (product_id, purchase_price, price_cents, quantity, remaining, date_str, remark, supplier_id, sn_list),
     )
     if supplier_id:
         conn.execute(
-            "UPDATE suppliers SET balance = COALESCE(balance, 0) + ? WHERE id=?",
-            (purchase_price * quantity, supplier_id),
+            "UPDATE suppliers SET balance=COALESCE(balance,0)+?, "
+            "balance_cents=COALESCE(balance_cents,0)+? WHERE id=?",
+            (purchase_price * quantity, price_cents * quantity, supplier_id),
         )
     conn.commit()
     bid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -448,7 +213,10 @@ def add_batch(product_id, purchase_price, quantity, remaining, date_str, remark=
 def get_batches(product_id):
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, product_id, purchase_price, quantity, remaining, date, remark, supplier_id, sn_list FROM batches WHERE product_id=? ORDER BY date DESC, id DESC",
+        "SELECT b.id, b.product_id, b.purchase_price, b.quantity, b.remaining, "
+        "b.date, b.remark, CASE WHEN s.deleted_at IS NULL THEN b.supplier_id END AS supplier_id, "
+        "b.sn_list FROM batches b LEFT JOIN suppliers s ON b.supplier_id=s.id "
+        "WHERE b.product_id=? AND b.deleted_at IS NULL ORDER BY b.date DESC, b.id DESC",
         (product_id,),
     ).fetchall()
     conn.close()
@@ -495,38 +263,35 @@ def get_batch_remaining(batch_id):
 
 
 def delete_batch(batch_id):
-    """
-    删除批次
-
-    特殊处理：
-    - 回滚供应商欠款（如果批次有关联供应商）
-    - 级联删除关联的报价和付款记录
-    """
+    """Soft-delete a batch while retaining orders and ledger history."""
     conn = get_connection()
     try:
-        # 先查询批次信息，用于回滚供应商欠款
         row = conn.execute(
-            "SELECT supplier_id, purchase_price, quantity FROM batches WHERE id=?", (batch_id,)
+            "SELECT supplier_id,purchase_price,purchase_price_cents,quantity "
+            "FROM batches WHERE id=? AND deleted_at IS NULL",
+            (batch_id,),
         ).fetchone()
-
-        conn.execute("PRAGMA foreign_keys = OFF")
-
-        # 回滚供应商欠款
-        if row and row[0]:
-            total = row[1] * row[2]
+        if row and row["supplier_id"]:
             conn.execute(
-                "UPDATE suppliers SET balance = balance - ? WHERE id=?",
-                (total, row[0])
+                "UPDATE suppliers SET balance=balance-?, balance_cents=balance_cents-? "
+                "WHERE id=?",
+                (
+                    row["purchase_price"] * row["quantity"],
+                    row["purchase_price_cents"] * row["quantity"],
+                    row["supplier_id"],
+                ),
             )
-
-        conn.execute("DELETE FROM payments WHERE quote_id IN (SELECT id FROM quotes WHERE batch_id=?)", (batch_id,))
-        conn.execute("DELETE FROM quotes WHERE batch_id=?", (batch_id,))
-        conn.execute("DELETE FROM batches WHERE id=?", (batch_id,))
-        conn.execute("PRAGMA foreign_keys = ON")
+        soft_delete(conn, "batches", batch_id, "用户删除批次")
+        for quote in conn.execute(
+            "SELECT id,status FROM quotes WHERE batch_id=? AND deleted_at IS NULL",
+            (batch_id,),
+        ):
+            if quote["status"] in ("待确认", "已取消"):
+                soft_delete(conn, "quotes", quote["id"], "所属批次已删除")
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        raise e
+        raise
     finally:
         conn.close()
 
@@ -534,7 +299,8 @@ def delete_batch(batch_id):
 def get_total_remaining(product_id):
     conn = get_connection()
     row = conn.execute(
-        "SELECT COALESCE(SUM(remaining),0) FROM batches WHERE product_id=?", (product_id,)
+        "SELECT COALESCE(SUM(remaining),0) FROM batches "
+        "WHERE product_id=? AND deleted_at IS NULL", (product_id,)
     ).fetchone()[0]
     conn.close()
     return row
@@ -558,7 +324,9 @@ def search_customers(keyword):
     conn = get_connection()
     kw = f"%{keyword}%"
     rows = conn.execute(
-        "SELECT id, name, wechat, qq, phone, note FROM customers WHERE name LIKE ? OR wechat LIKE ? OR qq LIKE ? OR phone LIKE ? OR note LIKE ? ORDER BY name",
+        "SELECT id, name, wechat, qq, phone, note FROM customers "
+        "WHERE deleted_at IS NULL AND "
+        "(name LIKE ? OR wechat LIKE ? OR qq LIKE ? OR phone LIKE ? OR note LIKE ?) ORDER BY name",
         (kw, kw, kw, kw, kw),
     ).fetchall()
     conn.close()
@@ -568,7 +336,8 @@ def search_customers(keyword):
 def get_all_customers():
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, name, wechat, qq, phone, note FROM customers ORDER BY name"
+        "SELECT id, name, wechat, qq, phone, note FROM customers "
+        "WHERE deleted_at IS NULL ORDER BY name"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -592,7 +361,9 @@ def search_suppliers(keyword):
     conn = get_connection()
     kw = f"%{keyword}%"
     rows = conn.execute(
-        "SELECT id, name, wechat, qq, phone, note FROM suppliers WHERE name LIKE ? OR wechat LIKE ? OR qq LIKE ? OR phone LIKE ? OR note LIKE ? ORDER BY name",
+        "SELECT id, name, wechat, qq, phone, note FROM suppliers "
+        "WHERE deleted_at IS NULL AND "
+        "(name LIKE ? OR wechat LIKE ? OR qq LIKE ? OR phone LIKE ? OR note LIKE ?) ORDER BY name",
         (kw, kw, kw, kw, kw),
     ).fetchall()
     conn.close()
@@ -602,38 +373,30 @@ def search_suppliers(keyword):
 def get_all_suppliers():
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, name, wechat, qq, phone, note FROM suppliers ORDER BY name"
+        "SELECT id, name, wechat, qq, phone, note FROM suppliers "
+        "WHERE deleted_at IS NULL ORDER BY name"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def delete_customer_cascade(customer_id):
-    """级联删除客户及其关联的付款记录、报价记录。返回受影响记录数。"""
+    """Compatibility name: soft-delete the customer and preserve history."""
     conn = get_connection()
-    conn.execute("PRAGMA foreign_keys = OFF")
     quote_count = conn.execute("SELECT COUNT(*) FROM quotes WHERE customer_id=?", (customer_id,)).fetchone()[0]
     payment_count = conn.execute("SELECT COUNT(*) FROM payments WHERE customer_id=?", (customer_id,)).fetchone()[0]
-    conn.execute("DELETE FROM payments WHERE customer_id=?", (customer_id,))
-    conn.execute("DELETE FROM payments WHERE quote_id IN (SELECT id FROM quotes WHERE customer_id=?)", (customer_id,))
-    conn.execute("DELETE FROM quotes WHERE customer_id=?", (customer_id,))
-    conn.execute("DELETE FROM customers WHERE id=?", (customer_id,))
-    conn.execute("PRAGMA foreign_keys = ON")
+    soft_delete(conn, "customers", customer_id, "用户删除客户")
     conn.commit()
     conn.close()
     return {"quotes": quote_count, "payments": payment_count}
 
 
 def delete_supplier_cascade(supplier_id):
-    """级联删除上游及其关联的付款记录。批次的上游字段设为NULL。返回受影响记录数。"""
+    """Compatibility name: soft-delete the supplier and preserve history."""
     conn = get_connection()
-    conn.execute("PRAGMA foreign_keys = OFF")
     batch_count = conn.execute("SELECT COUNT(*) FROM batches WHERE supplier_id=?", (supplier_id,)).fetchone()[0]
     payment_count = conn.execute("SELECT COUNT(*) FROM payments WHERE supplier_id=?", (supplier_id,)).fetchone()[0]
-    conn.execute("DELETE FROM payments WHERE supplier_id=?", (supplier_id,))
-    conn.execute("UPDATE batches SET supplier_id=NULL WHERE supplier_id=?", (supplier_id,))
-    conn.execute("DELETE FROM suppliers WHERE id=?", (supplier_id,))
-    conn.execute("PRAGMA foreign_keys = ON")
+    soft_delete(conn, "suppliers", supplier_id, "用户删除供应商")
     conn.commit()
     conn.close()
     return {"batches": batch_count, "payments": payment_count}
@@ -643,9 +406,11 @@ def delete_supplier_cascade(supplier_id):
 
 def add_quote(batch_id, customer_id, quote_price, quote_quantity, quote_date, remark="", paid="", status="待确认", received_amount=0, sn_list="", tax_rate=None, purchase_tax_inclusive=0, quote_tax_inclusive=0):
     conn = get_connection()
+    quote_price_cents = yuan_to_cents(quote_price)
+    received_amount_cents = yuan_to_cents(received_amount)
     conn.execute(
-        "INSERT INTO quotes (batch_id, customer_id, quote_price, quote_quantity, quote_date, remark, paid, status, received_amount, sn_list, tax_rate, purchase_tax_inclusive, quote_tax_inclusive) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (batch_id, customer_id, quote_price, quote_quantity, quote_date, remark, paid, status, received_amount, sn_list, tax_rate, purchase_tax_inclusive, quote_tax_inclusive),
+        "INSERT INTO quotes (batch_id, customer_id, quote_price, quote_price_cents, quote_quantity, quote_date, remark, paid, status, received_amount, received_amount_cents, sn_list, tax_rate, purchase_tax_inclusive, quote_tax_inclusive) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (batch_id, customer_id, quote_price, quote_price_cents, quote_quantity, quote_date, remark, paid, status, received_amount, received_amount_cents, sn_list, tax_rate, purchase_tax_inclusive, quote_tax_inclusive),
     )
     conn.commit()
     qid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -656,48 +421,44 @@ def add_quote(batch_id, customer_id, quote_price, quote_quantity, quote_date, re
 def update_quote(quote_id, batch_id, customer_id, quote_price, quote_quantity, quote_date, remark, paid, sn_list="", tax_rate=None, purchase_tax_inclusive=0, quote_tax_inclusive=0):
     conn = get_connection()
     conn.execute(
-        "UPDATE quotes SET batch_id=?, customer_id=?, quote_price=?, quote_quantity=?, quote_date=?, remark=?, paid=?, sn_list=?, tax_rate=?, purchase_tax_inclusive=?, quote_tax_inclusive=? WHERE id=?",
-        (batch_id, customer_id, quote_price, quote_quantity, quote_date, remark, paid, sn_list, tax_rate, purchase_tax_inclusive, quote_tax_inclusive, quote_id),
+        "UPDATE quotes SET batch_id=?, customer_id=?, quote_price=?, quote_price_cents=?, quote_quantity=?, quote_date=?, remark=?, paid=?, sn_list=?, tax_rate=?, purchase_tax_inclusive=?, quote_tax_inclusive=? WHERE id=?",
+        (batch_id, customer_id, quote_price, yuan_to_cents(quote_price), quote_quantity, quote_date, remark, paid, sn_list, tax_rate, purchase_tax_inclusive, quote_tax_inclusive, quote_id),
     )
     conn.commit()
     conn.close()
 
 
 def delete_quote(quote_id):
-    """
-    删除报价记录
-
-    特殊处理：
-    - 如果报价状态为"已出库"，先回补库存再删除
-    - 级联删除关联的收付款记录
-    - 注意：出库时 SN 保存到 quotes.sn_list，batches.sn_list 不被修改，删除时无需处理 SN
-    """
+    """Soft-delete only draft/cancelled quotes; never erase financial history."""
     conn = get_connection()
     try:
-        # 获取报价信息，判断是否需要回补库存
         row = conn.execute(
-            "SELECT status, batch_id, quote_quantity FROM quotes WHERE id=?",
-            (quote_id,)
+            "SELECT status,batch_id,quote_quantity FROM quotes WHERE id=?", (quote_id,)
         ).fetchone()
-
-        if row and row[0] == "已出库":
-            batch_id = row[1]
-            quote_quantity = row[2] or 0
-
-            # 回补库存
+        if row and row["status"] == "已出库":
             conn.execute(
-                "UPDATE batches SET remaining = remaining + ? WHERE id = ?",
-                (quote_quantity, batch_id)
+                "UPDATE batches SET remaining=remaining+? WHERE id=?",
+                (row["quote_quantity"], row["batch_id"]),
             )
-
-        conn.execute("PRAGMA foreign_keys = OFF")
-        conn.execute("DELETE FROM payments WHERE quote_id=?", (quote_id,))
-        conn.execute("DELETE FROM quotes WHERE id=?", (quote_id,))
-        conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute(
+                "UPDATE quotes SET status='已取消',sn_list='' WHERE id=?", (quote_id,)
+            )
+            audit(
+                conn,
+                "quotes",
+                quote_id,
+                "transition",
+                before={"status": "已出库"},
+                after={"status": "已取消"},
+                reason="兼容删除前自动取消",
+            )
+        elif row and row["status"] not in ("待确认", "已取消"):
+            raise ValueError("已报价、已出库或已收款记录不能直接删除")
+        soft_delete(conn, "quotes", quote_id, "用户删除报价")
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        raise e
+        raise
     finally:
         conn.close()
 
@@ -714,7 +475,8 @@ def get_quote_by_id(quote_id):
         "JOIN batches b ON q.batch_id = b.id "
         "JOIN products p ON b.product_id = p.id "
         "LEFT JOIN customers c ON q.customer_id = c.id "
-        "WHERE q.id=?",
+        "WHERE q.id=? AND q.deleted_at IS NULL AND b.deleted_at IS NULL "
+        "AND p.deleted_at IS NULL AND (c.id IS NULL OR c.deleted_at IS NULL)",
         (quote_id,),
     ).fetchone()
     conn.close()
@@ -723,7 +485,12 @@ def get_quote_by_id(quote_id):
 
 def search_quotes(keyword="", date_from="", date_to="", customer_id=None):
     conn = get_connection()
-    conditions = []
+    conditions = [
+        "q.deleted_at IS NULL",
+        "b.deleted_at IS NULL",
+        "p.deleted_at IS NULL",
+        "(c.id IS NULL OR c.deleted_at IS NULL)",
+    ]
     params = []
 
     if keyword:
@@ -809,9 +576,11 @@ def ship_quote(quote_id, sn_list=""):
 
         # 校验库存
         batch_row = conn.execute(
-            "SELECT remaining FROM batches WHERE id=?", (batch_id,)
+            "SELECT remaining FROM batches WHERE id=? AND deleted_at IS NULL", (batch_id,)
         ).fetchone()
-        if not batch_row or batch_row[0] < quote_quantity:
+        if not batch_row:
+            return False, "批次不存在或已删除"
+        if batch_row[0] < quote_quantity:
             return False, "库存不足，无法出库"
 
         # 执行出库
@@ -888,37 +657,39 @@ def _add_payment_raw(conn, quote_id=None, customer_id=None, supplier_id=None,
     供批量收款/付款时在同一个事务中调用。
     外部调用方需自行管理 conn.commit() / conn.rollback() / conn.close()
     """
-    conn.execute(
-        "INSERT INTO payments (quote_id, customer_id, supplier_id, type, amount, pay_date, method, remark) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (quote_id, customer_id, supplier_id, pay_type, amount, pay_date, method, remark),
+    amount_cents = yuan_to_cents(amount)
+    payment_id = insert_payment(
+        conn,
+        quote_id=quote_id,
+        customer_id=customer_id,
+        supplier_id=supplier_id,
+        pay_type=pay_type,
+        amount_cents=amount_cents,
+        pay_date=pay_date,
+        method=method,
+        remark=remark,
     )
     if quote_id and pay_type == "receivable":
-        # 第一步：更新 received_amount
+        add_allocation(conn, payment_id, quote_id, amount_cents)
         conn.execute(
-            "UPDATE quotes SET received_amount = received_amount + ? WHERE id=?",
-            (amount, quote_id),
+            "UPDATE quotes SET received_amount_cents=received_amount_cents+? WHERE id=?",
+            (amount_cents, quote_id),
         )
-        # 第二步：查询新值，基于新值更新 paid 和 status
-        row = conn.execute(
-            "SELECT received_amount, quote_price, quote_quantity, status FROM quotes WHERE id=?", (quote_id,)
-        ).fetchone()
-        if row:
-            new_received = round(row[0], 2)
-            total = round(row[1] * row[2], 2)
-            paid = "是" if new_received >= total else "否"
-            # 状态：收满则变为"已收款"，否则保持原状态（不自动回退）
-            status = row[3]
-            if new_received >= total:
-                status = "已收款"
-            conn.execute(
-                "UPDATE quotes SET paid=?, status=? WHERE id=?",
-                (paid, status, quote_id)
-            )
+        sync_quote_payment_state(conn, quote_id)
     if pay_type == "payable" and supplier_id:
         conn.execute(
-            "UPDATE suppliers SET balance = balance - ? WHERE id=?", (amount, supplier_id)
+            "UPDATE suppliers SET balance=balance-?, balance_cents=balance_cents-? "
+            "WHERE id=?",
+            (amount, amount_cents, supplier_id),
         )
+    audit(
+        conn,
+        "payments",
+        payment_id,
+        "create",
+        after={"type": pay_type, "amount_cents": amount_cents},
+    )
+    return payment_id
 
 
 def add_payment(quote_id=None, customer_id=None, supplier_id=None, pay_type="receivable",
@@ -928,9 +699,8 @@ def add_payment(quote_id=None, customer_id=None, supplier_id=None, pay_type="rec
     """
     conn = get_connection()
     try:
-        _add_payment_raw(conn, quote_id, customer_id, supplier_id, pay_type, amount, pay_date, method, remark)
+        pid = _add_payment_raw(conn, quote_id, customer_id, supplier_id, pay_type, amount, pay_date, method, remark)
         conn.commit()
-        pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         return pid
     except Exception as e:
         conn.rollback()
@@ -946,12 +716,24 @@ def get_payments(quote_id=None, customer_id=None, supplier_id=None):
     if quote_id:
         conditions.append("p.quote_id = ?")
         params.append(quote_id)
+        conditions.append(
+            "EXISTS(SELECT 1 FROM quotes q "
+            "JOIN batches b ON q.batch_id=b.id "
+            "JOIN products pr ON b.product_id=pr.id "
+            "LEFT JOIN customers c ON q.customer_id=c.id "
+            "WHERE q.id=p.quote_id AND q.deleted_at IS NULL "
+            "AND b.deleted_at IS NULL AND pr.deleted_at IS NULL "
+            "AND (c.id IS NULL OR c.deleted_at IS NULL))"
+        )
     if customer_id:
         conditions.append("p.customer_id = ?")
         params.append(customer_id)
     if supplier_id:
         conditions.append("p.supplier_id = ?")
         params.append(supplier_id)
+        conditions.append(
+            "EXISTS(SELECT 1 FROM suppliers s WHERE s.id=p.supplier_id AND s.deleted_at IS NULL)"
+        )
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"SELECT * FROM payments p WHERE {where} ORDER BY p.pay_date DESC, p.id DESC"
     rows = conn.execute(sql, params).fetchall()
@@ -964,13 +746,15 @@ def get_customer_balance(customer_id=None):
     if customer_id:
         row = conn.execute(
             "SELECT COALESCE(SUM(q.quote_price * q.quote_quantity - q.received_amount), 0) "
-            "FROM quotes q WHERE q.customer_id = ? AND q.status IN ('已报价','已出库')",
+            "FROM quotes q WHERE q.customer_id = ? AND q.deleted_at IS NULL "
+            "AND q.status IN ('已报价','已出库')",
             (customer_id,),
         ).fetchone()
     else:
         row = conn.execute(
             "SELECT COALESCE(SUM(q.quote_price * q.quote_quantity - q.received_amount), 0) "
-            "FROM quotes q WHERE q.status IN ('已报价','已出库')",
+            "FROM quotes q WHERE q.deleted_at IS NULL "
+            "AND q.status IN ('已报价','已出库')",
         ).fetchone()
     conn.close()
     return row[0] if row else 0
@@ -1063,7 +847,7 @@ def get_customer_stats(customer_id):
                q.tax_rate, q.purchase_tax_inclusive, q.quote_tax_inclusive
         FROM quotes q
         JOIN batches b ON q.batch_id = b.id
-        WHERE q.customer_id = ? AND q.status != '已取消'
+        WHERE q.customer_id = ? AND q.deleted_at IS NULL AND q.status != '已取消'
         """,
         (customer_id,),
     ).fetchall()
@@ -1094,6 +878,7 @@ def get_payment_by_id(payment_id):
     row = conn.execute(
         """
         SELECT p.id, p.quote_id, p.customer_id, p.supplier_id, p.type, p.amount,
+               p.amount_cents, p.entry_kind, p.reversal_of_id, p.supersedes_id,
                p.pay_date, p.method, p.remark, p.created_at,
                c.name as customer_name, s.name as supplier_name,
                q.quote_price, q.quote_quantity, q.received_amount
@@ -1134,9 +919,16 @@ def get_all_payments_with_details(pay_type=None, customer_id=None, supplier_id=N
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
         SELECT p.id, p.quote_id, p.customer_id, p.supplier_id, p.type, p.amount,
+               p.amount_cents, p.entry_kind, p.reversal_of_id, p.supersedes_id,
                p.pay_date, p.method, p.remark, p.created_at,
                COALESCE(c.name, '') as customer_name,
-               COALESCE(s.name, '') as supplier_name
+               COALESCE(s.name, '') as supplier_name,
+               CASE
+                 WHEN p.entry_kind='reversal' THEN '冲销'
+                 WHEN EXISTS(SELECT 1 FROM payments r WHERE r.reversal_of_id=p.id) THEN '已冲销'
+                 WHEN p.supersedes_id IS NOT NULL THEN '更正'
+                 ELSE '正常'
+               END AS ledger_status
         FROM payments p
         LEFT JOIN customers c ON p.customer_id = c.id
         LEFT JOIN suppliers s ON p.supplier_id = s.id
@@ -1153,135 +945,161 @@ def _update_quote_payment_status(conn, quote_id):
     根据 quote 的 received_amount 重新计算 paid 和 status
     内部辅助函数，不管理连接和事务
     """
-    row = conn.execute(
-        "SELECT received_amount, quote_price, quote_quantity, status, sn_list FROM quotes WHERE id=?",
-        (quote_id,),
-    ).fetchone()
-    if not row:
-        return
-    total_amount = round(row["quote_price"] * row["quote_quantity"], 2)
-    new_received = round(row["received_amount"], 2)
-    current_status = row["status"]
-    sn_list = row["sn_list"] or ""
+    sync_quote_payment_state(conn, quote_id)
 
-    # 计算 paid
-    paid = "是" if new_received >= total_amount else "否"
 
-    # 计算 status
-    if new_received >= total_amount:
-        new_status = "已收款"
-    elif current_status == "已收款":
-        # 从已收款回退，根据 sn_list 判断
-        new_status = "已出库" if sn_list else "待确认"
-    else:
-        # 未收满且不是从已收款回退，保持当前状态不变
-        new_status = current_status
-
-    # paid 总是需要更新，status 只在变化时更新
-    conn.execute(
-        "UPDATE quotes SET paid=? WHERE id=?",
-        (paid, quote_id),
+def _allocate_customer_raw(conn, payment_id, customer_id, amount_cents):
+    remaining = amount_cents
+    rows = conn.execute(
+        "SELECT id, quote_price_cents, quote_quantity, received_amount_cents "
+        "FROM quotes WHERE customer_id=? AND deleted_at IS NULL "
+        "AND status IN ('待确认','已报价','已出库') "
+        "AND quote_price_cents*quote_quantity>received_amount_cents "
+        "ORDER BY quote_date,id",
+        (customer_id,),
+    ).fetchall()
+    available = sum(
+        r["quote_price_cents"] * r["quote_quantity"] - r["received_amount_cents"]
+        for r in rows
     )
-    if current_status != new_status:
+    if amount_cents > available:
+        raise ValueError("收款金额超过客户待收金额")
+    for row in rows:
+        pending = row["quote_price_cents"] * row["quote_quantity"] - row["received_amount_cents"]
+        applied = min(remaining, pending)
+        if applied:
+            add_allocation(conn, payment_id, row["id"], applied)
+            conn.execute(
+                "UPDATE quotes SET received_amount_cents=received_amount_cents+? WHERE id=?",
+                (applied, row["id"]),
+            )
+            sync_quote_payment_state(conn, row["id"])
+            remaining -= applied
+        if remaining == 0:
+            break
+
+
+def _void_payment_raw(conn, old_payment, reason):
+    if old_payment["entry_kind"] != "payment":
+        raise ValueError("冲销记录不能再次冲销")
+    if conn.execute(
+        "SELECT 1 FROM payments WHERE reversal_of_id=?", (old_payment["id"],)
+    ).fetchone():
+        raise ValueError("该记录已经冲销")
+    reversal_id = insert_payment(
+        conn,
+        quote_id=old_payment["quote_id"],
+        customer_id=old_payment["customer_id"],
+        supplier_id=old_payment["supplier_id"],
+        pay_type=old_payment["type"],
+        amount_cents=old_payment["amount_cents"],
+        pay_date=old_payment["pay_date"],
+        method=old_payment["method"],
+        remark=reason,
+        entry_kind="reversal",
+        reversal_of_id=old_payment["id"],
+    )
+    if old_payment["type"] == "receivable":
+        for allocation in conn.execute(
+            "SELECT quote_id,amount_cents FROM payment_allocations WHERE payment_id=?",
+            (old_payment["id"],),
+        ).fetchall():
+            add_allocation(conn, reversal_id, allocation["quote_id"], -allocation["amount_cents"])
+            conn.execute(
+                "UPDATE quotes SET received_amount_cents=received_amount_cents-? WHERE id=?",
+                (allocation["amount_cents"], allocation["quote_id"]),
+            )
+            sync_quote_payment_state(conn, allocation["quote_id"])
+    elif old_payment["supplier_id"]:
         conn.execute(
-            "UPDATE quotes SET status=? WHERE id=?",
-            (new_status, quote_id),
+            "UPDATE suppliers SET balance=balance+?, balance_cents=balance_cents+? WHERE id=?",
+            (old_payment["amount"], old_payment["amount_cents"], old_payment["supplier_id"]),
         )
+    audit(
+        conn,
+        "payments",
+        old_payment["id"],
+        "void",
+        before=dict(old_payment),
+        after={"reversal_id": reversal_id},
+        reason=reason,
+    )
+    return reversal_id
 
 
 def update_payment(payment_id, new_amount, new_pay_date, new_method, new_remark):
-    """修改收付款记录，同步更新关联数据"""
+    """Compatibility edit: append a reversal and corrected replacement."""
     conn = get_connection()
     try:
-        # 获取原记录
         old_payment = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
         if not old_payment:
-            conn.close()
             return False, "记录不存在"
-
-        old_amount = old_payment["amount"]
-        old_type = old_payment["type"]
-        quote_id = old_payment["quote_id"]
-        supplier_id = old_payment["supplier_id"]
-
-        # 更新 payments 记录
-        conn.execute(
-            "UPDATE payments SET amount=?, pay_date=?, method=?, remark=? WHERE id=?",
-            (new_amount, new_pay_date, new_method, new_remark, payment_id),
+        _void_payment_raw(conn, old_payment, "更正原流水")
+        new_cents = yuan_to_cents(new_amount)
+        replacement_id = insert_payment(
+            conn,
+            quote_id=old_payment["quote_id"],
+            customer_id=old_payment["customer_id"],
+            supplier_id=old_payment["supplier_id"],
+            pay_type=old_payment["type"],
+            amount_cents=new_cents,
+            pay_date=new_pay_date,
+            method=new_method,
+            remark=new_remark,
+            supersedes_id=payment_id,
         )
-
-        # 同步更新关联数据
-        amount_diff = new_amount - old_amount
-
-        if old_type == "receivable" and quote_id:
-            # 更新 quotes 的 received_amount
+        if old_payment["type"] == "receivable":
+            if old_payment["quote_id"]:
+                add_allocation(conn, replacement_id, old_payment["quote_id"], new_cents)
+                conn.execute(
+                    "UPDATE quotes SET received_amount_cents=received_amount_cents+? WHERE id=?",
+                    (new_cents, old_payment["quote_id"]),
+                )
+                sync_quote_payment_state(conn, old_payment["quote_id"])
+            else:
+                _allocate_customer_raw(
+                    conn, replacement_id, old_payment["customer_id"], new_cents
+                )
+        elif old_payment["supplier_id"]:
             conn.execute(
-                "UPDATE quotes SET received_amount = received_amount + ? WHERE id=?",
-                (amount_diff, quote_id),
+                "UPDATE suppliers SET balance=balance-?, balance_cents=balance_cents-? WHERE id=?",
+                (new_amount, new_cents, old_payment["supplier_id"]),
             )
-            # 同步更新 paid 和 status
-            _update_quote_payment_status(conn, quote_id)
-
-        elif old_type == "payable" and supplier_id:
-            # 更新 suppliers 的 balance
-            conn.execute(
-                "UPDATE suppliers SET balance = balance - ? WHERE id=?",
-                (amount_diff, supplier_id),
-            )
-
+        audit(
+            conn,
+            "payments",
+            replacement_id,
+            "correct",
+            after={"supersedes_id": payment_id, "amount_cents": new_cents},
+            reason="兼容接口更正",
+        )
         conn.commit()
-        return True, "修改成功"
-    except Exception as e:
+        return True, "更正成功"
+    except Exception:
         conn.rollback()
-        raise e
+        raise
     finally:
         conn.close()
 
 
 def delete_payment(payment_id):
-    """删除收付款记录，回滚关联数据"""
+    """Compatibility delete: append an immutable reversal entry."""
     conn = get_connection()
     try:
-        # 获取原记录
         old_payment = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
         if not old_payment:
-            conn.close()
             return False, "记录不存在", {}
-
-        old_amount = old_payment["amount"]
-        old_type = old_payment["type"]
-        quote_id = old_payment["quote_id"]
-        supplier_id = old_payment["supplier_id"]
-        customer_id = old_payment["customer_id"]
-        pay_date = old_payment["pay_date"]
-
-        # 删除 payments 记录
-        conn.execute("DELETE FROM payments WHERE id=?", (payment_id,))
-
-        # 回滚关联数据
-        affected = {"quote_id": quote_id, "supplier_id": supplier_id, "customer_id": customer_id}
-
-        if old_type == "receivable" and quote_id:
-            # 回滚 quotes 的 received_amount
-            conn.execute(
-                "UPDATE quotes SET received_amount = received_amount - ? WHERE id=?",
-                (old_amount, quote_id),
-            )
-            # 同步更新 paid 和 status
-            _update_quote_payment_status(conn, quote_id)
-
-        elif old_type == "payable" and supplier_id:
-            # 回滚 suppliers 的 balance（删除付款记录意味着欠款增加）
-            conn.execute(
-                "UPDATE suppliers SET balance = balance + ? WHERE id=?",
-                (old_amount, supplier_id),
-            )
-
+        _void_payment_raw(conn, old_payment, "用户作废流水")
+        affected = {
+            "quote_id": old_payment["quote_id"],
+            "supplier_id": old_payment["supplier_id"],
+            "customer_id": old_payment["customer_id"],
+        }
         conn.commit()
         return True, "删除成功", affected
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        raise e
+        raise
     finally:
         conn.close()
 

@@ -5,6 +5,8 @@ JSON 数据导入导出模块：用于全量数据备份和迁移
 import json
 import os
 from datetime import datetime
+from src.models.repositories import yuan_to_cents
+from src.version import APP_VERSION
 
 
 def export_all_to_json(db_module, output_path=None):
@@ -20,15 +22,18 @@ def export_all_to_json(db_module, output_path=None):
         output_path = os.path.join(desktop, f"调货助手备份_{timestamp}.json")
     
     data = {
-        "version": "v1.04",
+        "version": f"v{APP_VERSION}",
+        "schema_version": 2,
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "data": {
-            "products": db_module.get_all_products(),
+            "products": _get_table("products"),
             "suppliers": _get_all_suppliers(db_module),
             "batches": _get_all_batches(db_module),
-            "customers": db_module.get_all_customers(),
+            "customers": _get_table("customers"),
             "quotes": _get_all_quotes(db_module),
             "payments": _get_all_payments(db_module),
+            "payment_allocations": _get_table("payment_allocations"),
+            "audit_events": _get_table("audit_events"),
         }
     }
     
@@ -85,6 +90,18 @@ def _get_all_payments(db_module):
     return [dict(r) for r in rows]
 
 
+def _get_table(table_name):
+    allowed = {"products", "customers", "payment_allocations", "audit_events"}
+    if table_name not in allowed:
+        raise ValueError("不支持导出的表")
+    from src.models.database import get_connection
+    conn = get_connection()
+    try:
+        return [dict(r) for r in conn.execute(f"SELECT * FROM {table_name} ORDER BY id")]
+    finally:
+        conn.close()
+
+
 def import_from_json(json_path, db_module):
     """
     从 JSON 文件导入数据
@@ -92,75 +109,230 @@ def import_from_json(json_path, db_module):
     返回: (success: bool, message: str, stats: dict)
     """
     try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        if "version" not in data or "data" not in data:
+        with open(json_path, "r", encoding="utf-8") as stream:
+            document = json.load(stream)
+        if "version" not in document or "data" not in document:
             return False, "无效的备份文件格式", {}
-        
+
+        payload = document["data"]
         stats = {
-            "products": 0,
-            "suppliers": 0,
-            "batches": 0,
-            "customers": 0,
-            "quotes": 0,
-            "payments": 0,
+            key: 0 for key in ("products", "suppliers", "batches", "customers", "quotes", "payments")
         }
-        
-        imported_products = {}
-        
-        for product in data["data"].get("products", []):
-            pid = _import_product(product, db_module)
-            imported_products[product["id"]] = pid
-            stats["products"] += 1
-        
-        imported_suppliers = {}
-        for supplier in data["data"].get("suppliers", []):
-            sid = _import_supplier(supplier, db_module)
-            imported_suppliers[supplier["id"]] = sid
-            stats["suppliers"] += 1
-        
-        imported_batches = {}
-        for batch in data["data"].get("batches", []):
-            old_product_id = batch.get("product_id") or batch.get("id")
-            new_product_id = imported_products.get(old_product_id)
-            if new_product_id:
-                old_supplier_id = batch.get("supplier_id")
-                new_supplier_id = imported_suppliers.get(old_supplier_id) if old_supplier_id else None
-                bid = _import_batch(batch, new_product_id, new_supplier_id, db_module)
-                imported_batches[batch["id"]] = bid
+        maps = {key: {} for key in ("products", "suppliers", "batches", "customers", "quotes", "payments")}
+        conn = db_module.get_connection()
+        try:
+            conn.execute("BEGIN")
+
+            for product in payload.get("products", []):
+                cursor = conn.execute(
+                    "INSERT INTO products(series,cpu,ram,storage,gpu,screen,note,"
+                    "deleted_at,deleted_reason) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        product.get("series", ""),
+                        product.get("cpu", ""),
+                        product.get("ram", ""),
+                        product.get("storage", ""),
+                        product.get("gpu", ""),
+                        product.get("screen", ""),
+                        product.get("note", ""),
+                        product.get("deleted_at"),
+                        product.get("deleted_reason"),
+                    ),
+                )
+                maps["products"][product["id"]] = cursor.lastrowid
+                stats["products"] += 1
+
+            for supplier in payload.get("suppliers", []):
+                balance_cents = supplier.get("balance_cents")
+                if balance_cents is None:
+                    balance_cents = yuan_to_cents(supplier.get("balance", 0))
+                cursor = conn.execute(
+                    "INSERT INTO suppliers(name,wechat,qq,phone,note,balance,balance_cents,"
+                    "deleted_at,deleted_reason) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        supplier.get("name", ""),
+                        supplier.get("wechat", ""),
+                        supplier.get("qq", ""),
+                        supplier.get("phone", ""),
+                        supplier.get("note", ""),
+                        balance_cents / 100,
+                        balance_cents,
+                        supplier.get("deleted_at"),
+                        supplier.get("deleted_reason"),
+                    ),
+                )
+                maps["suppliers"][supplier["id"]] = cursor.lastrowid
+                stats["suppliers"] += 1
+
+            for customer in payload.get("customers", []):
+                balance_cents = customer.get("balance_cents")
+                if balance_cents is None:
+                    balance_cents = yuan_to_cents(customer.get("balance", 0))
+                cursor = conn.execute(
+                    "INSERT INTO customers(name,wechat,qq,phone,note,balance,balance_cents,"
+                    "default_tax_rate,deleted_at,deleted_reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        customer.get("name", ""),
+                        customer.get("wechat", ""),
+                        customer.get("qq", ""),
+                        customer.get("phone", ""),
+                        customer.get("note", ""),
+                        balance_cents / 100,
+                        balance_cents,
+                        customer.get("default_tax_rate"),
+                        customer.get("deleted_at"),
+                        customer.get("deleted_reason"),
+                    ),
+                )
+                maps["customers"][customer["id"]] = cursor.lastrowid
+                stats["customers"] += 1
+
+            for batch in payload.get("batches", []):
+                product_id = maps["products"].get(batch.get("product_id"))
+                if not product_id:
+                    raise ValueError(f"批次#{batch.get('id')} 缺少对应机型")
+                price_cents = batch.get("purchase_price_cents")
+                if price_cents is None:
+                    price_cents = yuan_to_cents(batch.get("purchase_price", 0))
+                cursor = conn.execute(
+                    "INSERT INTO batches(product_id,purchase_price,purchase_price_cents,"
+                    "quantity,remaining,date,remark,supplier_id,sn_list,deleted_at,deleted_reason) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        product_id,
+                        price_cents / 100,
+                        price_cents,
+                        batch.get("quantity", 0),
+                        batch.get("remaining", 0),
+                        batch.get("date", ""),
+                        batch.get("remark", ""),
+                        maps["suppliers"].get(batch.get("supplier_id")),
+                        batch.get("sn_list", ""),
+                        batch.get("deleted_at"),
+                        batch.get("deleted_reason"),
+                    ),
+                )
+                maps["batches"][batch["id"]] = cursor.lastrowid
                 stats["batches"] += 1
-        
-        imported_customers = {}
-        for customer in data["data"].get("customers", []):
-            cid = _import_customer(customer, db_module)
-            imported_customers[customer["id"]] = cid
-            stats["customers"] += 1
-        
-        imported_quotes = {}
-        for quote in data["data"].get("quotes", []):
-            old_batch_id = quote.get("batch_id")
-            old_customer_id = quote.get("customer_id")
-            new_batch_id = imported_batches.get(old_batch_id)
-            new_customer_id = imported_customers.get(old_customer_id)
-            if new_batch_id:
-                qid = _import_quote(quote, new_batch_id, new_customer_id, db_module)
-                if qid:
-                    imported_quotes[quote["id"]] = qid
-                    stats["quotes"] += 1
-        
-        for payment in data["data"].get("payments", []):
-            old_quote_id = payment.get("quote_id")
-            old_customer_id = payment.get("customer_id")
-            old_supplier_id = payment.get("supplier_id")
-            new_quote_id = imported_quotes.get(old_quote_id)
-            new_customer_id = imported_customers.get(old_customer_id)
-            new_supplier_id = imported_suppliers.get(old_supplier_id)
-            _import_payment(payment, new_quote_id, new_customer_id, new_supplier_id, db_module)
-            stats["payments"] += 1
-        
-        return True, "导入成功", stats
-    
+
+            for quote in payload.get("quotes", []):
+                batch_id = maps["batches"].get(quote.get("batch_id"))
+                if not batch_id:
+                    raise ValueError(f"报价#{quote.get('id')} 缺少对应批次")
+                price_cents = quote.get("quote_price_cents")
+                received_cents = quote.get("received_amount_cents")
+                if price_cents is None:
+                    price_cents = yuan_to_cents(quote.get("quote_price", 0))
+                if received_cents is None:
+                    received_cents = yuan_to_cents(quote.get("received_amount", 0))
+                cursor = conn.execute(
+                    "INSERT INTO quotes(batch_id,customer_id,quote_price,quote_price_cents,"
+                    "quote_quantity,quote_date,remark,paid,status,received_amount,"
+                    "received_amount_cents,sn_list,tax_rate,purchase_tax_inclusive,"
+                    "quote_tax_inclusive,deleted_at,deleted_reason) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        batch_id,
+                        maps["customers"].get(quote.get("customer_id")),
+                        price_cents / 100,
+                        price_cents,
+                        quote.get("quote_quantity", 1),
+                        quote.get("quote_date", ""),
+                        quote.get("remark", ""),
+                        quote.get("paid", "否"),
+                        quote.get("status", "待确认"),
+                        received_cents / 100,
+                        received_cents,
+                        quote.get("sn_list", ""),
+                        quote.get("tax_rate"),
+                        quote.get("purchase_tax_inclusive", 0),
+                        quote.get("quote_tax_inclusive", 0),
+                        quote.get("deleted_at"),
+                        quote.get("deleted_reason"),
+                    ),
+                )
+                maps["quotes"][quote["id"]] = cursor.lastrowid
+                stats["quotes"] += 1
+
+            payment_documents = payload.get("payments", [])
+            for payment in payment_documents:
+                amount_cents = payment.get("amount_cents")
+                if amount_cents is None:
+                    amount_cents = yuan_to_cents(payment.get("amount", 0))
+                cursor = conn.execute(
+                    "INSERT INTO payments(quote_id,customer_id,supplier_id,type,amount,"
+                    "amount_cents,entry_kind,pay_date,method,remark) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        maps["quotes"].get(payment.get("quote_id")),
+                        maps["customers"].get(payment.get("customer_id")),
+                        maps["suppliers"].get(payment.get("supplier_id")),
+                        payment.get("type", "receivable"),
+                        amount_cents / 100,
+                        amount_cents,
+                        payment.get("entry_kind", "payment"),
+                        payment.get("pay_date", ""),
+                        payment.get("method", ""),
+                        payment.get("remark", ""),
+                    ),
+                )
+                maps["payments"][payment["id"]] = cursor.lastrowid
+                stats["payments"] += 1
+
+            for payment in payment_documents:
+                conn.execute(
+                    "UPDATE payments SET reversal_of_id=?,supersedes_id=? WHERE id=?",
+                    (
+                        maps["payments"].get(payment.get("reversal_of_id")),
+                        maps["payments"].get(payment.get("supersedes_id")),
+                        maps["payments"][payment["id"]],
+                    ),
+                )
+
+            allocations = payload.get("payment_allocations", [])
+            for allocation in allocations:
+                payment_id = maps["payments"].get(allocation.get("payment_id"))
+                quote_id = maps["quotes"].get(allocation.get("quote_id"))
+                if not payment_id or not quote_id:
+                    raise ValueError("收款分配引用了不存在的流水或报价")
+                conn.execute(
+                    "INSERT INTO payment_allocations(payment_id,quote_id,amount_cents) "
+                    "VALUES (?,?,?)",
+                    (payment_id, quote_id, allocation.get("amount_cents", 0)),
+                )
+
+            entity_maps = {
+                "products": maps["products"],
+                "batches": maps["batches"],
+                "customers": maps["customers"],
+                "suppliers": maps["suppliers"],
+                "quotes": maps["quotes"],
+                "payments": maps["payments"],
+            }
+            for event in payload.get("audit_events", []):
+                entity_id = entity_maps.get(event.get("entity_type"), {}).get(
+                    event.get("entity_id")
+                )
+                conn.execute(
+                    "INSERT INTO audit_events(entity_type,entity_id,action,before_json,"
+                    "after_json,reason,created_at) VALUES (?,?,?,?,?,?,?)",
+                    (
+                        event.get("entity_type", ""),
+                        entity_id,
+                        event.get("action", ""),
+                        event.get("before_json"),
+                        event.get("after_json"),
+                        event.get("reason", ""),
+                        event.get("created_at"),
+                    ),
+                )
+
+            conn.commit()
+            return True, "导入成功", stats
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
     except FileNotFoundError:
         return False, "文件不存在", {}
     except json.JSONDecodeError:
