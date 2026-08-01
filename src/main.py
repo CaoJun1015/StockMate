@@ -46,7 +46,10 @@ from src.ui.product_tab import ProductTab
 from src.ui.record_tab import RecordTab
 from src.ui.customer_tab import CustomerTab
 from src.ui.supplier_tab import SupplierTab
+from src.ui.finance_tab import FinanceTab
 from src.ui.utils import _validate_date, _global_excepthook
+from src.models.migrations import DatabaseMigrationError
+from src.version import APP_DISPLAY_NAME
 from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
 from src.utils.excel_export import export_quotes_to_excel
@@ -64,7 +67,7 @@ from src.utils.remote_diagnose import search_diagnose, get_diagnose_tree, get_al
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("调货助手 v1.10")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.setMinimumSize(1100, 700)
 
         # 初始化数据库（含自动备份 + 完整性检查）
@@ -186,8 +189,15 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab_records, "📊 报价记录")
 
         # === Tab 5: 账款管理 ===
-        tab_finance = self._build_finance_tab()
-        self.tabs.addTab(tab_finance, "💰 账款管理")
+        self.finance_tab = FinanceTab(self)
+        self.finance_tab.data_changed.connect(self.refresh_records)
+        self.tabs.addTab(self.finance_tab, "💰 账款管理")
+        # One-release UI compatibility for external scripts/tests.
+        for name in (
+            "receivable_table", "payable_table", "payment_flow_table",
+            "refresh_receivable_btn", "refresh_payable_btn", "refresh_flow_btn",
+        ):
+            setattr(self, name, getattr(self.finance_tab, name))
 
         # 状态栏
         self.status_bar = QStatusBar()
@@ -200,6 +210,7 @@ class MainWindow(QMainWindow):
         self.customer_tab.refresh_customer_list()
         self.supplier_tab.refresh_supplier_list()
         self.refresh_records()
+        self.finance_tab.refresh()
 
         # 启用所有表格的列头排序
         for table in self.findChildren(QTableWidget):
@@ -220,476 +231,6 @@ class MainWindow(QMainWindow):
     def on_statement(self):
         dlg = StatementDialog(self)
         dlg.exec()
-
-    # -------------------------------------------------------
-    # 账款管理
-    # -------------------------------------------------------
-    def _build_finance_tab(self):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-
-        # === 上部分：应收/应付（占比调大） ===
-        top_splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-
-        left_title = QLabel("应收款项（客户欠款）")
-        left_title.setObjectName("sectionTitleRed")
-        left_layout.addWidget(left_title)
-
-        self.receivable_table = QTableWidget()
-        self.receivable_table.setAlternatingRowColors(True)
-        self.receivable_table.setColumnCount(5)
-        self.receivable_table.setHorizontalHeaderLabels(["客户", "欠款金额", "订单数", "联系方式", "操作"])
-        self.receivable_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.receivable_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.receivable_table.horizontalHeader().setStretchLastSection(True)
-        self.receivable_table.setMinimumHeight(200)  # 设置最小高度
-        left_layout.addWidget(self.receivable_table)
-
-        self.refresh_receivable_btn = QPushButton("刷新")
-        self.refresh_receivable_btn.setObjectName("ghostBtn")
-        self.refresh_receivable_btn.clicked.connect(self.refresh_finance)
-        left_btn_row = QHBoxLayout()
-        left_btn_row.addStretch()
-        left_btn_row.addWidget(self.refresh_receivable_btn)
-        left_layout.addLayout(left_btn_row)
-
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        right_title = QLabel("应付款项（欠上游款）")
-        right_title.setObjectName("sectionTitleOrange")
-        right_layout.addWidget(right_title)
-
-        self.payable_table = QTableWidget()
-        self.payable_table.setAlternatingRowColors(True)
-        self.payable_table.setColumnCount(5)
-        self.payable_table.setHorizontalHeaderLabels(["上游", "欠款金额", "批次", "联系方式", "操作"])
-        self.payable_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.payable_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.payable_table.horizontalHeader().setStretchLastSection(True)
-        self.payable_table.setMinimumHeight(200)  # 设置最小高度
-        right_layout.addWidget(self.payable_table)
-
-        self.refresh_payable_btn = QPushButton("刷新")
-        self.refresh_payable_btn.setObjectName("ghostBtn")
-        self.refresh_payable_btn.clicked.connect(self.refresh_finance)
-        right_btn_row = QHBoxLayout()
-        right_btn_row.addStretch()
-        right_btn_row.addWidget(self.refresh_payable_btn)
-        right_layout.addLayout(right_btn_row)
-
-        top_splitter.addWidget(left_widget)
-        top_splitter.addWidget(right_widget)
-        top_splitter.setSizes([400, 400])
-        # 上部分占比 3（75%）
-        layout.addWidget(top_splitter, stretch=3)
-
-        # === 下部分：收付款流水预览（占比调小） ===
-        flow_group = QGroupBox("收付款流水记录")
-        flow_group.setMaximumHeight(250)  # 设置最大高度，限制流水区域
-        flow_layout = QVBoxLayout(flow_group)
-
-        # 筛选行
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("类型:"))
-        self.payment_type_filter = QComboBox()
-        self.payment_type_filter.addItems(["全部", "收款", "付款"])
-        self.payment_type_filter.currentTextChanged.connect(self.refresh_payment_flow)
-        filter_row.addWidget(self.payment_type_filter)
-
-        filter_row.addWidget(QLabel("对象:"))
-        self.payment_object_filter = QComboBox()
-        self.payment_object_filter.setEditable(True)
-        self.payment_object_filter.setPlaceholderText("全部对象...")
-        self.payment_object_filter.currentTextChanged.connect(self.refresh_payment_flow)
-        filter_row.addWidget(self.payment_object_filter)
-
-        filter_row.addWidget(QLabel("日期从:"))
-        self.payment_date_from = QDateEdit()
-        self.payment_date_from.setCalendarPopup(True)
-        self.payment_date_from.setDate(QDate.currentDate().addMonths(-3))
-        self.payment_date_from.dateChanged.connect(self.refresh_payment_flow)
-        filter_row.addWidget(self.payment_date_from)
-
-        filter_row.addWidget(QLabel("至:"))
-        self.payment_date_to = QDateEdit()
-        self.payment_date_to.setCalendarPopup(True)
-        self.payment_date_to.setDate(QDate.currentDate())
-        self.payment_date_to.dateChanged.connect(self.refresh_payment_flow)
-        filter_row.addWidget(self.payment_date_to)
-
-        self.refresh_flow_btn = QPushButton("刷新")
-        self.refresh_flow_btn.setObjectName("ghostBtn")
-        self.refresh_flow_btn.clicked.connect(self.refresh_payment_flow)
-        filter_row.addWidget(self.refresh_flow_btn)
-
-        filter_row.addStretch()
-        flow_layout.addLayout(filter_row)
-
-        # 流水表格
-        self.payment_flow_table = QTableWidget()
-        self.payment_flow_table.setAlternatingRowColors(True)
-        self.payment_flow_table.setColumnCount(8)
-        self.payment_flow_table.setHorizontalHeaderLabels(
-            ["ID", "日期", "类型", "金额", "方式", "关联对象", "备注", "操作"]
-        )
-        self.payment_flow_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.payment_flow_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.payment_flow_table.horizontalHeader().setStretchLastSection(True)
-        self.payment_flow_table.setColumnHidden(0, True)  # 隐藏 ID 列
-        flow_layout.addWidget(self.payment_flow_table)
-
-        # 统计标签
-        self.payment_flow_stats = QLabel()
-        self.payment_flow_stats.setObjectName("summaryLabel")
-        flow_layout.addWidget(self.payment_flow_stats)
-
-        # 下部分占比 1（25%）
-        layout.addWidget(flow_group, stretch=1)
-        return tab
-
-    def refresh_finance(self):
-        """刷新应收/应付表格"""
-        from src.models.database import get_connection
-        conn = get_connection()
-
-        rows = conn.execute("""
-            SELECT c.id, c.name, c.wechat, c.phone,
-                   COALESCE(SUM(q.quote_price * q.quote_quantity - q.received_amount), 0) as debt,
-                   COUNT(q.id) as order_count
-            FROM customers c
-            LEFT JOIN quotes q ON q.customer_id = c.id AND q.status IN ('已报价','已出库')
-            GROUP BY c.id
-            HAVING debt > 0
-            ORDER BY debt DESC
-        """).fetchall()
-
-        self.receivable_table.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            self.receivable_table.setItem(i, 0, QTableWidgetItem(r[1]))
-            debt_item = QTableWidgetItem(f"¥{r[4]:.0f}")
-            debt_item.setForeground(QColor("#D32F2F"))
-            self.receivable_table.setItem(i, 1, debt_item)
-            self.receivable_table.setItem(i, 2, QTableWidgetItem(str(r[5])))
-            contact = " | ".join(filter(None, [r[2] or "", r[3] or ""]))
-            self.receivable_table.setItem(i, 3, QTableWidgetItem(contact))
-            pay_btn = QPushButton("收款")
-            pay_btn.setObjectName("tableActionPrimary")
-            pay_btn.clicked.connect(lambda checked, cid=r[0]: self._on_finance_receive(cid))
-            self.receivable_table.setCellWidget(i, 4, pay_btn)
-        self.receivable_table.resizeColumnsToContents()
-
-        s_rows = conn.execute("""
-            SELECT s.id, s.name, s.wechat, s.phone,
-                   COALESCE(SUM(b.purchase_price * b.quantity), 0) -
-                   COALESCE((SELECT SUM(py.amount) FROM payments py WHERE py.supplier_id = s.id AND py.type = 'payable'), 0) as debt
-            FROM suppliers s
-            LEFT JOIN batches b ON b.supplier_id = s.id
-            GROUP BY s.id
-            HAVING debt > 0
-            ORDER BY debt DESC
-        """).fetchall()
-
-        self.payable_table.setRowCount(len(s_rows))
-        for i, r in enumerate(s_rows):
-            self.payable_table.setItem(i, 0, QTableWidgetItem(r[1]))
-            debt_item = QTableWidgetItem(f"¥{r[4]:.0f}")
-            debt_item.setForeground(QColor("#F57C00"))
-            self.payable_table.setItem(i, 1, debt_item)
-            batch_count = conn.execute(
-                "SELECT COUNT(*) FROM batches WHERE supplier_id=?", (r[0],)
-            ).fetchone()[0]
-            self.payable_table.setItem(i, 2, QTableWidgetItem(str(batch_count)))
-            contact = " | ".join(filter(None, [r[2] or "", r[3] or ""]))
-            self.payable_table.setItem(i, 3, QTableWidgetItem(contact))
-            pay_btn = QPushButton("付款")
-            pay_btn.setObjectName("tableActionOrange")
-            pay_btn.clicked.connect(lambda checked, sid=r[0]: self._on_finance_pay(sid))
-            self.payable_table.setCellWidget(i, 4, pay_btn)
-        self.payable_table.resizeColumnsToContents()
-
-        conn.close()
-
-        # 同时刷新流水记录和筛选对象列表
-        self._load_payment_object_filter()
-        self.refresh_payment_flow()
-
-    def _load_payment_object_filter(self):
-        """加载筛选对象下拉框（客户+上游）"""
-        self.payment_object_filter.clear()
-        self.payment_object_filter.addItem("全部对象", None)
-        customers = get_all_customers()
-        for c in customers:
-            self.payment_object_filter.addItem(f"客户: {c['name']}", ("customer", c["id"]))
-        suppliers = get_all_suppliers()
-        for s in suppliers:
-            self.payment_object_filter.addItem(f"上游: {s['name']}", ("supplier", s["id"]))
-
-    def refresh_payment_flow(self):
-        """刷新收付款流水表格"""
-        # 获取筛选条件
-        pay_type = self.payment_type_filter.currentText()
-        if pay_type == "收款":
-            pay_type = "receivable"
-        elif pay_type == "付款":
-            pay_type = "payable"
-        else:
-            pay_type = None
-
-        object_data = self.payment_object_filter.currentData()
-        customer_id = None
-        supplier_id = None
-        if object_data:
-            if object_data[0] == "customer":
-                customer_id = object_data[1]
-            elif object_data[0] == "supplier":
-                supplier_id = object_data[1]
-
-        date_from = self.payment_date_from.date().toString("yyyy-MM-dd")
-        date_to = self.payment_date_to.date().toString("yyyy-MM-dd")
-
-        # 获取数据
-        payments = get_all_payments_with_details(pay_type, customer_id, supplier_id, date_from, date_to)
-
-        self.payment_flow_table.setRowCount(len(payments))
-        total_receive = 0
-        total_pay = 0
-
-        for i, p in enumerate(payments):
-            self.payment_flow_table.setItem(i, 0, QTableWidgetItem(str(p["id"])))
-            self.payment_flow_table.setItem(i, 1, QTableWidgetItem(p.get("pay_date", "")))
-
-            type_text = "收款" if p.get("type") == "receivable" else "付款"
-            type_item = QTableWidgetItem(type_text)
-            type_item.setForeground(QColor("#388E3C") if p.get("type") == "receivable" else QColor("#F57C00"))
-            self.payment_flow_table.setItem(i, 2, type_item)
-
-            amount_item = QTableWidgetItem(f"¥{p.get('amount', 0):.0f}")
-            amount_item.setForeground(QColor("#388E3C") if p.get("type") == "receivable" else QColor("#F57C00"))
-            self.payment_flow_table.setItem(i, 3, amount_item)
-
-            self.payment_flow_table.setItem(i, 4, QTableWidgetItem(p.get("method", "")))
-
-            # 关联对象
-            obj_name = p.get("customer_name", "") or p.get("supplier_name", "")
-            if p.get("type") == "receivable" and obj_name:
-                obj_name = f"客户: {obj_name}"
-            elif p.get("type") == "payable" and obj_name:
-                obj_name = f"上游: {obj_name}"
-            self.payment_flow_table.setItem(i, 5, QTableWidgetItem(obj_name))
-
-            self.payment_flow_table.setItem(i, 6, QTableWidgetItem(p.get("remark", "") or ""))
-
-            # 操作按钮
-            btn_widget = QWidget()
-            btn_layout = QHBoxLayout(btn_widget)
-            btn_layout.setContentsMargins(2, 2, 2, 2)
-
-            edit_btn = QPushButton("修改")
-            edit_btn.setObjectName("tableActionPrimary")
-            edit_btn.clicked.connect(lambda checked, pid=p["id"]: self._on_edit_payment(pid))
-            btn_layout.addWidget(edit_btn)
-
-            del_btn = QPushButton("删除")
-            del_btn.setObjectName("tableActionDanger")
-            del_btn.clicked.connect(lambda checked, pid=p["id"]: self._on_delete_payment(pid))
-            btn_layout.addWidget(del_btn)
-
-            self.payment_flow_table.setCellWidget(i, 7, btn_widget)
-
-            if p.get("type") == "receivable":
-                total_receive += p.get("amount", 0)
-            else:
-                total_pay += p.get("amount", 0)
-
-        self.payment_flow_table.resizeColumnsToContents()
-        self.payment_flow_stats.setText(
-            f"共 {len(payments)} 条记录 | 收款合计: ¥{total_receive:.0f} | 付款合计: ¥{total_pay:.0f}"
-        )
-
-    def _on_edit_payment(self, payment_id):
-        """修改收付款记录（两次确认）"""
-        payment = get_payment_by_id(payment_id)
-        if not payment:
-            QMessageBox.warning(self, "错误", "无法获取记录信息")
-            return
-
-        # 第一次确认：显示原记录信息
-        type_text = "收款" if payment["type"] == "receivable" else "付款"
-        obj_name = payment.get("customer_name", "") or payment.get("supplier_name", "")
-        info = f"原记录信息:\n\n类型: {type_text}\n金额: ¥{payment['amount']:.0f}\n日期: {payment['pay_date']}\n方式: {payment['method']}\n关联对象: {obj_name}\n备注: {payment['remark'] or '无'}\n\n是否要修改此记录？"
-        reply = QMessageBox.question(self, "确认修改 - 第一步", info, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # 弹出编辑对话框
-        dlg = PaymentEditDialog(self, payment)
-        if dlg.exec():
-            new_data = dlg.get_data()
-            if new_data["amount"] <= 0:
-                QMessageBox.warning(self, "提示", "金额必须大于 0")
-                return
-
-            # 第二次确认：显示修改内容对比
-            changes = []
-            if payment["amount"] != new_data["amount"]:
-                changes.append(f"金额: ¥{payment['amount']:.0f} → ¥{new_data['amount']:.0f}")
-            if payment["pay_date"] != new_data["pay_date"]:
-                changes.append(f"日期: {payment['pay_date']} → {new_data['pay_date']}")
-            if payment["method"] != new_data["method"]:
-                changes.append(f"方式: {payment['method']} → {new_data['method']}")
-            if (payment["remark"] or "") != new_data["remark"]:
-                changes.append(f"备注: {payment['remark'] or '无'} → {new_data['remark'] or '无'}")
-
-            if not changes:
-                QMessageBox.information(self, "提示", "没有任何修改")
-                return
-
-            confirm_text = f"确认以下修改:\n\n" + "\n".join(changes) + "\n\n修改后将自动更新关联数据（报价已收金额/供应商欠款）。\n是否确认修改？"
-            reply2 = QMessageBox.question(self, "确认修改 - 第二步", confirm_text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply2 != QMessageBox.StandardButton.Yes:
-                return
-
-            # 执行修改
-            success, msg = update_payment(payment_id, new_data["amount"], new_data["pay_date"], new_data["method"], new_data["remark"])
-            if success:
-                QMessageBox.information(self, "成功", "修改成功！关联数据已同步更新。")
-                self.refresh_payment_flow()
-                self.refresh_finance()
-                self.refresh_records()
-            else:
-                QMessageBox.warning(self, "失败", msg)
-
-    def _on_delete_payment(self, payment_id):
-        """删除收付款记录（两次确认 + 回滚）"""
-        payment = get_payment_by_id(payment_id)
-        if not payment:
-            QMessageBox.warning(self, "错误", "无法获取记录信息")
-            return
-
-        # 第一次确认：显示记录信息
-        type_text = "收款" if payment["type"] == "receivable" else "付款"
-        obj_name = payment.get("customer_name", "") or payment.get("supplier_name", "")
-        info = f"即将删除的记录:\n\n类型: {type_text}\n金额: ¥{payment['amount']:.0f}\n日期: {payment['pay_date']}\n方式: {payment['method']}\n关联对象: {obj_name}\n备注: {payment['remark'] or '无'}\n\n删除后将自动回滚关联数据。\n是否继续？"
-        reply = QMessageBox.question(self, "确认删除 - 第一步", info, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # 第二次确认：显示影响范围
-        if payment["type"] == "receivable" and payment.get("quote_id"):
-            impact = f"影响范围:\n• 报价记录 #{payment['quote_id']} 的已收金额将减少 ¥{payment['amount']:.0f}\n• 若已收金额不足，订单状态可能从「已收款」回退为「已出库」"
-        elif payment["type"] == "payable" and payment.get("supplier_id"):
-            impact = f"影响范围:\n• 上游供应商「{obj_name}」的欠款将增加 ¥{payment['amount']:.0f}"
-        else:
-            impact = "此记录无直接关联数据，删除后仅影响流水统计。"
-
-        confirm_text = f"⚠️ 最终确认\n\n{impact}\n\n此操作不可撤销！\n是否确认删除？"
-        reply2 = QMessageBox.question(self, "确认删除 - 第二步", confirm_text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply2 != QMessageBox.StandardButton.Yes:
-            return
-
-        # 执行删除
-        success, msg, affected = delete_payment(payment_id)
-        if success:
-            QMessageBox.information(self, "成功", "删除成功！关联数据已回滚。")
-            self.refresh_payment_flow()
-            self.refresh_finance()
-            self.refresh_records()
-        else:
-            QMessageBox.warning(self, "失败", msg)
-
-    def _on_finance_receive(self, customer_id):
-        """收款操作（带预览确认）"""
-        from src.models.database import get_connection
-        conn = get_connection()
-        unpaid = conn.execute("""
-            SELECT id, quote_price, quote_quantity, received_amount,
-                   quote_price * quote_quantity - received_amount as remaining
-            FROM quotes
-            WHERE customer_id=? AND status IN ('已报价','已出库','待确认')
-            AND quote_price * quote_quantity > received_amount
-            ORDER BY quote_date ASC
-        """, (customer_id,)).fetchall()
-        total_pending = sum(r[4] for r in unpaid)
-        conn.close()
-
-        if not unpaid:
-            QMessageBox.information(self, "提示", "该客户没有待收款项")
-            return
-
-        # 弹出收款对话框（带预览）
-        dlg = PaymentDialog(self, title="收款", pay_type="receivable", preview_pending=total_pending)
-        if dlg.exec():
-            data = dlg.get_data()
-            if data["amount"] <= 0:
-                QMessageBox.warning(self, "提示", "请输入收款金额")
-                return
-
-            # 预览确认：显示收款后的剩余待收
-            remaining_after = total_pending - data["amount"]
-            preview_text = f"收款确认:\n\n本次收款: ¥{data['amount']:.0f}\n当前待收: ¥{total_pending:.0f}\n收款后剩余待收: ¥{remaining_after:.0f}\n\n收款方式: {data['method']}\n收款日期: {data['pay_date']}"
-            if remaining_after < 0:
-                preview_text += "\n\n⚠️ 注意: 收款金额超过待收金额，将自动结清所有欠款。"
-
-            reply = QMessageBox.question(self, "确认收款", preview_text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
-            # 批量收款在同一个事务中执行，保证原子性
-            conn = get_connection()
-            try:
-                remaining = data["amount"]
-                for q in unpaid:
-                    if remaining <= 0:
-                        break
-                    qid, _, _, _, pending = q
-                    apply_amount = min(remaining, pending)
-                    _add_payment_raw(
-                        conn,
-                        quote_id=qid,
-                        customer_id=customer_id,
-                        pay_type="receivable",
-                        amount=apply_amount,
-                        pay_date=data["pay_date"],
-                        method=data["method"],
-                        remark=data["remark"],
-                    )
-                    remaining -= apply_amount
-                conn.commit()
-                QMessageBox.information(self, "成功", f"收款 ¥{data['amount']:.2f} 已记录！")
-            except Exception as e:
-                conn.rollback()
-                QMessageBox.critical(self, "收款失败", f"收款操作失败: {str(e)}")
-                return
-            finally:
-                conn.close()
-            self.refresh_finance()
-            self.refresh_records()
-
-    def _on_finance_pay(self, supplier_id):
-        """付款操作"""
-        dlg = PaymentDialog(self, title="付款", pay_type="payable")
-        if dlg.exec():
-            data = dlg.get_data()
-            if data["amount"] <= 0:
-                QMessageBox.warning(self, "提示", "请输入付款金额")
-                return
-            add_payment(
-                supplier_id=supplier_id,
-                pay_type="payable",
-                amount=data["amount"],
-                pay_date=data["pay_date"],
-                method=data["method"],
-                remark=data["remark"],
-            )
-            QMessageBox.information(self, "成功", f"付款 ¥{data['amount']:.2f} 已记录！")
-            self.refresh_finance()
 
     # -------------------------------------------------------
     # Tab 构建
@@ -1124,7 +665,16 @@ def main():
     sys.excepthook = _global_excepthook
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLE)
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except DatabaseMigrationError as exc:
+        backup_path = exc.backup.path if exc.backup else "未生成"
+        QMessageBox.critical(
+            None,
+            "数据库升级失败",
+            f"{exc}\n\n程序已停止启动，数据未被部分升级。\n迁移前备份: {backup_path}",
+        )
+        return
     window.show()
     sys.exit(app.exec())
 

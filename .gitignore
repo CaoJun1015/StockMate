@@ -22,6 +22,9 @@ Thumbs.db
 
 # Database
 data/*.db
+data/*.db-*
+data/**/*.db
+data/**/*.db-*
 
 # Backup directories
 backup*/

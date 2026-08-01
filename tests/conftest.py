@@ -10,11 +10,14 @@ import sys
 import os
 import sqlite3
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 # 将 src 目录加入 Python 路径，确保可以导入项目模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 # 导入 database 模块
 import models.database as db_module
+import src.models.database as src_db_module
 
 
 # 建表 SQL（与 database.py 中的 init_db 保持一致）
@@ -110,6 +113,11 @@ CREATE TABLE IF NOT EXISTS operation_logs (
 );
 """
 
+# v1.13: keep the fixture schema sourced from the production schema instead of
+# maintaining a second hand-written copy.
+from models.schema import CURRENT_SCHEMA_SQL
+CREATE_TABLES_SQL = CURRENT_SCHEMA_SQL
+
 
 # 模块级别的变量，用于持有内存数据库连接
 _test_conn = None
@@ -176,8 +184,22 @@ def memory_db(monkeypatch):
 
     # 替换模块级别的 get_connection 函数
     monkeypatch.setattr(db_module, "get_connection", _get_test_connection)
+    monkeypatch.setattr(src_db_module, "get_connection", _get_test_connection)
     # 同时替换 DB_PATH 防止意外
     monkeypatch.setattr(db_module, "DB_PATH", ":memory:")
+    monkeypatch.setattr(src_db_module, "DB_PATH", ":memory:")
+
+    # MainWindow binds init_db at import time and the new FinanceTab uses
+    # read-model functions. Keep UI tests fully isolated from production data.
+    try:
+        import src.main as main_module
+        import src.ui.finance_tab as finance_module
+        monkeypatch.setattr(main_module, "init_db", lambda: (True, "测试数据库"))
+        monkeypatch.setattr(finance_module, "get_receivables", lambda *_: [])
+        monkeypatch.setattr(finance_module, "get_payables", lambda *_: [])
+        monkeypatch.setattr(finance_module, "get_payment_flow", lambda *_, **__: [])
+    except ImportError:
+        pass
 
     yield _test_conn
 
@@ -185,6 +207,15 @@ def memory_db(monkeypatch):
     if _test_conn is not None:
         _test_conn.close()
         _test_conn = None
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """Minimal pytest-qt compatible QApplication fixture."""
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    yield app
 
 
 @pytest.fixture

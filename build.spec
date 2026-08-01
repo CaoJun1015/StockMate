@@ -4,11 +4,20 @@
 调货助手 PyInstaller 打包配置
 """
 
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(SPECPATH).resolve()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.version import APP_VERSION
+
 block_cipher = None
 
 a = Analysis(
     ['run.py'],
-    pathex=[],
+    pathex=[str(PROJECT_ROOT)],
     binaries=[],
     datas=[],
     hiddenimports=[
@@ -20,7 +29,6 @@ a = Analysis(
         'docx',
         'PIL',
         'PIL._tkinter_finder',
-        'psutil',
         'src.ui',
         'src.ui.style',
         'src.ui.dialogs',
@@ -50,7 +58,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='调货助手 v1.10',
+    name=f'调货助手 v{APP_VERSION}',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
