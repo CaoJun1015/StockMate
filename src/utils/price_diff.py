@@ -8,9 +8,10 @@
 - ⚠️ 下架：上游不再供货，检查库存
 """
 
-import sqlite3
 from datetime import datetime
-from src.models.database import get_connection
+from src.models.connection import transaction
+from src.models.queries import get_latest_price_snapshot, list_price_snapshots
+from src.models.repositories import insert_price_snapshot
 
 
 def _normalize_key(series, cpu, ram, storage, gpu):
@@ -27,7 +28,7 @@ def _normalize_key(series, cpu, ram, storage, gpu):
     return "|".join(parts)
 
 
-def save_snapshot(products, import_date=None):
+def save_snapshot(products, import_date=None, db_path=None):
     """
     保存一次价格表快照。
 
@@ -42,39 +43,26 @@ def save_snapshot(products, import_date=None):
     if import_date is None:
         import_date = datetime.now().strftime("%Y-%m-%d")
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # 创建快照头
-    cursor.execute(
-        "INSERT INTO price_snapshots (import_date, item_count) VALUES (?, ?)",
-        (import_date, len(products),
-    ))
-    snapshot_id = cursor.lastrowid
-
-    # 保存每条记录
+    normalized = []
     for p in products:
-        series = p.get("series", "")
-        cpu = p.get("cpu", "")
-        ram = p.get("ram", "")
-        storage = p.get("storage", "")
-        gpu = p.get("gpu", "")
-        note = p.get("note", "")
-        norm_key = _normalize_key(series, cpu, ram, storage, gpu)
-
-        cursor.execute(
-            """INSERT INTO price_snapshot_items
-               (snapshot_id, series, cpu, ram, storage, gpu, note, norm_key)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (snapshot_id, series, cpu, ram, storage, gpu, note, norm_key),
+        normalized.append(
+            {
+                **p,
+                "norm_key": _normalize_key(
+                    p.get("series", ""),
+                    p.get("cpu", ""),
+                    p.get("ram", ""),
+                    p.get("storage", ""),
+                    p.get("gpu", ""),
+                ),
+            }
         )
-
-    conn.commit()
-    conn.close()
+    with transaction(db_path) as conn:
+        snapshot_id = insert_price_snapshot(conn, import_date, normalized)
     return snapshot_id, len(products)
 
 
-def get_latest_snapshot(before_date=None):
+def get_latest_snapshot(before_date=None, db_path=None):
     """
     获取最近一次快照（不含 before_date 当天，用于对比上一版本）。
 
@@ -82,41 +70,12 @@ def get_latest_snapshot(before_date=None):
         dict {snapshot_id, import_date, item_count, items: list[dict]}
         或 None
     """
-    conn = get_connection()
-    if before_date:
-        row = conn.execute(
-            "SELECT id, import_date, item_count FROM price_snapshots WHERE import_date < ? ORDER BY import_date DESC, id DESC LIMIT 1",
-            (before_date,),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT id, import_date, item_count FROM price_snapshots ORDER BY import_date DESC, id DESC LIMIT 1"
-        ).fetchone()
-
-    if not row:
-        conn.close()
-        return None
-
-    snapshot = {"snapshot_id": row[0], "import_date": row[1], "item_count": row[2]}
-
-    items = conn.execute(
-        "SELECT id, series, cpu, ram, storage, gpu, note, norm_key FROM price_snapshot_items WHERE snapshot_id=?",
-        (snapshot["snapshot_id"],),
-    ).fetchall()
-    conn.close()
-
-    snapshot["items"] = [dict(i) for i in items]
-    return snapshot
+    return get_latest_price_snapshot(before_date, db_path)
 
 
-def get_all_snapshots():
+def get_all_snapshots(db_path=None):
     """获取所有快照列表（不含明细）。"""
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT id, import_date, item_count, created_at FROM price_snapshots ORDER BY import_date DESC, id DESC"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    return list_price_snapshots(db_path)
 
 
 def diff_snapshots(old_snapshot, new_items):

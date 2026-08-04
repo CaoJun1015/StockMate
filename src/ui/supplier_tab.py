@@ -14,6 +14,7 @@ from src.models.queries import (
 from src.services.exceptions import ServiceError
 from src.services.party_service import SupplierService
 from src.ui.dialogs import CustomerDialog
+from src.utils.money import format_yuan
 
 
 class SupplierTab(QWidget):
@@ -94,20 +95,21 @@ class SupplierTab(QWidget):
         total_amount = 0
         self.supplier_history_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            price = r.get("purchase_price", 0) or 0
+            price = r.get("purchase_price_cents", 0) or 0
             quantity = r.get("quantity", 0) or 0
             total_amount += price * quantity
             self.supplier_history_table.setItem(i, 0, QTableWidgetItem(r.get("date") or ""))
             self.supplier_history_table.setItem(i, 1, QTableWidgetItem(r.get("series") or ""))
             self.supplier_history_table.setItem(i, 2, QTableWidgetItem(r.get("cpu") or ""))
             self.supplier_history_table.setItem(i, 3, QTableWidgetItem(str(quantity)))
-            self.supplier_history_table.setItem(i, 4, QTableWidgetItem(f"¥{price:.0f}"))
-            self.supplier_history_table.setItem(i, 5, QTableWidgetItem(f"¥{price * quantity:.0f}"))
+            self.supplier_history_table.setItem(i, 4, QTableWidgetItem(format_yuan(price)))
+            self.supplier_history_table.setItem(i, 5, QTableWidgetItem(format_yuan(price * quantity)))
             self.supplier_history_table.setItem(i, 6, QTableWidgetItem(r.get("remark") or ""))
         self.supplier_history_table.resizeColumnsToContents()
 
         self.supplier_stats_label.setText(
-            f"上游: {supplier_name} | 总批次数: {len(rows)} | 总金额: ¥{total_amount:.0f}"
+            f"上游: {supplier_name} | 总批次数: {len(rows)} | "
+            f"总金额: {format_yuan(total_amount)}"
         )
 
     def refresh_supplier_list(self):

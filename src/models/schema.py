@@ -1,6 +1,6 @@
-"""Current (schema v2) SQLite schema."""
+"""Current (schema v3) SQLite schema."""
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 CURRENT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS customers (
     qq TEXT,
     phone TEXT,
     note TEXT,
-    balance REAL DEFAULT 0,
     balance_cents INTEGER NOT NULL DEFAULT 0,
     default_tax_rate REAL DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -39,7 +38,6 @@ CREATE TABLE IF NOT EXISTS suppliers (
     qq TEXT,
     phone TEXT,
     note TEXT,
-    balance REAL DEFAULT 0,
     balance_cents INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP,
@@ -49,7 +47,6 @@ CREATE TABLE IF NOT EXISTS suppliers (
 CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id INTEGER NOT NULL,
-    purchase_price REAL NOT NULL,
     purchase_price_cents INTEGER NOT NULL,
     quantity INTEGER NOT NULL,
     remaining INTEGER NOT NULL,
@@ -68,14 +65,12 @@ CREATE TABLE IF NOT EXISTS quotes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id INTEGER NOT NULL,
     customer_id INTEGER,
-    quote_price REAL NOT NULL,
     quote_price_cents INTEGER NOT NULL,
     quote_quantity INTEGER NOT NULL DEFAULT 1,
     quote_date TEXT NOT NULL,
     remark TEXT,
     paid TEXT,
     status TEXT DEFAULT '待确认',
-    received_amount REAL DEFAULT 0,
     received_amount_cents INTEGER NOT NULL DEFAULT 0,
     sn_list TEXT,
     tax_rate REAL DEFAULT NULL,
@@ -94,7 +89,6 @@ CREATE TABLE IF NOT EXISTS payments (
     customer_id INTEGER,
     supplier_id INTEGER,
     type TEXT NOT NULL,
-    amount REAL NOT NULL,
     amount_cents INTEGER NOT NULL,
     entry_kind TEXT NOT NULL DEFAULT 'payment',
     reversal_of_id INTEGER,
@@ -176,6 +170,8 @@ CREATE INDEX IF NOT EXISTS idx_allocations_quote ON payment_allocations(quote_id
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_reversal_per_payment
     ON payments(reversal_of_id) WHERE reversal_of_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_events(action);
 CREATE INDEX IF NOT EXISTS idx_logs_time ON operation_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_snapshot_date ON price_snapshots(import_date);
 CREATE INDEX IF NOT EXISTS idx_snapshot_items ON price_snapshot_items(snapshot_id);

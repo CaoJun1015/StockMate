@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_HALF_UP
 
-def calc_tax_adjusted_profit(
-    purchase_price: float,
-    quote_price: float,
+
+def calc_tax_adjusted_profit_cents(
+    purchase_price_cents: int,
+    quote_price_cents: int,
     quantity: int,
     tax_rate: float | None,
     purchase_tax_inclusive: bool,
     quote_tax_inclusive: bool,
-) -> float:
+) -> int:
+    purchase = Decimal(purchase_price_cents)
+    quote = Decimal(quote_price_cents)
     if not tax_rate:
-        return (quote_price - purchase_price) * quantity
+        return (quote_price_cents - purchase_price_cents) * quantity
+    divisor = Decimal("1") + Decimal(str(tax_rate))
     purchase_exclusive = (
-        purchase_price / (1 + tax_rate)
+        purchase / divisor
         if purchase_tax_inclusive
-        else purchase_price
+        else purchase
     )
     quote_exclusive = (
-        quote_price / (1 + tax_rate) if quote_tax_inclusive else quote_price
+        quote / divisor if quote_tax_inclusive else quote
     )
-    return (quote_exclusive - purchase_exclusive) * quantity
+    value = (quote_exclusive - purchase_exclusive) * quantity
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))

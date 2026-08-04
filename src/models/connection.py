@@ -182,17 +182,21 @@ def restore_database(
     target_path.parent.mkdir(parents=True, exist_ok=True)
     safety_backup = create_backup(
         target_path,
-        prefix="pre_restore_v1.14",
+        prefix="pre_restore_v1.15",
         retain=False,
     )
     try:
         _backup_over_database(source_path, target_path)
+        if source_version < SCHEMA_VERSION:
+            from src.models.migrations import migrate_database
+
+            migrate_database(target_path)
         restored_version, restored_integrity = _database_version_and_integrity(target_path)
         if restored_integrity != "ok":
             raise sqlite3.DatabaseError(f"恢复后完整性检查失败: {restored_integrity}")
-        if restored_version != source_version:
+        if restored_version != SCHEMA_VERSION:
             raise sqlite3.DatabaseError(
-                f"恢复后版本不一致: 源 {source_version}，目标 {restored_version}"
+                f"恢复后版本不一致: 期望 {SCHEMA_VERSION}，目标 {restored_version}"
             )
     except Exception as exc:
         if safety_backup is not None:

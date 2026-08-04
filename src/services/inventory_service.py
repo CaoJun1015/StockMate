@@ -62,7 +62,20 @@ class InventoryService:
                     supplier_id,
                     purchase_price_cents * quantity,
                 )
-            audit(conn, "batches", batch_id, "receive", after={"quantity": quantity})
+            audit(
+                conn,
+                "batches",
+                batch_id,
+                "receive",
+                after={
+                    "product_id": product_id,
+                    "supplier_id": supplier_id,
+                    "purchase_price_cents": purchase_price_cents,
+                    "quantity": quantity,
+                    "total_cents": purchase_price_cents * quantity,
+                    "date": date,
+                },
+            )
             log_operation(
                 conn,
                 "入库",

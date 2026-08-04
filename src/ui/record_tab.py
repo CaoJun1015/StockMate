@@ -22,7 +22,6 @@ from src.models.queries import (
     list_products,
     search_quotes,
 )
-from src.models.repositories import yuan_to_cents
 from src.services.exceptions import ServiceError
 from src.services.inventory_service import InventoryService
 from src.services.order_service import OrderService
@@ -35,7 +34,8 @@ from src.utils.price_diff import save_snapshot, get_latest_snapshot, diff_snapsh
 from src.utils.follow_up import get_stale_quotes, format_reminder_text
 from src.utils.monthly_report import get_monthly_report, format_report_text
 from src.utils.shipment_flow import parse_sn_input, validate_sn, validate_sn_list, generate_shipment_receipt
-from src.utils.tax import calc_tax_adjusted_profit
+from src.utils.money import format_yuan, yuan_to_cents
+from src.utils.tax import calc_tax_adjusted_profit_cents
 from src.ui.dialogs import ShipmentDialog, PaymentDialog, QuoteEditDialog
 
 
@@ -172,9 +172,9 @@ class RecordTab(QWidget):
         total_sale = 0
         for i, q in enumerate(quotes):
             status = q.get("status", "待确认")
-            received = q.get("received_amount", 0) or 0
+            received = q.get("received_amount_cents", 0) or 0
             sn_list = q.get("sn_list", "") or q.get("batch_sn_list", "") or ""
-            quote_price = q.get("quote_price", 0) or 0
+            quote_price = q.get("quote_price_cents", 0) or 0
             quote_quantity = q.get("quote_quantity", 1) or 1
             total_amount = quote_price * quote_quantity
 
@@ -187,9 +187,19 @@ class RecordTab(QWidget):
             self.record_table.setItem(i, 6, QTableWidgetItem(q.get("storage", "")))
             self.record_table.setItem(i, 7, QTableWidgetItem(q.get("gpu", "")))
             self.record_table.setItem(i, 8, QTableWidgetItem(q.get("supplier_name", "") or ""))
-            self.record_table.setItem(i, 9, QTableWidgetItem(f"¥{q.get('purchase_price', 0):.0f}" if q.get('purchase_price') else ""))
+            self.record_table.setItem(
+                i,
+                9,
+                QTableWidgetItem(
+                    format_yuan(q.get("purchase_price_cents", 0))
+                    if q.get("purchase_price_cents")
+                    else ""
+                ),
+            )
             self.record_table.setItem(i, 10, QTableWidgetItem(str(quote_quantity)))
-            self.record_table.setItem(i, 11, QTableWidgetItem(f"¥{quote_price:.0f}" if quote_price else ""))
+            self.record_table.setItem(
+                i, 11, QTableWidgetItem(format_yuan(quote_price) if quote_price else "")
+            )
 
             status_item = QTableWidgetItem(status)
             color = STATUS_COLORS.get(status, "#333")
@@ -197,7 +207,7 @@ class RecordTab(QWidget):
             status_item.setBackground(QColor(color))
             self.record_table.setItem(i, 12, status_item)
 
-            received_text = f"¥{received:.0f}" if received > 0 else "¥0"
+            received_text = format_yuan(received)
             received_item = QTableWidgetItem(received_text)
             if received >= total_amount and total_amount > 0:
                 received_item.setForeground(QColor("#388E3C"))
@@ -211,7 +221,7 @@ class RecordTab(QWidget):
             self.record_table.setItem(i, 15, QTableWidgetItem(merged_remark))
             self.record_table.setItem(i, 16, QTableWidgetItem(q.get("paid", "否")))
 
-            total_cost += (q.get("purchase_price", 0) or 0) * quote_quantity
+            total_cost += (q.get("purchase_price_cents", 0) or 0) * quote_quantity
             total_sale += quote_price * quote_quantity
 
             # 收款提醒：已出库超过7天未收满的订单，整行红色高亮
@@ -240,21 +250,22 @@ class RecordTab(QWidget):
         tax_total_sale = 0
         total_tax_profit = 0
         for q in quotes:
-            purchase_price = q.get("purchase_price", 0) or 0
-            quote_price = q.get("quote_price", 0) or 0
+            purchase_price = q.get("purchase_price_cents", 0) or 0
+            quote_price = q.get("quote_price_cents", 0) or 0
             quantity = q.get("quote_quantity", 1) or 1
             tax_rate = q.get("tax_rate")
             purchase_tax_inclusive = q.get("purchase_tax_inclusive", 0) or 0
             quote_tax_inclusive = q.get("quote_tax_inclusive", 0) or 0
             tax_total_cost += purchase_price * quantity
             tax_total_sale += quote_price * quantity
-            total_tax_profit += calc_tax_adjusted_profit(
+            total_tax_profit += calc_tax_adjusted_profit_cents(
                 purchase_price, quote_price, quantity, tax_rate,
                 purchase_tax_inclusive, quote_tax_inclusive,
             )
         profit = total_tax_profit
         self.stats_label.setText(
-            f"共 {len(quotes)} 条记录  |  总购入: ¥{tax_total_cost:.0f}  |  总报价: ¥{tax_total_sale:.0f}  |  毛利: ¥{profit:.0f}"
+            f"共 {len(quotes)} 条记录  |  总购入: {format_yuan(tax_total_cost)}  |  "
+            f"总报价: {format_yuan(tax_total_sale)}  |  毛利: {format_yuan(profit)}"
         )
 
     def on_edit_quote(self):
@@ -739,7 +750,12 @@ class RecordTab(QWidget):
                 QMessageBox.warning(self, "提示", "没有有效的SN")
                 return
             receipt = generate_shipment_receipt(
-                {"series": "手动出库", "customer_name": "________", "quote_price": 0, "quote_quantity": len(valid)},
+                {
+                    "series": "手动出库",
+                    "customer_name": "________",
+                    "quote_price_cents": 0,
+                    "quote_quantity": len(valid),
+                },
                 valid
             )
             clipboard = QApplication.clipboard()

@@ -9,20 +9,111 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
-
-def yuan_to_cents(value: int | float | str | Decimal) -> int:
-    return int((Decimal(str(value)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-
-
-def cents_to_yuan(value: int | None) -> float:
-    return float(Decimal(value or 0) / Decimal(100))
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
+
+
+IMPORT_COLUMNS = {
+    "products": (
+        "series", "cpu", "ram", "storage", "gpu", "screen", "note",
+        "created_at", "deleted_at", "deleted_reason",
+    ),
+    "suppliers": (
+        "name", "wechat", "qq", "phone", "note", "balance_cents",
+        "created_at", "deleted_at", "deleted_reason",
+    ),
+    "customers": (
+        "name", "wechat", "qq", "phone", "note", "balance_cents",
+        "default_tax_rate", "created_at", "deleted_at", "deleted_reason",
+    ),
+    "batches": (
+        "product_id", "purchase_price_cents", "quantity", "remaining", "date",
+        "remark", "supplier_id", "sn_list", "created_at", "deleted_at",
+        "deleted_reason",
+    ),
+    "quotes": (
+        "batch_id", "customer_id", "quote_price_cents", "quote_quantity",
+        "quote_date", "remark", "paid", "status", "received_amount_cents",
+        "sn_list", "tax_rate", "purchase_tax_inclusive",
+        "quote_tax_inclusive", "created_at", "deleted_at", "deleted_reason",
+    ),
+    "payments": (
+        "quote_id", "customer_id", "supplier_id", "type", "amount_cents",
+        "entry_kind", "reversal_of_id", "supersedes_id", "pay_date", "method",
+        "remark", "created_at",
+    ),
+    "payment_allocations": (
+        "payment_id", "quote_id", "amount_cents", "created_at",
+    ),
+    "audit_events": (
+        "entity_type", "entity_id", "action", "before_json", "after_json",
+        "reason", "created_at",
+    ),
+}
+
+
+def import_record(
+    conn: sqlite3.Connection,
+    table: str,
+    record: dict[str, Any],
+) -> int:
+    columns = IMPORT_COLUMNS.get(table)
+    if columns is None:
+        raise ValueError(f"不支持导入表: {table}")
+    selected = [column for column in columns if column in record]
+    placeholders = ",".join("?" for _ in selected)
+    names = ",".join(f'"{column}"' for column in selected)
+    cursor = conn.execute(
+        f'INSERT INTO "{table}" ({names}) VALUES ({placeholders})',
+        tuple(record[column] for column in selected),
+    )
+    return int(cursor.lastrowid)
+
+
+def update_import_payment_links(
+    conn: sqlite3.Connection,
+    payment_id: int,
+    *,
+    reversal_of_id: int | None,
+    supersedes_id: int | None,
+) -> None:
+    conn.execute(
+        "UPDATE payments SET reversal_of_id=?,supersedes_id=? WHERE id=?",
+        (reversal_of_id, supersedes_id, payment_id),
+    )
+
+
+def insert_price_snapshot(
+    conn: sqlite3.Connection,
+    import_date: str,
+    products: list[dict[str, Any]],
+) -> int:
+    cursor = conn.execute(
+        "INSERT INTO price_snapshots(import_date,item_count) VALUES (?,?)",
+        (import_date, len(products)),
+    )
+    snapshot_id = int(cursor.lastrowid)
+    for product in products:
+        conn.execute(
+            "INSERT INTO price_snapshot_items "
+            "(snapshot_id,series,cpu,ram,storage,gpu,note,norm_key) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                snapshot_id,
+                product.get("series", ""),
+                product.get("cpu", ""),
+                product.get("ram", ""),
+                product.get("storage", ""),
+                product.get("gpu", ""),
+                product.get("note", ""),
+                product.get("norm_key", ""),
+            ),
+        )
+    return snapshot_id
 
 
 def get_active_entity(
@@ -130,21 +221,19 @@ def insert_quote(
 ) -> int:
     cursor = conn.execute(
         "INSERT INTO quotes "
-        "(batch_id,customer_id,quote_price,quote_price_cents,quote_quantity,"
-        "quote_date,remark,paid,status,received_amount,received_amount_cents,"
+        "(batch_id,customer_id,quote_price_cents,quote_quantity,"
+        "quote_date,remark,paid,status,received_amount_cents,"
         "sn_list,tax_rate,purchase_tax_inclusive,quote_tax_inclusive) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             batch_id,
             customer_id,
-            cents_to_yuan(quote_price_cents),
             quote_price_cents,
             quote_quantity,
             quote_date,
             remark,
             "否",
             "待确认",
-            0,
             0,
             "",
             tax_rate,
@@ -188,13 +277,12 @@ def update_quote(
     quote_tax_inclusive: bool,
 ) -> None:
     conn.execute(
-        "UPDATE quotes SET batch_id=?,customer_id=?,quote_price=?,quote_price_cents=?,"
+        "UPDATE quotes SET batch_id=?,customer_id=?,quote_price_cents=?,"
         "quote_quantity=?,quote_date=?,remark=?,paid=?,sn_list=?,tax_rate=?,"
         "purchase_tax_inclusive=?,quote_tax_inclusive=? WHERE id=?",
         (
             batch_id,
             customer_id,
-            cents_to_yuan(quote_price_cents),
             quote_price_cents,
             quote_quantity,
             quote_date,
@@ -222,11 +310,10 @@ def insert_batch(
 ) -> int:
     cursor = conn.execute(
         "INSERT INTO batches "
-        "(product_id,purchase_price,purchase_price_cents,quantity,remaining,"
-        "date,remark,supplier_id,sn_list) VALUES (?,?,?,?,?,?,?,?,?)",
+        "(product_id,purchase_price_cents,quantity,remaining,"
+        "date,remark,supplier_id,sn_list) VALUES (?,?,?,?,?,?,?,?)",
         (
             product_id,
-            cents_to_yuan(purchase_price_cents),
             purchase_price_cents,
             quantity,
             quantity,
@@ -320,9 +407,8 @@ def adjust_supplier_balance(
     delta_cents: int,
 ) -> None:
     conn.execute(
-        "UPDATE suppliers SET balance_cents=balance_cents+?, balance=balance+? "
-        "WHERE id=?",
-        (delta_cents, cents_to_yuan(delta_cents), supplier_id),
+        "UPDATE suppliers SET balance_cents=balance_cents+? WHERE id=?",
+        (delta_cents, supplier_id),
     )
 
 
@@ -471,18 +557,16 @@ def insert_payment(
     reversal_of_id: int | None = None,
     supersedes_id: int | None = None,
 ) -> int:
-    amount = cents_to_yuan(amount_cents)
     cursor = conn.execute(
         "INSERT INTO payments "
-        "(quote_id, customer_id, supplier_id, type, amount, amount_cents, "
+        "(quote_id, customer_id, supplier_id, type, amount_cents, "
         "entry_kind, reversal_of_id, supersedes_id, pay_date, method, remark) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (
             quote_id,
             customer_id,
             supplier_id,
             pay_type,
-            amount,
             amount_cents,
             entry_kind,
             reversal_of_id,
@@ -525,7 +609,7 @@ def sync_quote_payment_state(conn: sqlite3.Connection, quote_id: int) -> None:
     elif status == "已收款":
         status = "已出库" if row["sn_list"] else "待确认"
     conn.execute(
-        "UPDATE quotes SET received_amount=?, paid=?, status=? WHERE id=?",
-        (cents_to_yuan(received), paid, status, quote_id),
+        "UPDATE quotes SET paid=?, status=? WHERE id=?",
+        (paid, status, quote_id),
     )
 

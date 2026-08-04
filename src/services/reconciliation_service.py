@@ -126,8 +126,8 @@ class ReconciliationService:
         for row in snapshot["amounts"]:
             issues.append(
                 ReconciliationIssue(
-                    "CENTS_MISMATCH",
-                    f"{row['entity_type']}#{row['id']} 的 {row['field']} 元/分字段不一致",
+                    "CENTS_TYPE",
+                    f"{row['entity_type']}#{row['id']} 的 {row['field']} 不是有效整数分",
                     row["entity_type"],
                     row["id"],
                 )

@@ -119,7 +119,7 @@ def _ensure_legacy_compatibility_columns(conn: sqlite3.Connection) -> None:
     """)
 
 
-def _needs_current_schema_repair(conn: sqlite3.Connection) -> bool:
+def _needs_v2_schema_repair(conn: sqlite3.Connection) -> bool:
     required = {
         "products": {"deleted_at", "deleted_reason"},
         "batches": {
@@ -147,6 +147,100 @@ def _needs_current_schema_repair(conn: sqlite3.Connection) -> bool:
         for table in ("payment_allocations", "audit_events", "schema_migrations")
     )
     return missing_columns or missing_tables
+
+
+LEGACY_MONEY_COLUMNS = {
+    "batches": ("purchase_price", "purchase_price_cents"),
+    "quotes": ("quote_price", "quote_price_cents"),
+    "payments": ("amount", "amount_cents"),
+    "customers": ("balance", "balance_cents"),
+    "suppliers": ("balance", "balance_cents"),
+}
+
+
+def _validate_v2_money(conn: sqlite3.Connection) -> None:
+    """Refuse to discard a legacy REAL value that differs from its cents value."""
+    problems: list[str] = []
+    pairs = [
+        *(
+            (table, source, target)
+            for table, (source, target) in LEGACY_MONEY_COLUMNS.items()
+        ),
+        ("quotes", "received_amount", "received_amount_cents"),
+    ]
+    for table, source, target in pairs:
+        if source not in _columns(conn, table) or target not in _columns(conn, table):
+            problems.append(f"{table}.{source}/{target} 缺失")
+            continue
+        for row in conn.execute(f'SELECT id,"{source}","{target}" FROM "{table}"'):
+            expected = _to_cents(row[source], table, row["id"], source)
+            if expected != row[target]:
+                problems.append(
+                    f"{table}#{row['id']} {source}={row[source]!r}，"
+                    f"{target}={row[target]!r}"
+                )
+                if len(problems) >= 20:
+                    break
+        if len(problems) >= 20:
+            break
+    if problems:
+        raise DatabaseMigrationError(
+            "REAL/整数分金额不一致，拒绝删除旧字段：\n" + "\n".join(problems)
+        )
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """Drop legacy REAL money columns; SQLite performs a transactional rebuild."""
+    _validate_v2_money(conn)
+    for table, source in (
+        ("batches", "purchase_price"),
+        ("quotes", "quote_price"),
+        ("quotes", "received_amount"),
+        ("payments", "amount"),
+        ("customers", "balance"),
+        ("suppliers", "balance"),
+    ):
+        conn.execute(f'ALTER TABLE "{table}" DROP COLUMN "{source}"')
+
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_events(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_events(action)",
+    ):
+        conn.execute(statement)
+
+
+def _verify_v3_schema(conn: sqlite3.Connection) -> None:
+    forbidden = [
+        f"{table}.{column}"
+        for table, column in (
+            ("batches", "purchase_price"),
+            ("quotes", "quote_price"),
+            ("quotes", "received_amount"),
+            ("payments", "amount"),
+            ("customers", "balance"),
+            ("suppliers", "balance"),
+        )
+        if column in _columns(conn, table)
+    ]
+    if forbidden:
+        raise DatabaseMigrationError(
+            "schema v3 仍包含旧金额字段: " + ", ".join(forbidden)
+        )
+    required = {
+        "batches": {"purchase_price_cents"},
+        "quotes": {"quote_price_cents", "received_amount_cents"},
+        "payments": {"amount_cents", "entry_kind", "reversal_of_id", "supersedes_id"},
+        "customers": {"balance_cents"},
+        "suppliers": {"balance_cents"},
+    }
+    missing = [
+        f"{table}.{column}"
+        for table, columns in required.items()
+        for column in columns
+        if column not in _columns(conn, table)
+    ]
+    if missing:
+        raise DatabaseMigrationError("schema v3 缺少字段: " + ", ".join(missing))
 
 
 def _migrate_legacy_to_v2(conn: sqlite3.Connection) -> None:
@@ -278,7 +372,7 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
             conn.executescript(CURRENT_SCHEMA_SQL)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (?,?)",
-                (SCHEMA_VERSION, "fresh_schema_v2"),
+                (SCHEMA_VERSION, "fresh_schema_v3"),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             conn.commit()
@@ -286,7 +380,7 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
 
         if version < SCHEMA_VERSION:
             conn.close()
-            backup = create_backup(path, prefix="pre_migration_v1.13", retain=False)
+            backup = create_backup(path, prefix="pre_migration_v1.15", retain=False)
             conn = connect(path)
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
@@ -301,28 +395,32 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
                     "INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (1,?)",
                     ("legacy_schema_validated",),
                 )
-            _migrate_legacy_to_v2(conn)
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (2,?)",
-                ("cents_soft_delete_ledger",),
-            )
-            conn.execute("PRAGMA user_version=2")
-            conn.commit()
-        elif version == SCHEMA_VERSION:
-            # Structural verification is intentionally idempotent. It also
-            # repairs a v2 database produced by an interrupted/older v1.13
-            # candidate without changing business rows.
-            if _needs_current_schema_repair(conn):
-                conn.close()
-                backup = create_backup(path, prefix="pre_migration_v1.13", retain=False)
-                conn = connect(path)
-                conn.execute("BEGIN IMMEDIATE")
+            if version < 2:
                 _migrate_legacy_to_v2(conn)
-                conn.commit()
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (2,?)",
+                    ("cents_soft_delete_ledger",),
+                )
+            elif _needs_v2_schema_repair(conn):
+                _migrate_legacy_to_v2(conn)
+            _migrate_v2_to_v3(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (3,?)",
+                ("integer_money_audit_ui",),
+            )
+            conn.execute("PRAGMA user_version=3")
+            conn.commit()
 
+        _verify_v3_schema(conn)
         check = conn.execute("PRAGMA integrity_check").fetchone()[0]
         if check != "ok":
             raise DatabaseMigrationError(f"迁移后完整性检查失败: {check}", backup)
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_keys:
+            sample = ", ".join(
+                f"{row['table']}#{row['rowid']}" for row in foreign_keys[:10]
+            )
+            raise DatabaseMigrationError(f"迁移后外键检查失败: {sample}", backup)
         return backup
     except DatabaseMigrationError as exc:
         if conn.in_transaction:

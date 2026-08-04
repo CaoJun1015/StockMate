@@ -38,7 +38,7 @@ class PaymentService:
         payment_id: int,
         customer_id: int,
         amount_cents: int,
-    ) -> None:
+    ) -> list[dict[str, int]]:
         quotes = list_fifo_receivable_quotes(conn, customer_id)
         available = sum(
             row["quote_price_cents"] * row["quote_quantity"] - row["received_amount_cents"]
@@ -47,6 +47,7 @@ class PaymentService:
         if amount_cents > available:
             raise ValidationError("收款金额超过客户待收金额")
         remaining = amount_cents
+        allocations: list[dict[str, int]] = []
         for quote in quotes:
             pending = (
                 quote["quote_price_cents"] * quote["quote_quantity"]
@@ -57,9 +58,13 @@ class PaymentService:
                 add_allocation(conn, payment_id, quote["id"], applied)
                 add_quote_received_amount(conn, quote["id"], applied)
                 sync_quote_payment_state(conn, quote["id"])
+                allocations.append(
+                    {"quote_id": quote["id"], "amount_cents": applied}
+                )
                 remaining -= applied
             if remaining == 0:
                 break
+        return allocations
 
     def receive_customer_payment(
         self,
@@ -86,13 +91,21 @@ class PaymentService:
                 remark=remark,
                 supersedes_id=supersedes_id,
             )
-            self._allocate_customer_payment(conn, payment_id, customer_id, amount_cents)
+            allocations = self._allocate_customer_payment(
+                conn, payment_id, customer_id, amount_cents
+            )
             audit(
                 conn,
                 "payments",
                 payment_id,
                 "receive",
-                after={"amount_cents": amount_cents, "customer_id": customer_id},
+                after={
+                    "amount_cents": amount_cents,
+                    "customer_id": customer_id,
+                    "pay_date": pay_date,
+                    "method": method,
+                    "allocations": allocations,
+                },
             )
             log_operation(
                 conn,
@@ -134,7 +147,12 @@ class PaymentService:
                 "payments",
                 payment_id,
                 "pay",
-                after={"amount_cents": amount_cents, "supplier_id": supplier_id},
+                after={
+                    "amount_cents": amount_cents,
+                    "supplier_id": supplier_id,
+                    "pay_date": pay_date,
+                    "method": method,
+                },
             )
             log_operation(
                 conn,
@@ -191,7 +209,11 @@ class PaymentService:
             payment_id,
             "void",
             before=dict(payment),
-            after={"reversal_id": reversal_id},
+            after={
+                "reversal_id": reversal_id,
+                "amount_cents": payment["amount_cents"],
+                "allocations": list_payment_allocations(conn, reversal_id),
+            },
             reason=reason,
         )
         log_operation(conn, "作废流水", "payments", payment_id, reason)
@@ -233,10 +255,11 @@ class PaymentService:
                 supersedes_id=payment_id,
             )
             if original["type"] == "receivable":
-                self._allocate_customer_payment(
+                allocations = self._allocate_customer_payment(
                     conn, replacement_id, original["customer_id"], amount_cents
                 )
             elif original["supplier_id"]:
+                allocations = []
                 adjust_supplier_balance(
                     conn,
                     original["supplier_id"],
@@ -247,7 +270,13 @@ class PaymentService:
                 "payments",
                 replacement_id,
                 "correct",
-                after={"supersedes_id": payment_id, "amount_cents": amount_cents},
+                after={
+                    "supersedes_id": payment_id,
+                    "amount_cents": amount_cents,
+                    "pay_date": pay_date,
+                    "method": method,
+                    "allocations": allocations,
+                },
                 reason=reason,
             )
             log_operation(

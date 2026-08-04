@@ -65,7 +65,20 @@ class OrderService:
                 purchase_tax_inclusive=purchase_tax_inclusive,
                 quote_tax_inclusive=quote_tax_inclusive,
             )
-            audit(conn, "quotes", quote_id, "create", after={"status": "待确认"})
+            audit(
+                conn,
+                "quotes",
+                quote_id,
+                "create",
+                after={
+                    "batch_id": batch_id,
+                    "customer_id": customer_id,
+                    "quote_price_cents": quote_price_cents,
+                    "quote_quantity": quote_quantity,
+                    "total_cents": quote_price_cents * quote_quantity,
+                    "status": "待确认",
+                },
+            )
             log_operation(conn, "新增报价", "quotes", quote_id, f"数量={quote_quantity}")
             return quote_id
 

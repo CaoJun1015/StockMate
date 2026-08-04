@@ -10,6 +10,7 @@
 
 import re
 from datetime import datetime
+from src.utils.money import format_yuan
 
 
 def parse_sn_input(raw_text):
@@ -182,12 +183,12 @@ def generate_shipment_receipt(quote, sn_list, batch_info=None):
             spec_parts.append(val)
     parts.append(f"机型: {' '.join(spec_parts)}")
 
-    price = quote.get("quote_price", 0) or 0
+    price = quote.get("quote_price_cents", 0) or 0
     qty = quote.get("quote_quantity", 1) or 1
-    parts.append(f"单价: ¥{price:,.0f}")
+    parts.append(f"单价: {format_yuan(price)}")
     parts.append(f"数量: {qty} 台")
     if qty > 1:
-        parts.append(f"合计: ¥{price * qty:,.0f}")
+        parts.append(f"合计: {format_yuan(price * qty)}")
     parts.append("")
 
     # SN 列表

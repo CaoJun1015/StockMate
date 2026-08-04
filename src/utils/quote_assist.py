@@ -7,10 +7,14 @@
 - 计算建议报价范围
 """
 
-from src.models.database import get_connection
+from src.models.queries import (
+    get_customer_price_history_query,
+    get_quote_assist_history,
+)
+from src.utils.money import cents_to_yuan
 
 
-def get_quote_history(series="", cpu="", ram="", storage="", gpu=""):
+def get_quote_history(series="", cpu="", ram="", storage="", gpu="", db_path=None):
     """
     查询指定机型的历史报价记录。
 
@@ -26,80 +30,35 @@ def get_quote_history(series="", cpu="", ram="", storage="", gpu=""):
             recent_quotes: list[dict],  # 最近 5 条
         }
     """
-    conn = get_connection()
-    conditions = []
-    params = []
-
-    if series:
-        conditions.append("p.series LIKE ?")
-        params.append(f"%{series}%")
-    if cpu:
-        conditions.append("p.cpu LIKE ?")
-        params.append(f"%{cpu}%")
-    if ram:
-        conditions.append("p.ram LIKE ?")
-        params.append(f"%{ram}%")
-    if storage:
-        conditions.append("p.storage LIKE ?")
-        params.append(f"%{storage}%")
-    if gpu:
-        conditions.append("p.gpu LIKE ?")
-        params.append(f"%{gpu}%")
-
-    if not conditions:
-        conn.close()
+    stats = get_quote_assist_history(
+        series=series,
+        cpu=cpu,
+        ram=ram,
+        storage=storage,
+        gpu=gpu,
+        db_path=db_path,
+    )
+    if not stats:
         return None
-
-    where = " AND ".join(conditions)
-
-    # 统计
-    stats = conn.execute(f"""
-        SELECT 
-            COUNT(*) as total,
-            MIN(q.quote_price) as min_price,
-            MAX(q.quote_price) as max_price,
-            AVG(q.quote_price) as avg_price,
-            MIN(b.purchase_price) as min_cost,
-            AVG(b.purchase_price) as avg_cost
-        FROM quotes q
-        JOIN batches b ON q.batch_id = b.id
-        JOIN products p ON b.product_id = p.id
-        WHERE {where}
-        AND q.status IN ('已报价', '已出库', '已收款')
-    """, params).fetchone()
-
-    if not stats or stats["total"] == 0:
-        conn.close()
-        return None
-
-    # 最近 5 条
-    recent = conn.execute(f"""
-        SELECT q.quote_price, q.quote_quantity, q.quote_date, q.status,
-               b.purchase_price,
-               c.name as customer_name
-        FROM quotes q
-        JOIN batches b ON q.batch_id = b.id
-        JOIN products p ON b.product_id = p.id
-        LEFT JOIN customers c ON q.customer_id = c.id
-        WHERE {where}
-        ORDER BY q.quote_date DESC, q.id DESC
-        LIMIT 5
-    """, params).fetchall()
-
-    conn.close()
-
     return {
         "total_quotes": stats["total"],
-        "min_price": stats["min_price"],
-        "max_price": stats["max_price"],
-        "avg_price": stats["avg_price"],
-        "min_cost": stats["min_cost"],
-        "avg_cost": stats["avg_cost"],
-        "recent_quotes": [dict(r) for r in recent],
+        "min_price": cents_to_yuan(stats["min_price_cents"]),
+        "max_price": cents_to_yuan(stats["max_price_cents"]),
+        "avg_price": cents_to_yuan(stats["avg_price_cents"]),
+        "min_cost": cents_to_yuan(stats["min_cost_cents"]),
+        "avg_cost": cents_to_yuan(stats["avg_cost_cents"]),
+        "recent_quotes": [
+            {
+                **row,
+                "quote_price": cents_to_yuan(row["quote_price_cents"]),
+                "purchase_price": cents_to_yuan(row["purchase_price_cents"]),
+            }
+            for row in stats["recent_quotes"]
+        ],
     }
 
 
-def get_customer_price_history(customer_name, series=""):
+def get_customer_price_history(customer_name, series="", db_path=None):
     """
     查询指定客户的历史成交价。
 
@@ -110,30 +69,12 @@ def get_customer_price_history(customer_name, series=""):
     返回:
         list[dict] — 该客户的报价历史
     """
-    conn = get_connection()
-    conditions = ["c.name LIKE ?"]
-    params = [f"%{customer_name}%"]
-
-    if series:
-        conditions.append("p.series LIKE ?")
-        params.append(f"%{series}%")
-
-    where = " AND ".join(conditions)
-
-    rows = conn.execute(f"""
-        SELECT q.quote_price, q.quote_quantity, q.quote_date, q.status,
-               p.series, p.cpu, p.ram, p.storage
-        FROM quotes q
-        JOIN batches b ON q.batch_id = b.id
-        JOIN products p ON b.product_id = p.id
-        LEFT JOIN customers c ON q.customer_id = c.id
-        WHERE {where}
-        ORDER BY q.quote_date DESC
-        LIMIT 10
-    """, params).fetchall()
-
-    conn.close()
-    return [dict(r) for r in rows]
+    return [
+        {**row, "quote_price": cents_to_yuan(row["quote_price_cents"])}
+        for row in get_customer_price_history_query(
+            customer_name, series, db_path=db_path
+        )
+    ]
 
 
 def suggest_price(series, cpu="", ram="", storage="", gpu="", purchase_price=0, customer_name=""):

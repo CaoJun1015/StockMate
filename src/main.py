@@ -711,9 +711,8 @@ class MainWindow(QMainWindow):
         """导出全量数据为 JSON 格式"""
         try:
             from src.utils.json_export import export_all_to_json
-            from src.models import database as db
-            
-            output_path = export_all_to_json(db)
+
+            output_path = export_all_to_json()
             QMessageBox.information(
                 self, "导出成功",
                 f"数据已成功导出为 JSON 格式！\n\n文件位置: {output_path}\n\n可用于数据备份或迁移到其他电脑。"
@@ -739,7 +738,6 @@ class MainWindow(QMainWindow):
             return
         
         from src.utils.json_export import validate_json_file, import_from_json
-        from src.models import database as db
         
         valid, message, stats = validate_json_file(file_path)
         if not valid:
@@ -758,7 +756,7 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            success, message, import_stats = import_from_json(file_path, db)
+            success, message, import_stats = import_from_json(file_path)
             
             if success:
                 self.product_tab.refresh_product_list()

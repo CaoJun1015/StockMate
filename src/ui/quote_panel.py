@@ -18,7 +18,7 @@ from src.models.queries import (
     list_customers,
     list_suppliers,
 )
-from src.models.repositories import yuan_to_cents
+from src.utils.money import format_yuan, yuan_to_cents
 from src.services.exceptions import ServiceError
 from src.services.inventory_service import InventoryService
 from src.services.order_service import OrderService
@@ -180,7 +180,7 @@ class QuotePanel(QWidget):
         
         self.batch_table.setRowCount(len(batches))
         for i, b in enumerate(batches):
-            price_item = QTableWidgetItem(f"¥ {b['purchase_price']:.0f}")
+            price_item = QTableWidgetItem(format_yuan(b["purchase_price_cents"]))
             price_item.setData(Qt.ItemDataRole.UserRole, b["id"])
             self.batch_table.setItem(i, 0, price_item)
             self.batch_table.setItem(i, 1, QTableWidgetItem(str(b['quantity'])))

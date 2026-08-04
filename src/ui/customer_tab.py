@@ -15,7 +15,8 @@ from src.models.queries import (
 from src.services.exceptions import ServiceError
 from src.services.party_service import CustomerService
 from src.ui.dialogs import CustomerDialog
-from src.utils.tax import calc_tax_adjusted_profit
+from src.utils.money import format_yuan
+from src.utils.tax import calc_tax_adjusted_profit_cents
 
 
 class CustomerTab(QWidget):
@@ -123,15 +124,17 @@ class CustomerTab(QWidget):
         stats = get_customer_stats(cid)
         
         self.customer_stats_label.setText(
-            f"客户: {customer_name} | 总成交: {stats['total_quotes']}单 | 总金额: ¥{stats['total_amount']:.0f} | 总毛利: ¥{stats['total_profit']:.0f}"
+            f"客户: {customer_name} | 总成交: {stats['total_quotes']}单 | "
+            f"总金额: {format_yuan(stats['total_amount_cents'])} | "
+            f"总毛利: {format_yuan(stats['total_profit_cents'])}"
         )
         
         self.customer_history_table.setRowCount(len(quotes))
         for i, q in enumerate(quotes):
-            purchase_price = q.get("purchase_price", 0) or 0
-            quote_price = q.get("quote_price", 0) or 0
+            purchase_price = q.get("purchase_price_cents", 0) or 0
+            quote_price = q.get("quote_price_cents", 0) or 0
             quantity = q.get("quote_quantity", 1) or 1
-            profit = calc_tax_adjusted_profit(
+            profit = calc_tax_adjusted_profit_cents(
                 purchase_price, quote_price, quantity,
                 q.get("tax_rate"), q.get("purchase_tax_inclusive", 0) or 0, q.get("quote_tax_inclusive", 0) or 0,
             )
@@ -140,9 +143,9 @@ class CustomerTab(QWidget):
             self.customer_history_table.setItem(i, 1, QTableWidgetItem(q.get("series", "")))
             self.customer_history_table.setItem(i, 2, QTableWidgetItem(q.get("cpu", "")))
             self.customer_history_table.setItem(i, 3, QTableWidgetItem(str(quantity)))
-            self.customer_history_table.setItem(i, 4, QTableWidgetItem(f"¥{purchase_price:.0f}"))
-            self.customer_history_table.setItem(i, 5, QTableWidgetItem(f"¥{quote_price:.0f}"))
-            self.customer_history_table.setItem(i, 6, QTableWidgetItem(f"¥{profit:.0f}"))
+            self.customer_history_table.setItem(i, 4, QTableWidgetItem(format_yuan(purchase_price)))
+            self.customer_history_table.setItem(i, 5, QTableWidgetItem(format_yuan(quote_price)))
+            self.customer_history_table.setItem(i, 6, QTableWidgetItem(format_yuan(profit)))
             self.customer_history_table.setItem(i, 7, QTableWidgetItem(q.get("remark", "")))
         
         self.customer_history_table.resizeColumnsToContents()

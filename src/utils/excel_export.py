@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from src.utils.money import cents_to_yuan
 
 
 def export_quotes_to_excel(quotes, output_path=None):
@@ -59,8 +60,8 @@ def export_quotes_to_excel(quotes, output_path=None):
     total_quote = 0
 
     for row_idx, q in enumerate(quotes, 2):
-        purchase_price = q.get("purchase_price", 0) or 0
-        quote_price = q.get("quote_price", 0) or 0
+        purchase_price = q.get("purchase_price_cents", 0) or 0
+        quote_price = q.get("quote_price_cents", 0) or 0
         quantity = q.get("quote_quantity", 1) or 1
         profit = (quote_price - purchase_price) * quantity
 
@@ -76,12 +77,12 @@ def export_quotes_to_excel(quotes, output_path=None):
             q.get("storage", ""),
             q.get("gpu", ""),
             q.get("supplier_name", "") or "",
-            purchase_price,
+            cents_to_yuan(purchase_price),
             quantity,
-            quote_price,
-            profit,
+            cents_to_yuan(quote_price),
+            cents_to_yuan(profit),
             q.get("status", "待确认"),
-            q.get("received_amount", 0) or 0,
+            cents_to_yuan(q.get("received_amount_cents", 0) or 0),
             q.get("sn_list", "") or "",
             q.get("remark", ""),
             q.get("paid", "否"),
@@ -116,9 +117,9 @@ def export_quotes_to_excel(quotes, output_path=None):
     # 汇总行
     summary_row = len(quotes) + 2
     ws.cell(row=summary_row, column=8, value="合计").font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=9, value=round(total_purchase, 2)).font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=11, value=round(total_quote, 2)).font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=12, value=round(total_quote - total_purchase, 2)).font = Font(bold=True, size=10, color="008000")
+    ws.cell(row=summary_row, column=9, value=cents_to_yuan(total_purchase)).font = Font(bold=True, size=10)
+    ws.cell(row=summary_row, column=11, value=cents_to_yuan(total_quote)).font = Font(bold=True, size=10)
+    ws.cell(row=summary_row, column=12, value=cents_to_yuan(total_quote - total_purchase)).font = Font(bold=True, size=10, color="008000")
 
     for col_idx in range(1, len(headers) + 1):
         ws.cell(row=summary_row, column=col_idx).border = thin_border
