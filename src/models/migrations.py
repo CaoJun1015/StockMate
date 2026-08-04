@@ -243,6 +243,115 @@ def _verify_v3_schema(conn: sqlite3.Connection) -> None:
         raise DatabaseMigrationError("schema v3 缺少字段: " + ", ".join(missing))
 
 
+def _execute_current_schema(conn: sqlite3.Connection) -> None:
+    """Execute the idempotent schema without sqlite3.executescript implicit commits."""
+    for statement in CURRENT_SCHEMA_SQL.split(";"):
+        statement = statement.strip()
+        if statement:
+            conn.execute(statement)
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """Add the operating ledger while leaving historical business rows untouched."""
+    _execute_current_schema(conn)
+    _add_column(
+        conn,
+        "payments",
+        "account_id INTEGER REFERENCES ledger_accounts(id)",
+    )
+
+
+def _verify_v4_schema(conn: sqlite3.Connection) -> None:
+    _verify_v3_schema(conn)
+    required_tables = {
+        "finance_settings",
+        "ledger_accounts",
+        "finance_categories",
+        "ledger_entries",
+        "ledger_lines",
+        "shipment_snapshots",
+        "supplier_payment_allocations",
+        "sales_returns",
+        "purchase_returns",
+    }
+    missing_tables = sorted(
+        table for table in required_tables if not _table_exists(conn, table)
+    )
+    if missing_tables:
+        raise DatabaseMigrationError(
+            "schema v4 missing tables: " + ", ".join(missing_tables)
+        )
+    if "account_id" not in _columns(conn, "payments"):
+        raise DatabaseMigrationError("schema v4 missing payments.account_id")
+    system_codes = {
+        row["code"]
+        for row in conn.execute(
+            "SELECT code FROM ledger_accounts WHERE is_system=1"
+        )
+    }
+    required_codes = {
+        "AR",
+        "AP",
+        "INVENTORY",
+        "SALES",
+        "COGS",
+        "EXPENSE",
+        "OTHER_INCOME",
+        "OWNER_EQUITY",
+    }
+    if not required_codes.issubset(system_codes):
+        raise DatabaseMigrationError("schema v4 system ledger accounts are incomplete")
+
+
+def _migration_snapshot(conn: sqlite3.Connection) -> dict[str, int]:
+    snapshot = {
+        f"count:{table}": int(
+            conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        )
+        for table in (
+            "products",
+            "batches",
+            "customers",
+            "suppliers",
+            "quotes",
+            "payments",
+        )
+        if _table_exists(conn, table)
+    }
+    money_columns = (
+        ("batches", "purchase_price_cents"),
+        ("quotes", "quote_price_cents"),
+        ("quotes", "received_amount_cents"),
+        ("payments", "amount_cents"),
+        ("customers", "balance_cents"),
+        ("suppliers", "balance_cents"),
+    )
+    for table, column in money_columns:
+        if _table_exists(conn, table) and column in _columns(conn, table):
+            snapshot[f"sum:{table}.{column}"] = int(
+                conn.execute(
+                    f'SELECT COALESCE(SUM("{column}"),0) FROM "{table}"'
+                ).fetchone()[0]
+            )
+    return snapshot
+
+
+def _verify_database(
+    conn: sqlite3.Connection,
+    backup: BackupInfo | None,
+) -> None:
+    _verify_v4_schema(conn)
+    check = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    if check != "ok":
+        raise DatabaseMigrationError(f"迁移后完整性检查失败: {check}", backup)
+    foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_keys:
+        sample = ", ".join(
+            f"{row['table']}#{row['rowid']}" for row in foreign_keys[:10]
+        )
+        raise DatabaseMigrationError(f"迁移后外键检查失败: {sample}", backup)
+
+
 def _migrate_legacy_to_v2(conn: sqlite3.Connection) -> None:
     required = {"products", "batches", "customers", "suppliers", "quotes", "payments"}
     missing = sorted(table for table in required if not _table_exists(conn, table))
@@ -369,18 +478,21 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
 
         is_fresh = not _table_exists(conn, "products")
         if is_fresh:
-            conn.executescript(CURRENT_SCHEMA_SQL)
+            conn.execute("BEGIN IMMEDIATE")
+            _execute_current_schema(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (?,?)",
-                (SCHEMA_VERSION, "fresh_schema_v3"),
+                (SCHEMA_VERSION, "fresh_schema_v4"),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            _verify_database(conn, None)
             conn.commit()
             return None
 
         if version < SCHEMA_VERSION:
+            before = _migration_snapshot(conn)
             conn.close()
-            backup = create_backup(path, prefix="pre_migration_v1.15", retain=False)
+            backup = create_backup(path, prefix="pre_migration_v1.16", retain=False)
             conn = connect(path)
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
@@ -401,26 +513,40 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
                     "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (2,?)",
                     ("cents_soft_delete_ledger",),
                 )
-            elif _needs_v2_schema_repair(conn):
+            elif version < 3 and _needs_v2_schema_repair(conn):
                 _migrate_legacy_to_v2(conn)
-            _migrate_v2_to_v3(conn)
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (3,?)",
-                ("integer_money_audit_ui",),
-            )
-            conn.execute("PRAGMA user_version=3")
+            if version < 3:
+                _migrate_v2_to_v3(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (3,?)",
+                    ("integer_money_audit_ui",),
+                )
+            if version < 4:
+                _migrate_v3_to_v4(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (4,?)",
+                    ("operating_finance_ledger",),
+                )
+            conn.execute("PRAGMA user_version=4")
+            after = _migration_snapshot(conn)
+            changed = {
+                key: (value, after.get(key))
+                for key, value in before.items()
+                if after.get(key) != value
+            }
+            if changed:
+                details = "；".join(
+                    f"{key}: {values[0]} -> {values[1]}"
+                    for key, values in sorted(changed.items())
+                )
+                raise DatabaseMigrationError(
+                    f"迁移前后核心记录或金额不一致：{details}",
+                    backup,
+                )
+            _verify_database(conn, backup)
             conn.commit()
 
-        _verify_v3_schema(conn)
-        check = conn.execute("PRAGMA integrity_check").fetchone()[0]
-        if check != "ok":
-            raise DatabaseMigrationError(f"迁移后完整性检查失败: {check}", backup)
-        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if foreign_keys:
-            sample = ", ".join(
-                f"{row['table']}#{row['rowid']}" for row in foreign_keys[:10]
-            )
-            raise DatabaseMigrationError(f"迁移后外键检查失败: {sample}", backup)
+        _verify_database(conn, backup)
         return backup
     except DatabaseMigrationError as exc:
         if conn.in_transaction:

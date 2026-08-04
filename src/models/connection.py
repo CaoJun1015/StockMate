@@ -182,7 +182,7 @@ def restore_database(
     target_path.parent.mkdir(parents=True, exist_ok=True)
     safety_backup = create_backup(
         target_path,
-        prefix="pre_restore_v1.15",
+        prefix="pre_restore_v1.16",
         retain=False,
     )
     try:

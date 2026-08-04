@@ -16,6 +16,7 @@ from src.models.queries import (
     list_financial_audit_events,
 )
 from src.models.schema import SCHEMA_VERSION
+from src.services.finance_service import FinanceService
 from src.services.inventory_service import InventoryService
 from src.services.order_service import OrderService
 from src.services.party_service import CustomerService, SupplierService
@@ -88,6 +89,10 @@ def _seed_flow(path: Path):
     product = ProductService(path).create(series="Y7000P", cpu="i7")
     customer = CustomerService(path).create(name="审计客户")
     supplier = SupplierService(path).create(name="审计上游")
+    FinanceService(path).initialize_finance(
+        "2026-08-04",
+        [{"name": "测试账户", "opening_balance_cents": 0}],
+    )
     batch = InventoryService(path).receive_batch(
         product_id=product,
         purchase_price_cents=500_000,
@@ -106,12 +111,25 @@ def _seed_flow(path: Path):
     return product, customer, supplier, batch, quote
 
 
-def test_fresh_database_is_schema_v3_without_real_money_columns(tmp_path):
+def _funds_account(path: Path) -> int:
+    conn = connect(path, read_only=True)
+    try:
+        return int(
+            conn.execute(
+                "SELECT id FROM ledger_accounts "
+                "WHERE is_system=0 AND is_active=1 ORDER BY id LIMIT 1"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+
+def test_fresh_database_is_schema_v4_without_real_money_columns(tmp_path):
     path = tmp_path / "fresh.db"
     assert migrate_database(path) is None
     conn = connect(path, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
         assert "purchase_price" not in _columns(conn, "batches")
         assert {"quote_price", "received_amount"}.isdisjoint(_columns(conn, "quotes"))
         assert "amount" not in _columns(conn, "payments")
@@ -126,10 +144,10 @@ def test_v2_migration_drops_real_columns_and_creates_hashed_backup(tmp_path):
     _make_v2(path)
     backup = migrate_database(path)
     assert backup and backup.path.exists() and len(backup.sha256) == 64
-    assert backup.path.name.startswith("pre_migration_v1.15_")
+    assert backup.path.name.startswith("pre_migration_v1.16_")
     conn = connect(path, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         assert "purchase_price" not in _columns(conn, "batches")
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert not conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -150,7 +168,7 @@ def test_v2_money_mismatch_rolls_back_and_reports_record(tmp_path):
         conn.close()
 
 
-def test_version_zero_database_runs_v2_and_v3_chain(tmp_path):
+def test_version_zero_database_runs_v2_v3_and_v4_chain(tmp_path):
     path = tmp_path / "legacy.db"
     _make_v2(path)
     conn = connect(path)
@@ -160,11 +178,11 @@ def test_version_zero_database_runs_v2_and_v3_chain(tmp_path):
     migrate_database(path)
     conn = connect(path, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         versions = {
             row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
         }
-        assert {1, 2, 3}.issubset(versions)
+        assert {1, 2, 3, 4}.issubset(versions)
     finally:
         conn.close()
 
@@ -180,7 +198,7 @@ def test_unknown_future_version_is_rejected(tmp_path):
         migrate_database(path)
 
 
-def test_restoring_v2_backup_upgrades_it_to_v3(tmp_path):
+def test_restoring_v2_backup_upgrades_it_to_v4(tmp_path):
     backup = tmp_path / "old-v2.db"
     _make_v2(backup)
     target = tmp_path / "current.db"
@@ -188,7 +206,7 @@ def test_restoring_v2_backup_upgrades_it_to_v3(tmp_path):
     restore_database(backup, target)
     conn = connect(target, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         assert "amount" not in _columns(conn, "payments")
     finally:
         conn.close()
@@ -198,7 +216,12 @@ def test_service_flow_uses_cents_and_builds_fifo_audit_chain(tmp_path):
     path = tmp_path / "flow.db"
     _, customer, _, _, quote = _seed_flow(path)
     receipt = PaymentService(path).receive_customer_payment(
-        customer, 600_000, "2026-08-04", "微信", "首款"
+        customer,
+        600_000,
+        "2026-08-04",
+        "微信",
+        "首款",
+        account_id=_funds_account(path),
     )
     conn = connect(path, read_only=True)
     try:
@@ -227,7 +250,11 @@ def test_void_and_correction_are_immutable_and_visible_in_audit(tmp_path):
     _, customer, _, _, _ = _seed_flow(path)
     service = PaymentService(path)
     original = service.receive_customer_payment(
-        customer, 500_000, "2026-08-04", "微信"
+        customer,
+        500_000,
+        "2026-08-04",
+        "微信",
+        account_id=_funds_account(path),
     ).payment_id
     replacement = service.correct_payment(
         original,
@@ -253,7 +280,11 @@ def test_supplier_payment_audit_keeps_deleted_party_name(tmp_path):
     path = tmp_path / "supplier.db"
     _, _, supplier, _, _ = _seed_flow(path)
     PaymentService(path).record_supplier_payment(
-        supplier, 100_000, "2026-08-04", "转账"
+        supplier,
+        100_000,
+        "2026-08-04",
+        "转账",
+        account_id=_funds_account(path),
     )
     SupplierService(path).delete(supplier, "停止合作")
     events = list_financial_audit_events(
@@ -273,12 +304,16 @@ def test_v115_json_is_cents_only_and_roundtrips(tmp_path):
     source = tmp_path / "source.db"
     _, customer, _, _, _ = _seed_flow(source)
     PaymentService(source).receive_customer_payment(
-        customer, 500_000, "2026-08-04", "微信"
+        customer,
+        500_000,
+        "2026-08-04",
+        "微信",
+        account_id=_funds_account(source),
     )
     exported = tmp_path / "backup.json"
     export_all_to_json(exported, source)
     document = json.loads(exported.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 3
+    assert document["schema_version"] == 4
     assert document["money_unit"] == "cents"
     assert "amount" not in document["data"]["payments"][0]
     assert "quote_price" not in document["data"]["quotes"][0]
@@ -388,6 +423,6 @@ def test_finance_tab_exposes_audit_subpage(qapp, tmp_path):
     _seed_flow(path)
     tab = FinanceTab(db_path=path)
     tab.refresh()
-    assert tab.section_tabs.count() == 3
-    assert tab.section_tabs.tabText(2) == "账务审计"
-    assert tab.audit_table.rowCount() >= 3
+    assert tab.section_tabs.count() == 5
+    assert tab.section_tabs.tabText(4) == "流水审计"
+    assert tab.audit_table.rowCount() >= 2

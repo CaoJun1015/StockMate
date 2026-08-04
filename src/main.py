@@ -188,7 +188,7 @@ class MainWindow(QMainWindow):
         # === Tab 5: 账款管理 ===
         self.finance_tab = FinanceTab(self)
         self.finance_tab.data_changed.connect(self.refresh_records)
-        self.tabs.addTab(self.finance_tab, "💰 账款管理")
+        self.tabs.addTab(self.finance_tab, "💰 财务记账")
         # One-release UI compatibility for external scripts/tests.
         for name in (
             "receivable_table", "payable_table", "payment_flow_table",

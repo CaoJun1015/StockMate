@@ -4,7 +4,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel,
-    QComboBox, QLineEdit, QSpinBox, QGroupBox,
+    QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QGroupBox,
     QMessageBox, QApplication, QAbstractItemView,
     QCheckBox,
 )
@@ -23,10 +23,12 @@ from src.services.exceptions import ServiceError
 from src.services.inventory_service import InventoryService
 from src.services.order_service import OrderService
 from src.services.party_service import CustomerService
+from src.services.return_service import ReturnService
 from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_single_quote_card, generate_quote_image, WATERMARK_TEXT
 
-from src.ui.dialogs import BatchDialog, CustomerDialog, ProductEditDialog, _parse_tax_rate
+from src.ui.dialogs import CustomerDialog, ProductEditDialog, _parse_tax_rate
+from src.ui.finance_dialogs import BatchDialog, ReturnDialog
 
 
 class QuotePanel(QWidget):
@@ -38,6 +40,7 @@ class QuotePanel(QWidget):
         self.customer_service = CustomerService()
         self.inventory_service = InventoryService()
         self.order_service = OrderService()
+        self.return_service = ReturnService()
         self.setup_ui()
 
     def setup_ui(self):
@@ -68,11 +71,15 @@ class QuotePanel(QWidget):
         self.del_batch_btn = QPushButton("删除批次")
         self.del_batch_btn.setObjectName("dangerBtn")
         self.del_batch_btn.clicked.connect(self.on_delete_batch)
+        self.return_batch_btn = QPushButton("采购退货")
+        self.return_batch_btn.setObjectName("warningBtn")
+        self.return_batch_btn.clicked.connect(self.on_return_batch)
         self.refresh_batch_btn = QPushButton("刷新")
         self.refresh_batch_btn.setObjectName("ghostBtn")
         self.refresh_batch_btn.clicked.connect(self.refresh)
         btn_row1.addWidget(self.add_batch_btn)
         btn_row1.addWidget(self.del_batch_btn)
+        btn_row1.addWidget(self.return_batch_btn)
         btn_row1.addWidget(self.refresh_batch_btn)
         btn_row1.addStretch()
         layout.addLayout(btn_row1)
@@ -82,8 +89,9 @@ class QuotePanel(QWidget):
         group = QGroupBox("报价操作")
         glayout = QGridLayout(group)
 
-        self.quote_price_spin = QSpinBox()
-        self.quote_price_spin.setRange(0, 999999)
+        self.quote_price_spin = QDoubleSpinBox()
+        self.quote_price_spin.setDecimals(2)
+        self.quote_price_spin.setRange(0, 999999999.99)
         self.quote_price_spin.setPrefix("¥ ")
         self.quote_price_spin.setValue(0)
 
@@ -225,11 +233,51 @@ class QuotePanel(QWidget):
                     remark=data["remark"],
                     supplier_id=data["supplier_id"],
                     sn_list=data["sn_list"],
+                    settlement_mode=data["settlement_mode"],
+                    account_id=data["account_id"],
                 )
             except ServiceError as exc:
                 QMessageBox.warning(self, "入库失败", str(exc))
                 return
             self.refresh()
+
+    def on_return_batch(self):
+        row = self.batch_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "提示", "请先选择要退货的批次")
+            return
+        item = self.batch_table.item(row, 0)
+        if not item:
+            return
+        batch_id = item.data(Qt.ItemDataRole.UserRole)
+        remaining_item = self.batch_table.item(row, 2)
+        try:
+            remaining = int(remaining_item.text()) if remaining_item else 1
+        except ValueError:
+            remaining = 1
+        dialog = ReturnDialog(
+            "采购退货",
+            self,
+            max_quantity=max(1, remaining),
+            allow_restock=False,
+        )
+        if not dialog.exec():
+            return
+        data = dialog.get_data()
+        try:
+            self.return_service.return_purchase(
+                batch_id,
+                quantity=data["quantity"],
+                return_date=data["date"],
+                reason=data["reason"],
+                refund_account_id=data["account_id"],
+                cash_refund_cents=yuan_to_cents(data["refund"]),
+            )
+        except ServiceError as exc:
+            QMessageBox.warning(self, "采购退货失败", str(exc))
+            return
+        QMessageBox.information(self, "成功", "采购退货已记录")
+        self.refresh()
 
     def on_delete_batch(self):
         row = self.batch_table.currentRow()
@@ -292,9 +340,9 @@ class QuotePanel(QWidget):
             screen=product.get("screen", ""),
             note=product.get("note", ""),
             customer_name=customer_name,
-            quote_price=f"¥ {quote_price:.0f}",
+            quote_price=f"¥ {quote_price:,.2f}",
             quote_quantity=quote_quantity,
-            total_price=f"¥ {total:.0f}",
+            total_price=f"¥ {total:,.2f}",
         )
         QMessageBox.information(self, "成功", f"{message}\n报价图片已生成:\n{output}")
         self.refresh()

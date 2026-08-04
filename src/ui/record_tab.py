@@ -27,6 +27,7 @@ from src.services.inventory_service import InventoryService
 from src.services.order_service import OrderService
 from src.services.payment_service import PaymentService
 from src.services.product_service import ProductService
+from src.services.return_service import ReturnService
 from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
 from src.utils.excel_export import export_quotes_to_excel
@@ -36,7 +37,8 @@ from src.utils.monthly_report import get_monthly_report, format_report_text
 from src.utils.shipment_flow import parse_sn_input, validate_sn, validate_sn_list, generate_shipment_receipt
 from src.utils.money import format_yuan, yuan_to_cents
 from src.utils.tax import calc_tax_adjusted_profit_cents
-from src.ui.dialogs import ShipmentDialog, PaymentDialog, QuoteEditDialog
+from src.ui.dialogs import ShipmentDialog, QuoteEditDialog
+from src.ui.finance_dialogs import PaymentDialog, ReturnDialog
 
 
 class RecordTab(QWidget):
@@ -49,6 +51,7 @@ class RecordTab(QWidget):
         self.inventory_service = InventoryService()
         self.order_service = OrderService()
         self.payment_service = PaymentService()
+        self.return_service = ReturnService()
         self.product_service = ProductService()
         self._build_ui()
 
@@ -65,6 +68,9 @@ class RecordTab(QWidget):
         self.receive_btn = QPushButton("收款")
         self.receive_btn.setObjectName("primaryBtn")
         self.receive_btn.clicked.connect(self.on_receive_payment)
+        self.return_btn = QPushButton("销售退货")
+        self.return_btn.setObjectName("warningBtn")
+        self.return_btn.clicked.connect(self.on_return_sale)
         self.cancel_record_btn = QPushButton("取消订单")
         self.cancel_record_btn.setObjectName("ghostBtn")
         self.cancel_record_btn.clicked.connect(self.on_cancel_quote)
@@ -80,6 +86,7 @@ class RecordTab(QWidget):
         btn_row.addWidget(self.confirm_record_btn)
         btn_row.addWidget(self.ship_record_btn)
         btn_row.addWidget(self.receive_btn)
+        btn_row.addWidget(self.return_btn)
         btn_row.addWidget(self.cancel_record_btn)
         btn_row.addWidget(self.edit_record_btn)
         btn_row.addWidget(self.del_record_btn)
@@ -382,6 +389,7 @@ class RecordTab(QWidget):
                 self.inventory_service.ship_quote(
                     quote_id,
                     data.get("sn_list", ""),
+                    data.get("shipped_date"),
                 )
             except ServiceError as exc:
                 QMessageBox.warning(self, "出库失败", str(exc))
@@ -420,12 +428,48 @@ class RecordTab(QWidget):
                     data["pay_date"],
                     data["method"],
                     data["remark"],
+                    account_id=data["account_id"],
                 )
             except ServiceError as exc:
                 QMessageBox.warning(self, "收款失败", str(exc))
                 return
             QMessageBox.information(self, "成功", f"收款 ¥{data['amount']:.2f} 已记录！")
             self.refresh_records()
+
+    def on_return_sale(self):
+        row = self.record_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "提示", "请先选择一条已出库记录")
+            return
+        quote_id = int(self.record_table.item(row, 0).text())
+        quote = get_quote_detail(quote_id)
+        if not quote or quote.get("status") not in ("已出库", "已收款"):
+            QMessageBox.warning(self, "提示", "只有已出库或已收款订单可以退货")
+            return
+        dialog = ReturnDialog(
+            "销售退货",
+            self,
+            max_quantity=quote.get("quote_quantity", 1),
+            allow_restock=True,
+        )
+        if not dialog.exec():
+            return
+        data = dialog.get_data()
+        try:
+            self.return_service.return_sale(
+                quote_id,
+                quantity=data["quantity"],
+                return_date=data["date"],
+                restock=data["restock"],
+                reason=data["reason"],
+                refund_account_id=data["account_id"],
+                cash_refund_cents=yuan_to_cents(data["refund"]),
+            )
+        except ServiceError as exc:
+            QMessageBox.warning(self, "销售退货失败", str(exc))
+            return
+        QMessageBox.information(self, "成功", "销售退货已记录")
+        self.refresh_records()
 
     def on_cancel_quote(self):
         row = self.record_table.currentRow()

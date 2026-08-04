@@ -38,6 +38,7 @@ a = Analysis(
         'src.ui.customer_tab',
         'src.ui.supplier_tab',
         'src.ui.finance_tab',
+        'src.ui.finance_dialogs',
         'src.ui.utils',
     ],
     hookspath=[],

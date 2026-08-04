@@ -1,4 +1,4 @@
-"""Shared test isolation for the v1.15 service/query architecture."""
+"""Shared test isolation for the v1.16 service/query architecture."""
 
 from __future__ import annotations
 

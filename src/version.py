@@ -1,5 +1,5 @@
 """Application version shared by the UI, exports, and packaging."""
 
-APP_VERSION = "1.15"
+APP_VERSION = "1.16"
 APP_DISPLAY_NAME = f"调货助手 v{APP_VERSION}"
 

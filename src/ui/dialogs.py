@@ -6,7 +6,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel,
-    QComboBox, QLineEdit, QTextEdit, QSpinBox, QDateEdit,
+    QComboBox, QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QDateEdit,
     QDialogButtonBox, QMessageBox, QAbstractItemView, QHeaderView,
     QCheckBox,
 )
@@ -22,6 +22,7 @@ from src.models.queries import (
     list_suppliers,
 )
 from src.services.party_service import CustomerService, SupplierService
+from src.models.finance_queries import list_financial_accounts
 from src.utils.money import cents_to_yuan, format_yuan
 from src.utils.shipment_flow import parse_sn_input, validate_sn_list, check_sn_duplicates
 
@@ -74,6 +75,10 @@ class ShipmentDialog(QDialog):
 
         self.remaining_label = QLabel()
         self._update_remaining()
+        self.shipped_date_edit = QDateEdit()
+        self.shipped_date_edit.setDate(QDate.currentDate())
+        self.shipped_date_edit.setCalendarPopup(True)
+        layout.addRow("出库日期:", self.shipped_date_edit)
         layout.addRow("批次剩余:", self.remaining_label)
 
         self.sn_edit = QTextEdit()
@@ -141,6 +146,7 @@ class ShipmentDialog(QDialog):
             "sn_list": ",".join(sn_list),
             "sn_count": len(sn_list),
             "remark": self.remark_edit.text().strip(),
+            "shipped_date": self.shipped_date_edit.date().toString("yyyy-MM-dd"),
         }
 
 
@@ -177,8 +183,9 @@ class PaymentDialog(QDialog):
             info_label.setObjectName("dangerSummaryLabel")
             layout.addRow(info_label)
 
-        self.amount_spin = QSpinBox()
-        self.amount_spin.setRange(1, 999999)
+        self.amount_spin = QDoubleSpinBox()
+        self.amount_spin.setDecimals(2)
+        self.amount_spin.setRange(0.01, 999999999.99)
         self.amount_spin.setPrefix("¥ ")
         self.amount_spin.setValue(0)
         layout.addRow("金额:", self.amount_spin)
@@ -241,10 +248,11 @@ class PaymentEditDialog(QDialog):
         info_label.setObjectName("dialogInfoLabel")
         layout.addRow(info_label)
 
-        self.amount_spin = QSpinBox()
-        self.amount_spin.setRange(1, 999999)
+        self.amount_spin = QDoubleSpinBox()
+        self.amount_spin.setDecimals(2)
+        self.amount_spin.setRange(0.01, 999999999.99)
         self.amount_spin.setPrefix("¥ ")
-        self.amount_spin.setValue(int(cents_to_yuan(payment.get("amount_cents", 0))))
+        self.amount_spin.setValue(cents_to_yuan(payment.get("amount_cents", 0)))
         layout.addRow("金额:", self.amount_spin)
 
         self.method_combo = QComboBox()
@@ -569,8 +577,9 @@ class BatchDialog(QDialog):
         layout = QFormLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        self.price_spin = QSpinBox()
-        self.price_spin.setRange(0, 999999)
+        self.price_spin = QDoubleSpinBox()
+        self.price_spin.setDecimals(2)
+        self.price_spin.setRange(0, 999999999.99)
         self.price_spin.setPrefix("¥ ")
         self.price_spin.setValue(0)
 
@@ -712,8 +721,9 @@ class QuoteEditDialog(QDialog):
         layout = QFormLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        self.price_spin = QSpinBox()
-        self.price_spin.setRange(0, 999999)
+        self.price_spin = QDoubleSpinBox()
+        self.price_spin.setDecimals(2)
+        self.price_spin.setRange(0, 999999999.99)
         self.price_spin.setPrefix("¥ ")
         self.price_spin.setValue(0)
 
@@ -754,7 +764,7 @@ class QuoteEditDialog(QDialog):
 
         if quote:
             self.price_spin.setValue(
-                int(cents_to_yuan(quote.get("quote_price_cents", 0)))
+                cents_to_yuan(quote.get("quote_price_cents", 0))
             )
             self.quantity_spin.setValue(quote.get("quote_quantity", 1))
             if quote.get("quote_date"):

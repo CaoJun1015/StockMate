@@ -16,6 +16,15 @@ BACKUP_TABLES = (
     "quotes",
     "payments",
     "payment_allocations",
+    "finance_settings",
+    "ledger_accounts",
+    "finance_categories",
+    "ledger_entries",
+    "ledger_lines",
+    "shipment_snapshots",
+    "supplier_payment_allocations",
+    "sales_returns",
+    "purchase_returns",
     "audit_events",
 )
 
@@ -1108,7 +1117,12 @@ def collect_reconciliation_snapshot(db_path=None) -> dict:
                 LEFT JOIN payment_allocations a ON a.payment_id=p.id
                 WHERE p.type='receivable'
                 GROUP BY p.id
-                HAVING expected_cents!=allocated_cents
+                HAVING
+                    (expected_cents>=0
+                     AND (allocated_cents<0 OR allocated_cents>expected_cents))
+                    OR
+                    (expected_cents<0
+                     AND (allocated_cents>0 OR allocated_cents<expected_cents))
                 """
             ).fetchall()
         ]
@@ -1123,12 +1137,22 @@ def collect_reconciliation_snapshot(db_path=None) -> dict:
                            WHERE b.supplier_id=s.id AND b.deleted_at IS NULL
                        ),0) -
                        COALESCE((
+                           SELECT SUM(pr.amount_cents)
+                           FROM purchase_returns pr
+                           WHERE pr.supplier_id=s.id
+                       ),0) -
+                       COALESCE((
                            SELECT SUM(
                                CASE WHEN p.entry_kind='reversal'
                                     THEN -p.amount_cents ELSE p.amount_cents END
                            )
                            FROM payments p
                            WHERE p.supplier_id=s.id AND p.type='payable'
+                       ),0) +
+                       COALESCE((
+                           SELECT SUM(pr.cash_refund_cents)
+                           FROM purchase_returns pr
+                           WHERE pr.supplier_id=s.id
                        ),0) AS expected_cents
                 FROM suppliers s
                 WHERE s.balance_cents!=(
@@ -1138,12 +1162,22 @@ def collect_reconciliation_snapshot(db_path=None) -> dict:
                         WHERE b.supplier_id=s.id AND b.deleted_at IS NULL
                     ),0) -
                     COALESCE((
+                        SELECT SUM(pr.amount_cents)
+                        FROM purchase_returns pr
+                        WHERE pr.supplier_id=s.id
+                    ),0) -
+                    COALESCE((
                         SELECT SUM(
                             CASE WHEN p.entry_kind='reversal'
                                  THEN -p.amount_cents ELSE p.amount_cents END
                         )
                         FROM payments p
                         WHERE p.supplier_id=s.id AND p.type='payable'
+                    ),0) +
+                    COALESCE((
+                        SELECT SUM(pr.cash_refund_cents)
+                        FROM purchase_returns pr
+                        WHERE pr.supplier_id=s.id
                     ),0)
                 )
                 """

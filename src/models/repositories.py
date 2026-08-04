@@ -44,7 +44,7 @@ IMPORT_COLUMNS = {
     "payments": (
         "quote_id", "customer_id", "supplier_id", "type", "amount_cents",
         "entry_kind", "reversal_of_id", "supersedes_id", "pay_date", "method",
-        "remark", "created_at",
+        "account_id", "remark", "created_at",
     ),
     "payment_allocations": (
         "payment_id", "quote_id", "amount_cents", "created_at",
@@ -52,6 +52,41 @@ IMPORT_COLUMNS = {
     "audit_events": (
         "entity_type", "entity_id", "action", "before_json", "after_json",
         "reason", "created_at",
+    ),
+    "ledger_accounts": (
+        "code", "name", "account_type", "is_system", "is_active", "created_at",
+        "deleted_at",
+    ),
+    "finance_categories": (
+        "name", "kind", "affects_profit", "is_system", "is_active", "created_at",
+        "deleted_at",
+    ),
+    "ledger_entries": (
+        "entry_date", "event_type", "source_type", "source_id",
+        "idempotency_key", "status", "reversal_of_id", "supersedes_id",
+        "reason", "remark", "created_at",
+    ),
+    "ledger_lines": (
+        "entry_id", "account_id", "debit_cents", "credit_cents", "customer_id",
+        "supplier_id", "quote_id", "batch_id", "category_id", "created_at",
+    ),
+    "shipment_snapshots": (
+        "quote_id", "shipped_date", "quantity", "unit_sale_cents",
+        "unit_cost_cents", "revenue_cents", "cost_cents", "ledger_entry_id",
+        "created_at",
+    ),
+    "supplier_payment_allocations": (
+        "payment_id", "batch_id", "amount_cents", "created_at",
+    ),
+    "sales_returns": (
+        "quote_id", "return_date", "quantity", "revenue_cents", "cost_cents",
+        "restock_quantity", "cash_refund_cents", "account_id",
+        "ledger_entry_id", "reason", "created_at",
+    ),
+    "purchase_returns": (
+        "batch_id", "supplier_id", "return_date", "quantity", "amount_cents",
+        "cash_refund_cents", "account_id", "ledger_entry_id", "reason",
+        "created_at",
     ),
 }
 
@@ -359,6 +394,7 @@ def list_fifo_receivable_quotes(
         for row in conn.execute(
             "SELECT id, quote_price_cents, quote_quantity, received_amount_cents "
             "FROM quotes WHERE customer_id=? AND deleted_at IS NULL "
+            "AND status='已出库' "
             "AND status IN ('待确认','已报价','已出库') "
             "AND quote_price_cents*quote_quantity>received_amount_cents "
             "ORDER BY quote_date,id",
@@ -409,6 +445,17 @@ def adjust_supplier_balance(
     conn.execute(
         "UPDATE suppliers SET balance_cents=balance_cents+? WHERE id=?",
         (delta_cents, supplier_id),
+    )
+
+
+def adjust_customer_balance(
+    conn: sqlite3.Connection,
+    customer_id: int,
+    delta_cents: int,
+) -> None:
+    conn.execute(
+        "UPDATE customers SET balance_cents=balance_cents+? WHERE id=?",
+        (delta_cents, customer_id),
     )
 
 
@@ -553,6 +600,7 @@ def insert_payment(
     pay_date: str,
     method: str,
     remark: str,
+    account_id: int | None = None,
     entry_kind: str = "payment",
     reversal_of_id: int | None = None,
     supersedes_id: int | None = None,
@@ -560,8 +608,8 @@ def insert_payment(
     cursor = conn.execute(
         "INSERT INTO payments "
         "(quote_id, customer_id, supplier_id, type, amount_cents, "
-        "entry_kind, reversal_of_id, supersedes_id, pay_date, method, remark) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "entry_kind, reversal_of_id, supersedes_id, pay_date, method, account_id, remark) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             quote_id,
             customer_id,
@@ -573,6 +621,7 @@ def insert_payment(
             supersedes_id,
             pay_date,
             method,
+            account_id,
             remark,
         ),
     )

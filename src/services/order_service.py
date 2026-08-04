@@ -151,6 +151,10 @@ class OrderService:
             if not quote:
                 raise NotFoundError("报价记录不存在")
             old_status = quote["status"]
+            if old_status in ("已出库", "已收款") and new_status == "已取消":
+                raise InvalidTransitionError(
+                    "已出库订单不能直接取消，请使用销售退货"
+                )
             if new_status not in VALID_TRANSITIONS.get(old_status, set()):
                 raise InvalidTransitionError(f"不允许从「{old_status}」变更为「{new_status}」")
             if old_status == "已出库" and new_status == "已取消":

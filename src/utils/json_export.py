@@ -9,6 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from src.models.connection import transaction
+from src.models.finance_repository import (
+    find_import_account,
+    find_import_category,
+    update_import_account,
+    update_import_category,
+    update_import_finance_settings,
+    update_import_ledger_links,
+)
 from src.models.queries import export_backup_data
 from src.models.repositories import import_record, update_import_payment_links
 from src.utils.money import yuan_to_cents
@@ -23,7 +31,7 @@ def export_all_to_json(output_path=None, db_path=None):
     output_path = Path(output_path)
     document = {
         "version": f"v{APP_VERSION}",
-        "schema_version": 3,
+        "schema_version": 4,
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "money_unit": "cents",
         "data": export_backup_data(db_path),
@@ -56,9 +64,41 @@ def import_from_json(json_path, db_path=None):
         payload = document["data"]
         tables = ("products", "suppliers", "customers", "batches", "quotes", "payments")
         stats = {table: 0 for table in tables}
-        maps: dict[str, dict[int, int]] = {table: {} for table in tables}
+        map_tables = (
+            *tables,
+            "ledger_accounts",
+            "finance_categories",
+            "ledger_entries",
+            "sales_returns",
+            "purchase_returns",
+        )
+        maps: dict[str, dict[int, int]] = {table: {} for table in map_tables}
 
         with transaction(db_path, immediate=True) as conn:
+            for account in payload.get("ledger_accounts", []):
+                existing_id = find_import_account(conn, account.get("code"))
+                if existing_id is not None:
+                    new_id = existing_id
+                    update_import_account(conn, new_id, account)
+                else:
+                    new_id = import_record(conn, "ledger_accounts", dict(account))
+                maps["ledger_accounts"][account["id"]] = new_id
+
+            for category in payload.get("finance_categories", []):
+                existing_id = find_import_category(
+                    conn,
+                    category.get("name"),
+                    category.get("kind"),
+                )
+                if existing_id is not None:
+                    new_id = existing_id
+                    update_import_category(conn, new_id, category)
+                else:
+                    new_id = import_record(
+                        conn, "finance_categories", dict(category)
+                    )
+                maps["finance_categories"][category["id"]] = new_id
+
             for product in payload.get("products", []):
                 new_id = import_record(conn, "products", dict(product))
                 maps["products"][product["id"]] = new_id
@@ -115,6 +155,9 @@ def import_from_json(json_path, db_path=None):
                 row["quote_id"] = _remap(row.get("quote_id"), maps["quotes"])
                 row["customer_id"] = _remap(row.get("customer_id"), maps["customers"])
                 row["supplier_id"] = _remap(row.get("supplier_id"), maps["suppliers"])
+                row["account_id"] = _remap(
+                    row.get("account_id"), maps["ledger_accounts"]
+                )
                 row["amount_cents"] = _money_cents(row, "amount_cents", "amount")
                 new_id = import_record(conn, "payments", row)
                 maps["payments"][payment["id"]] = new_id
@@ -136,6 +179,101 @@ def import_from_json(json_path, db_path=None):
                 if row["payment_id"] is None or row["quote_id"] is None:
                     raise ValueError(f"付款分配#{allocation.get('id')} 关联记录缺失")
                 import_record(conn, "payment_allocations", row)
+
+            pending_entry_links: list[tuple[int, int | None, int | None]] = []
+            for entry in payload.get("ledger_entries", []):
+                row = dict(entry)
+                old_reversal = row.pop("reversal_of_id", None)
+                old_supersedes = row.pop("supersedes_id", None)
+                new_id = import_record(conn, "ledger_entries", row)
+                maps["ledger_entries"][entry["id"]] = new_id
+                pending_entry_links.append((new_id, old_reversal, old_supersedes))
+            for entry_id, old_reversal, old_supersedes in pending_entry_links:
+                update_import_ledger_links(
+                    conn,
+                    entry_id,
+                    reversal_of_id=_remap(
+                        old_reversal,
+                        maps["ledger_entries"],
+                    ),
+                    supersedes_id=_remap(
+                        old_supersedes,
+                        maps["ledger_entries"],
+                    ),
+                )
+
+            for line in payload.get("ledger_lines", []):
+                row = dict(line)
+                row["entry_id"] = _remap(
+                    row.get("entry_id"), maps["ledger_entries"]
+                )
+                row["account_id"] = _remap(
+                    row.get("account_id"), maps["ledger_accounts"]
+                )
+                row["customer_id"] = _remap(
+                    row.get("customer_id"), maps["customers"]
+                )
+                row["supplier_id"] = _remap(
+                    row.get("supplier_id"), maps["suppliers"]
+                )
+                row["quote_id"] = _remap(row.get("quote_id"), maps["quotes"])
+                row["batch_id"] = _remap(row.get("batch_id"), maps["batches"])
+                row["category_id"] = _remap(
+                    row.get("category_id"), maps["finance_categories"]
+                )
+                import_record(conn, "ledger_lines", row)
+
+            for snapshot in payload.get("shipment_snapshots", []):
+                row = dict(snapshot)
+                row["quote_id"] = _remap(row.get("quote_id"), maps["quotes"])
+                row["ledger_entry_id"] = _remap(
+                    row.get("ledger_entry_id"), maps["ledger_entries"]
+                )
+                import_record(conn, "shipment_snapshots", row)
+
+            for allocation in payload.get("supplier_payment_allocations", []):
+                row = dict(allocation)
+                row["payment_id"] = _remap(
+                    row.get("payment_id"), maps["payments"]
+                )
+                row["batch_id"] = _remap(row.get("batch_id"), maps["batches"])
+                import_record(conn, "supplier_payment_allocations", row)
+
+            for record in payload.get("sales_returns", []):
+                row = dict(record)
+                row["quote_id"] = _remap(row.get("quote_id"), maps["quotes"])
+                row["account_id"] = _remap(
+                    row.get("account_id"), maps["ledger_accounts"]
+                )
+                row["ledger_entry_id"] = _remap(
+                    row.get("ledger_entry_id"), maps["ledger_entries"]
+                )
+                new_id = import_record(conn, "sales_returns", row)
+                maps["sales_returns"][record["id"]] = new_id
+
+            for record in payload.get("purchase_returns", []):
+                row = dict(record)
+                row["batch_id"] = _remap(row.get("batch_id"), maps["batches"])
+                row["supplier_id"] = _remap(
+                    row.get("supplier_id"), maps["suppliers"]
+                )
+                row["account_id"] = _remap(
+                    row.get("account_id"), maps["ledger_accounts"]
+                )
+                row["ledger_entry_id"] = _remap(
+                    row.get("ledger_entry_id"), maps["ledger_entries"]
+                )
+                new_id = import_record(conn, "purchase_returns", row)
+                maps["purchase_returns"][record["id"]] = new_id
+
+            settings = payload.get("finance_settings", [])
+            if settings:
+                setting = settings[0]
+                update_import_finance_settings(
+                    conn,
+                    enabled_at=setting.get("enabled_at"),
+                    initialized_at=setting.get("initialized_at"),
+                )
 
             for event in payload.get("audit_events", []):
                 row = dict(event)

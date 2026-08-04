@@ -5,7 +5,7 @@ QMainWindow { background-color: #F8FAFC; }
 QWidget { font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif; font-size: 13px; color: #1E293B; }
 
 /* ---- 输入控件 ---- */
-QLineEdit, QComboBox, QSpinBox, QDateEdit {
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit {
     padding: 7px 12px;
     border: 1px solid #E2E8F0;
     border-radius: 6px;
@@ -14,7 +14,7 @@ QLineEdit, QComboBox, QSpinBox, QDateEdit {
     font-size: 13px;
     selection-background-color: #DBEAFE;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDateEdit:focus { border-color: #3B82F6; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QDateEdit:focus { border-color: #3B82F6; }
 QComboBox::drop-down { border: none; width: 24px; }
 QComboBox::down-arrow {
     width: 10px; height: 10px; image: none;

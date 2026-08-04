@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from src.models.finance_queries import collect_finance_reconciliation_snapshot
 from src.models.queries import collect_reconciliation_snapshot
 
 
@@ -153,6 +154,71 @@ class ReconciliationService:
                     row["id"],
                 )
             )
+
+        finance = collect_finance_reconciliation_snapshot(self.db_path)
+        if not finance["enabled"]:
+            for key in (
+                "unbalanced_entries",
+                "customer_balances",
+                "supplier_balances",
+                "shipment_snapshots",
+                "sales_returns",
+                "customer_allocations",
+                "supplier_allocations",
+            ):
+                finance[key] = []
+            finance["inventory"] = {"business_cents": 0, "ledger_cents": 0}
+        for row in finance["unbalanced_entries"]:
+            issues.append(
+                ReconciliationIssue(
+                    "LEDGER_UNBALANCED",
+                    f"账本#{row['id']}借方与贷方不平衡",
+                    "ledger_entries",
+                    row["id"],
+                )
+            )
+        for row in finance["customer_balances"]:
+            issues.append(
+                ReconciliationIssue(
+                    "CUSTOMER_LEDGER",
+                    f"客户#{row['id']}业务余额与账本余额不一致",
+                    "customers",
+                    row["id"],
+                )
+            )
+        for row in finance["supplier_balances"]:
+            issues.append(
+                ReconciliationIssue(
+                    "SUPPLIER_LEDGER",
+                    f"供应商#{row['id']}业务余额与账本余额不一致",
+                    "suppliers",
+                    row["id"],
+                )
+            )
+        inventory = finance["inventory"]
+        if inventory["business_cents"] != inventory["ledger_cents"]:
+            issues.append(
+                ReconciliationIssue(
+                    "INVENTORY_LEDGER",
+                    "库存业务金额与账本库存金额不一致",
+                )
+            )
+        for key, code, entity in (
+            ("shipment_snapshots", "SHIPMENT_SNAPSHOT", "quotes"),
+            ("sales_returns", "RETURN_QUANTITY", "quotes"),
+            ("customer_allocations", "CUSTOMER_ADVANCE", "payments"),
+            ("supplier_allocations", "SUPPLIER_ADVANCE", "payments"),
+        ):
+            for row in finance[key]:
+                entity_id = row.get("id", row.get("quote_id"))
+                issues.append(
+                    ReconciliationIssue(
+                        code,
+                        f"{entity}#{entity_id}账务关系不守恒",
+                        entity,
+                        entity_id,
+                    )
+                )
 
         return ReconciliationReport(
             checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

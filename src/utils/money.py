@@ -23,5 +23,5 @@ def cents_to_yuan(value: int | None) -> float:
     return float(cents_to_decimal(value))
 
 
-def format_yuan(value: int | None, *, decimals: int = 0) -> str:
+def format_yuan(value: int | None, *, decimals: int = 2) -> str:
     return f"¥{cents_to_decimal(value):,.{decimals}f}"
