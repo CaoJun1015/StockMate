@@ -160,7 +160,6 @@ LEGACY_MONEY_COLUMNS = {
 
 def _validate_v2_money(conn: sqlite3.Connection) -> None:
     """Refuse to discard a legacy REAL value that differs from its cents value."""
-    problems: list[str] = []
     pairs = [
         *(
             (table, source, target)
@@ -168,6 +167,20 @@ def _validate_v2_money(conn: sqlite3.Connection) -> None:
         ),
         ("quotes", "received_amount", "received_amount_cents"),
     ]
+    # 修复：对 cents 列为 NULL 的行做一次补回填
+    # 处理之前迁移中断导致列已创建但数据未填充的情况
+    for table, source, target in pairs:
+        if source not in _columns(conn, table) or target not in _columns(conn, table):
+            continue
+        for row in conn.execute(
+            f'SELECT id, "{source}" FROM "{table}" WHERE "{target}" IS NULL'
+        ):
+            conn.execute(
+                f'UPDATE "{table}" SET "{target}"=? WHERE id=?',
+                (_to_cents(row[1], table, row[0], source), row[0]),
+            )
+
+    problems: list[str] = []
     for table, source, target in pairs:
         if source not in _columns(conn, table) or target not in _columns(conn, table):
             problems.append(f"{table}.{source}/{target} 缺失")
