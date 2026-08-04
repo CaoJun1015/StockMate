@@ -25,6 +25,9 @@ data/*.db
 data/*.db-*
 data/**/*.db
 data/**/*.db-*
+test_output/diaohuo_v116_prod_copy_*.db
+test_output/diaohuo_v116_prod_copy_*.db-*
+test_output/smoke_*/*
 
 # Backup directories
 backup*/

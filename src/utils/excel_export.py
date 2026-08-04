@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from src.utils.money import cents_to_yuan
 
 
 def export_quotes_to_excel(quotes, output_path=None):
@@ -59,8 +60,8 @@ def export_quotes_to_excel(quotes, output_path=None):
     total_quote = 0
 
     for row_idx, q in enumerate(quotes, 2):
-        purchase_price = q.get("purchase_price", 0) or 0
-        quote_price = q.get("quote_price", 0) or 0
+        purchase_price = q.get("purchase_price_cents", 0) or 0
+        quote_price = q.get("quote_price_cents", 0) or 0
         quantity = q.get("quote_quantity", 1) or 1
         profit = (quote_price - purchase_price) * quantity
 
@@ -76,12 +77,12 @@ def export_quotes_to_excel(quotes, output_path=None):
             q.get("storage", ""),
             q.get("gpu", ""),
             q.get("supplier_name", "") or "",
-            purchase_price,
+            cents_to_yuan(purchase_price),
             quantity,
-            quote_price,
-            profit,
+            cents_to_yuan(quote_price),
+            cents_to_yuan(profit),
             q.get("status", "待确认"),
-            q.get("received_amount", 0) or 0,
+            cents_to_yuan(q.get("received_amount_cents", 0) or 0),
             q.get("sn_list", "") or "",
             q.get("remark", ""),
             q.get("paid", "否"),
@@ -116,9 +117,9 @@ def export_quotes_to_excel(quotes, output_path=None):
     # 汇总行
     summary_row = len(quotes) + 2
     ws.cell(row=summary_row, column=8, value="合计").font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=9, value=round(total_purchase, 2)).font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=11, value=round(total_quote, 2)).font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=12, value=round(total_quote - total_purchase, 2)).font = Font(bold=True, size=10, color="008000")
+    ws.cell(row=summary_row, column=9, value=cents_to_yuan(total_purchase)).font = Font(bold=True, size=10)
+    ws.cell(row=summary_row, column=11, value=cents_to_yuan(total_quote)).font = Font(bold=True, size=10)
+    ws.cell(row=summary_row, column=12, value=cents_to_yuan(total_quote - total_purchase)).font = Font(bold=True, size=10, color="008000")
 
     for col_idx in range(1, len(headers) + 1):
         ws.cell(row=summary_row, column=col_idx).border = thin_border
@@ -131,6 +132,202 @@ def export_quotes_to_excel(quotes, output_path=None):
     # 冻结首行
     ws.freeze_panes = "A2"
 
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
+def export_finance_to_excel(
+    output_path,
+    *,
+    date_from: str,
+    date_to: str,
+    db_path=None,
+):
+    """Export the operating ledger, counterparties, profit, and audit summary."""
+    from src.models.finance_queries import (
+        get_finance_dashboard,
+        get_profit_report,
+        list_account_transactions,
+        list_counterparty_balances,
+        list_financial_accounts,
+        list_operating_entries,
+    )
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    header_fill = PatternFill(
+        start_color="4472C4", end_color="4472C4", fill_type="solid"
+    )
+    header_font = Font(color="FFFFFF", bold=True)
+
+    def sheet(name, headers, rows):
+        ws = wb.create_sheet(name)
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        for row in rows:
+            ws.append(row)
+        ws.freeze_panes = "A2"
+        for column in ws.columns:
+            width = min(
+                max(len(str(cell.value or "")) for cell in column) + 2,
+                36,
+            )
+            ws.column_dimensions[column[0].column_letter].width = width
+        return ws
+
+    dashboard = get_finance_dashboard(date_from, date_to, db_path)
+    sheet(
+        "经营总览",
+        ["指标", "金额（元）"],
+        [
+            ["资金总额", float(cents_to_yuan(dashboard["funds_cents"]))],
+            ["客户应收", float(cents_to_yuan(dashboard["receivable_cents"]))],
+            ["客户预收", float(cents_to_yuan(dashboard["customer_advance_cents"]))],
+            ["供应商应付", float(cents_to_yuan(dashboard["payable_cents"]))],
+            ["供应商预付", float(cents_to_yuan(dashboard["supplier_advance_cents"]))],
+            ["销售额", float(cents_to_yuan(dashboard["sales_cents"]))],
+            ["商品成本", float(cents_to_yuan(dashboard["cogs_cents"]))],
+            ["毛利润", float(cents_to_yuan(dashboard["gross_profit_cents"]))],
+            ["费用", float(cents_to_yuan(dashboard["expense_cents"]))],
+            ["净利润", float(cents_to_yuan(dashboard["net_profit_cents"]))],
+            ["资金净变化", float(cents_to_yuan(dashboard["cash_change_cents"]))],
+        ],
+    )
+    accounts = list_financial_accounts(include_inactive=True, db_path=db_path)
+    sheet(
+        "资金账户",
+        ["账户", "余额（元）", "状态"],
+        [
+            [
+                row["name"],
+                float(cents_to_yuan(row["balance_cents"])),
+                "正常" if row["is_active"] else "已停用",
+            ]
+            for row in accounts
+        ],
+    )
+    account_transactions = list_account_transactions(
+        date_from=date_from,
+        date_to=date_to,
+        db_path=db_path,
+    )
+    sheet(
+        "账户流水",
+        ["日期", "账户", "类型", "关联对象", "收入（元）", "支出（元）", "状态", "备注/原因"],
+        [
+            [
+                row["entry_date"],
+                row["account_name"],
+                row["event_type"],
+                row.get("customer_name") or row.get("supplier_name") or "",
+                float(cents_to_yuan(row["debit_cents"])),
+                float(cents_to_yuan(row["credit_cents"])),
+                row["status"],
+                row.get("reason") or row.get("remark") or "",
+            ]
+            for row in account_transactions
+        ],
+    )
+    entries = list_operating_entries(
+        date_from=date_from,
+        date_to=date_to,
+        limit=100_000,
+        db_path=db_path,
+    )
+    sheet(
+        "日常收支",
+        ["日期", "类型", "来源", "客户", "供应商", "资金变化（元）", "状态", "备注", "原因"],
+        [
+            [
+                row["entry_date"],
+                row["event_type"],
+                f"{row['source_type']}#{row.get('source_id') or ''}",
+                row.get("customer_name") or "",
+                row.get("supplier_name") or "",
+                float(cents_to_yuan(row["cash_change_cents"])),
+                row["status"],
+                row.get("remark") or "",
+                row.get("reason") or "",
+            ]
+            for row in entries
+            if row["event_type"] in ("manual_income", "manual_expense")
+        ],
+    )
+    sheet(
+        "审计摘要",
+        ["账本ID", "日期", "业务类型", "业务来源", "借贷总额（元）", "状态", "原因", "备注"],
+        [
+            [
+                row["id"],
+                row["entry_date"],
+                row["event_type"],
+                f"{row['source_type']}#{row.get('source_id') or ''}",
+                float(cents_to_yuan(row["debit_total_cents"])),
+                row["status"],
+                row.get("reason") or "",
+                row.get("remark") or "",
+            ]
+            for row in entries
+        ],
+    )
+    for kind, name in (("customer", "客户往来"), ("supplier", "供应商往来")):
+        rows = list_counterparty_balances(kind, db_path)
+        sheet(
+            name,
+            ["对象", "余额（元）", "性质", "未结项目", "最早未结日", "微信", "电话"],
+            [
+                [
+                    row["name"],
+                    float(cents_to_yuan(abs(row["balance_cents"]))),
+                    (
+                        "应收"
+                        if kind == "customer" and row["balance_cents"] > 0
+                        else "预收"
+                        if kind == "customer"
+                        else "应付"
+                        if row["balance_cents"] > 0
+                        else "预付"
+                    ),
+                    row.get("open_item_count") or 0,
+                    row.get("oldest_open_date") or "",
+                    row.get("wechat") or "",
+                    row.get("phone") or "",
+                ]
+                for row in rows
+            ],
+        )
+    profit = get_profit_report(
+        date_from=date_from,
+        date_to=date_to,
+        group_by="quote",
+        db_path=db_path,
+    )
+    sheet(
+        "利润明细",
+        ["报价", "销售额", "成本", "毛利润", "费用", "其他收入", "净利润"],
+        [
+            [
+                row["label"],
+                float(cents_to_yuan(row["sales_cents"])),
+                float(cents_to_yuan(row["cogs_cents"])),
+                float(cents_to_yuan(row["sales_cents"] - row["cogs_cents"])),
+                float(cents_to_yuan(row["expense_cents"])),
+                float(cents_to_yuan(row["other_income_cents"])),
+                float(
+                    cents_to_yuan(
+                        row["sales_cents"]
+                        - row["cogs_cents"]
+                        - row["expense_cents"]
+                        + row["other_income_cents"]
+                    )
+                ),
+            ]
+            for row in profit
+        ],
+    )
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     wb.save(output_path)
     return output_path

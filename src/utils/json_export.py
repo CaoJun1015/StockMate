@@ -1,470 +1,311 @@
-"""
-JSON 数据导入导出模块：用于全量数据备份和迁移
-"""
+"""Versioned JSON backup import/export using canonical integer-cent fields."""
+
+from __future__ import annotations
 
 import json
 import os
 from datetime import datetime
-from src.models.repositories import yuan_to_cents
+from pathlib import Path
+from typing import Any
+
+from src.models.connection import transaction
+from src.models.finance_repository import (
+    find_import_account,
+    find_import_category,
+    update_import_account,
+    update_import_category,
+    update_import_finance_settings,
+    update_import_ledger_links,
+)
+from src.models.queries import export_backup_data
+from src.models.repositories import import_record, update_import_payment_links
+from src.utils.money import yuan_to_cents
 from src.version import APP_VERSION
 
 
-def export_all_to_json(db_module, output_path=None):
-    """
-    导出所有数据为 JSON 格式
-    
-    db_module: 数据库模块，包含各种获取数据的函数
-    output_path: 输出路径，默认桌面
-    """
+def export_all_to_json(output_path=None, db_path=None):
     if not output_path:
-        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        desktop = Path(os.path.expanduser("~")) / "Desktop"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(desktop, f"调货助手备份_{timestamp}.json")
-    
-    data = {
+        output_path = desktop / f"调货助手备份_{timestamp}.json"
+    output_path = Path(output_path)
+    document = {
         "version": f"v{APP_VERSION}",
-        "schema_version": 2,
+        "schema_version": 4,
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "data": {
-            "products": _get_table("products"),
-            "suppliers": _get_all_suppliers(db_module),
-            "batches": _get_all_batches(db_module),
-            "customers": _get_table("customers"),
-            "quotes": _get_all_quotes(db_module),
-            "payments": _get_all_payments(db_module),
-            "payment_allocations": _get_table("payment_allocations"),
-            "audit_events": _get_table("audit_events"),
-        }
+        "money_unit": "cents",
+        "data": export_backup_data(db_path),
     }
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    
-    return output_path
+    with output_path.open("w", encoding="utf-8") as stream:
+        json.dump(document, stream, ensure_ascii=False, indent=2)
+    return str(output_path)
 
 
-def _get_all_suppliers(db_module):
-    """获取所有上游数据"""
-    from src.models.database import get_connection
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM suppliers ORDER BY id").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+def _money_cents(record: dict[str, Any], cents_key: str, yuan_key: str) -> int:
+    value = record.get(cents_key)
+    if value is not None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{cents_key} 必须是整数分")
+        return value
+    return yuan_to_cents(record.get(yuan_key, 0), strict=True)
 
 
-def _get_all_batches(db_module):
-    """获取所有批次数据"""
-    from src.models.database import get_connection
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT b.*, p.series FROM batches b JOIN products p ON b.product_id = p.id ORDER BY b.id"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+def _remap(value, mapping):
+    return mapping.get(value) if value is not None else None
 
 
-def _get_all_quotes(db_module):
-    """获取所有报价记录"""
-    from src.models.database import get_connection
-    conn = get_connection()
-    sql = """
-        SELECT q.*, p.series, p.cpu, p.ram, p.storage, p.gpu, p.screen,
-               b.purchase_price, c.name as customer_name
-        FROM quotes q
-        JOIN batches b ON q.batch_id = b.id
-        JOIN products p ON b.product_id = p.id
-        LEFT JOIN customers c ON q.customer_id = c.id
-        ORDER BY q.id
-    """
-    rows = conn.execute(sql).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def _get_all_payments(db_module):
-    """获取所有收付款记录"""
-    from src.models.database import get_connection
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM payments ORDER BY id").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def _get_table(table_name):
-    allowed = {"products", "customers", "payment_allocations", "audit_events"}
-    if table_name not in allowed:
-        raise ValueError("不支持导出的表")
-    from src.models.database import get_connection
-    conn = get_connection()
+def import_from_json(json_path, db_path=None):
     try:
-        return [dict(r) for r in conn.execute(f"SELECT * FROM {table_name} ORDER BY id")]
-    finally:
-        conn.close()
-
-
-def import_from_json(json_path, db_module):
-    """
-    从 JSON 文件导入数据
-    
-    返回: (success: bool, message: str, stats: dict)
-    """
-    try:
-        with open(json_path, "r", encoding="utf-8") as stream:
+        with Path(json_path).open("r", encoding="utf-8") as stream:
             document = json.load(stream)
-        if "version" not in document or "data" not in document:
+        if "version" not in document or not isinstance(document.get("data"), dict):
             return False, "无效的备份文件格式", {}
 
         payload = document["data"]
-        stats = {
-            key: 0 for key in ("products", "suppliers", "batches", "customers", "quotes", "payments")
-        }
-        maps = {key: {} for key in ("products", "suppliers", "batches", "customers", "quotes", "payments")}
-        conn = db_module.get_connection()
-        try:
-            conn.execute("BEGIN")
+        tables = ("products", "suppliers", "customers", "batches", "quotes", "payments")
+        stats = {table: 0 for table in tables}
+        map_tables = (
+            *tables,
+            "ledger_accounts",
+            "finance_categories",
+            "ledger_entries",
+            "sales_returns",
+            "purchase_returns",
+        )
+        maps: dict[str, dict[int, int]] = {table: {} for table in map_tables}
+
+        with transaction(db_path, immediate=True) as conn:
+            for account in payload.get("ledger_accounts", []):
+                existing_id = find_import_account(conn, account.get("code"))
+                if existing_id is not None:
+                    new_id = existing_id
+                    update_import_account(conn, new_id, account)
+                else:
+                    new_id = import_record(conn, "ledger_accounts", dict(account))
+                maps["ledger_accounts"][account["id"]] = new_id
+
+            for category in payload.get("finance_categories", []):
+                existing_id = find_import_category(
+                    conn,
+                    category.get("name"),
+                    category.get("kind"),
+                )
+                if existing_id is not None:
+                    new_id = existing_id
+                    update_import_category(conn, new_id, category)
+                else:
+                    new_id = import_record(
+                        conn, "finance_categories", dict(category)
+                    )
+                maps["finance_categories"][category["id"]] = new_id
 
             for product in payload.get("products", []):
-                cursor = conn.execute(
-                    "INSERT INTO products(series,cpu,ram,storage,gpu,screen,note,"
-                    "deleted_at,deleted_reason) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (
-                        product.get("series", ""),
-                        product.get("cpu", ""),
-                        product.get("ram", ""),
-                        product.get("storage", ""),
-                        product.get("gpu", ""),
-                        product.get("screen", ""),
-                        product.get("note", ""),
-                        product.get("deleted_at"),
-                        product.get("deleted_reason"),
-                    ),
-                )
-                maps["products"][product["id"]] = cursor.lastrowid
+                new_id = import_record(conn, "products", dict(product))
+                maps["products"][product["id"]] = new_id
                 stats["products"] += 1
 
             for supplier in payload.get("suppliers", []):
-                balance_cents = supplier.get("balance_cents")
-                if balance_cents is None:
-                    balance_cents = yuan_to_cents(supplier.get("balance", 0))
-                cursor = conn.execute(
-                    "INSERT INTO suppliers(name,wechat,qq,phone,note,balance,balance_cents,"
-                    "deleted_at,deleted_reason) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (
-                        supplier.get("name", ""),
-                        supplier.get("wechat", ""),
-                        supplier.get("qq", ""),
-                        supplier.get("phone", ""),
-                        supplier.get("note", ""),
-                        balance_cents / 100,
-                        balance_cents,
-                        supplier.get("deleted_at"),
-                        supplier.get("deleted_reason"),
-                    ),
-                )
-                maps["suppliers"][supplier["id"]] = cursor.lastrowid
+                row = dict(supplier)
+                row["balance_cents"] = _money_cents(row, "balance_cents", "balance")
+                new_id = import_record(conn, "suppliers", row)
+                maps["suppliers"][supplier["id"]] = new_id
                 stats["suppliers"] += 1
 
             for customer in payload.get("customers", []):
-                balance_cents = customer.get("balance_cents")
-                if balance_cents is None:
-                    balance_cents = yuan_to_cents(customer.get("balance", 0))
-                cursor = conn.execute(
-                    "INSERT INTO customers(name,wechat,qq,phone,note,balance,balance_cents,"
-                    "default_tax_rate,deleted_at,deleted_reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        customer.get("name", ""),
-                        customer.get("wechat", ""),
-                        customer.get("qq", ""),
-                        customer.get("phone", ""),
-                        customer.get("note", ""),
-                        balance_cents / 100,
-                        balance_cents,
-                        customer.get("default_tax_rate"),
-                        customer.get("deleted_at"),
-                        customer.get("deleted_reason"),
-                    ),
-                )
-                maps["customers"][customer["id"]] = cursor.lastrowid
+                row = dict(customer)
+                row["balance_cents"] = _money_cents(row, "balance_cents", "balance")
+                new_id = import_record(conn, "customers", row)
+                maps["customers"][customer["id"]] = new_id
                 stats["customers"] += 1
 
             for batch in payload.get("batches", []):
-                product_id = maps["products"].get(batch.get("product_id"))
-                if not product_id:
-                    raise ValueError(f"批次#{batch.get('id')} 缺少对应机型")
-                price_cents = batch.get("purchase_price_cents")
-                if price_cents is None:
-                    price_cents = yuan_to_cents(batch.get("purchase_price", 0))
-                cursor = conn.execute(
-                    "INSERT INTO batches(product_id,purchase_price,purchase_price_cents,"
-                    "quantity,remaining,date,remark,supplier_id,sn_list,deleted_at,deleted_reason) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        product_id,
-                        price_cents / 100,
-                        price_cents,
-                        batch.get("quantity", 0),
-                        batch.get("remaining", 0),
-                        batch.get("date", ""),
-                        batch.get("remark", ""),
-                        maps["suppliers"].get(batch.get("supplier_id")),
-                        batch.get("sn_list", ""),
-                        batch.get("deleted_at"),
-                        batch.get("deleted_reason"),
-                    ),
+                row = dict(batch)
+                row["product_id"] = _remap(row.get("product_id"), maps["products"])
+                row["supplier_id"] = _remap(row.get("supplier_id"), maps["suppliers"])
+                row["purchase_price_cents"] = _money_cents(
+                    row, "purchase_price_cents", "purchase_price"
                 )
-                maps["batches"][batch["id"]] = cursor.lastrowid
+                if row["product_id"] is None:
+                    raise ValueError(f"批次#{batch.get('id')} 缺少对应机型")
+                new_id = import_record(conn, "batches", row)
+                maps["batches"][batch["id"]] = new_id
                 stats["batches"] += 1
 
             for quote in payload.get("quotes", []):
-                batch_id = maps["batches"].get(quote.get("batch_id"))
-                if not batch_id:
-                    raise ValueError(f"报价#{quote.get('id')} 缺少对应批次")
-                price_cents = quote.get("quote_price_cents")
-                received_cents = quote.get("received_amount_cents")
-                if price_cents is None:
-                    price_cents = yuan_to_cents(quote.get("quote_price", 0))
-                if received_cents is None:
-                    received_cents = yuan_to_cents(quote.get("received_amount", 0))
-                cursor = conn.execute(
-                    "INSERT INTO quotes(batch_id,customer_id,quote_price,quote_price_cents,"
-                    "quote_quantity,quote_date,remark,paid,status,received_amount,"
-                    "received_amount_cents,sn_list,tax_rate,purchase_tax_inclusive,"
-                    "quote_tax_inclusive,deleted_at,deleted_reason) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        batch_id,
-                        maps["customers"].get(quote.get("customer_id")),
-                        price_cents / 100,
-                        price_cents,
-                        quote.get("quote_quantity", 1),
-                        quote.get("quote_date", ""),
-                        quote.get("remark", ""),
-                        quote.get("paid", "否"),
-                        quote.get("status", "待确认"),
-                        received_cents / 100,
-                        received_cents,
-                        quote.get("sn_list", ""),
-                        quote.get("tax_rate"),
-                        quote.get("purchase_tax_inclusive", 0),
-                        quote.get("quote_tax_inclusive", 0),
-                        quote.get("deleted_at"),
-                        quote.get("deleted_reason"),
-                    ),
+                row = dict(quote)
+                row["batch_id"] = _remap(row.get("batch_id"), maps["batches"])
+                row["customer_id"] = _remap(row.get("customer_id"), maps["customers"])
+                row["quote_price_cents"] = _money_cents(
+                    row, "quote_price_cents", "quote_price"
                 )
-                maps["quotes"][quote["id"]] = cursor.lastrowid
+                row["received_amount_cents"] = _money_cents(
+                    row, "received_amount_cents", "received_amount"
+                )
+                if row["batch_id"] is None:
+                    raise ValueError(f"报价#{quote.get('id')} 缺少对应批次")
+                new_id = import_record(conn, "quotes", row)
+                maps["quotes"][quote["id"]] = new_id
                 stats["quotes"] += 1
 
-            payment_documents = payload.get("payments", [])
-            for payment in payment_documents:
-                amount_cents = payment.get("amount_cents")
-                if amount_cents is None:
-                    amount_cents = yuan_to_cents(payment.get("amount", 0))
-                cursor = conn.execute(
-                    "INSERT INTO payments(quote_id,customer_id,supplier_id,type,amount,"
-                    "amount_cents,entry_kind,pay_date,method,remark) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        maps["quotes"].get(payment.get("quote_id")),
-                        maps["customers"].get(payment.get("customer_id")),
-                        maps["suppliers"].get(payment.get("supplier_id")),
-                        payment.get("type", "receivable"),
-                        amount_cents / 100,
-                        amount_cents,
-                        payment.get("entry_kind", "payment"),
-                        payment.get("pay_date", ""),
-                        payment.get("method", ""),
-                        payment.get("remark", ""),
-                    ),
+            pending_links: list[tuple[int, int | None, int | None]] = []
+            for payment in payload.get("payments", []):
+                row = dict(payment)
+                old_reversal = row.pop("reversal_of_id", None)
+                old_supersedes = row.pop("supersedes_id", None)
+                row["quote_id"] = _remap(row.get("quote_id"), maps["quotes"])
+                row["customer_id"] = _remap(row.get("customer_id"), maps["customers"])
+                row["supplier_id"] = _remap(row.get("supplier_id"), maps["suppliers"])
+                row["account_id"] = _remap(
+                    row.get("account_id"), maps["ledger_accounts"]
                 )
-                maps["payments"][payment["id"]] = cursor.lastrowid
+                row["amount_cents"] = _money_cents(row, "amount_cents", "amount")
+                new_id = import_record(conn, "payments", row)
+                maps["payments"][payment["id"]] = new_id
+                pending_links.append((new_id, old_reversal, old_supersedes))
                 stats["payments"] += 1
 
-            for payment in payment_documents:
-                conn.execute(
-                    "UPDATE payments SET reversal_of_id=?,supersedes_id=? WHERE id=?",
-                    (
-                        maps["payments"].get(payment.get("reversal_of_id")),
-                        maps["payments"].get(payment.get("supersedes_id")),
-                        maps["payments"][payment["id"]],
+            for payment_id, old_reversal, old_supersedes in pending_links:
+                update_import_payment_links(
+                    conn,
+                    payment_id,
+                    reversal_of_id=_remap(old_reversal, maps["payments"]),
+                    supersedes_id=_remap(old_supersedes, maps["payments"]),
+                )
+
+            for allocation in payload.get("payment_allocations", []):
+                row = dict(allocation)
+                row["payment_id"] = _remap(row.get("payment_id"), maps["payments"])
+                row["quote_id"] = _remap(row.get("quote_id"), maps["quotes"])
+                if row["payment_id"] is None or row["quote_id"] is None:
+                    raise ValueError(f"付款分配#{allocation.get('id')} 关联记录缺失")
+                import_record(conn, "payment_allocations", row)
+
+            pending_entry_links: list[tuple[int, int | None, int | None]] = []
+            for entry in payload.get("ledger_entries", []):
+                row = dict(entry)
+                old_reversal = row.pop("reversal_of_id", None)
+                old_supersedes = row.pop("supersedes_id", None)
+                new_id = import_record(conn, "ledger_entries", row)
+                maps["ledger_entries"][entry["id"]] = new_id
+                pending_entry_links.append((new_id, old_reversal, old_supersedes))
+            for entry_id, old_reversal, old_supersedes in pending_entry_links:
+                update_import_ledger_links(
+                    conn,
+                    entry_id,
+                    reversal_of_id=_remap(
+                        old_reversal,
+                        maps["ledger_entries"],
+                    ),
+                    supersedes_id=_remap(
+                        old_supersedes,
+                        maps["ledger_entries"],
                     ),
                 )
 
-            allocations = payload.get("payment_allocations", [])
-            for allocation in allocations:
-                payment_id = maps["payments"].get(allocation.get("payment_id"))
-                quote_id = maps["quotes"].get(allocation.get("quote_id"))
-                if not payment_id or not quote_id:
-                    raise ValueError("收款分配引用了不存在的流水或报价")
-                conn.execute(
-                    "INSERT INTO payment_allocations(payment_id,quote_id,amount_cents) "
-                    "VALUES (?,?,?)",
-                    (payment_id, quote_id, allocation.get("amount_cents", 0)),
+            for line in payload.get("ledger_lines", []):
+                row = dict(line)
+                row["entry_id"] = _remap(
+                    row.get("entry_id"), maps["ledger_entries"]
+                )
+                row["account_id"] = _remap(
+                    row.get("account_id"), maps["ledger_accounts"]
+                )
+                row["customer_id"] = _remap(
+                    row.get("customer_id"), maps["customers"]
+                )
+                row["supplier_id"] = _remap(
+                    row.get("supplier_id"), maps["suppliers"]
+                )
+                row["quote_id"] = _remap(row.get("quote_id"), maps["quotes"])
+                row["batch_id"] = _remap(row.get("batch_id"), maps["batches"])
+                row["category_id"] = _remap(
+                    row.get("category_id"), maps["finance_categories"]
+                )
+                import_record(conn, "ledger_lines", row)
+
+            for snapshot in payload.get("shipment_snapshots", []):
+                row = dict(snapshot)
+                row["quote_id"] = _remap(row.get("quote_id"), maps["quotes"])
+                row["ledger_entry_id"] = _remap(
+                    row.get("ledger_entry_id"), maps["ledger_entries"]
+                )
+                import_record(conn, "shipment_snapshots", row)
+
+            for allocation in payload.get("supplier_payment_allocations", []):
+                row = dict(allocation)
+                row["payment_id"] = _remap(
+                    row.get("payment_id"), maps["payments"]
+                )
+                row["batch_id"] = _remap(row.get("batch_id"), maps["batches"])
+                import_record(conn, "supplier_payment_allocations", row)
+
+            for record in payload.get("sales_returns", []):
+                row = dict(record)
+                row["quote_id"] = _remap(row.get("quote_id"), maps["quotes"])
+                row["account_id"] = _remap(
+                    row.get("account_id"), maps["ledger_accounts"]
+                )
+                row["ledger_entry_id"] = _remap(
+                    row.get("ledger_entry_id"), maps["ledger_entries"]
+                )
+                new_id = import_record(conn, "sales_returns", row)
+                maps["sales_returns"][record["id"]] = new_id
+
+            for record in payload.get("purchase_returns", []):
+                row = dict(record)
+                row["batch_id"] = _remap(row.get("batch_id"), maps["batches"])
+                row["supplier_id"] = _remap(
+                    row.get("supplier_id"), maps["suppliers"]
+                )
+                row["account_id"] = _remap(
+                    row.get("account_id"), maps["ledger_accounts"]
+                )
+                row["ledger_entry_id"] = _remap(
+                    row.get("ledger_entry_id"), maps["ledger_entries"]
+                )
+                new_id = import_record(conn, "purchase_returns", row)
+                maps["purchase_returns"][record["id"]] = new_id
+
+            settings = payload.get("finance_settings", [])
+            if settings:
+                setting = settings[0]
+                update_import_finance_settings(
+                    conn,
+                    enabled_at=setting.get("enabled_at"),
+                    initialized_at=setting.get("initialized_at"),
                 )
 
-            entity_maps = {
-                "products": maps["products"],
-                "batches": maps["batches"],
-                "customers": maps["customers"],
-                "suppliers": maps["suppliers"],
-                "quotes": maps["quotes"],
-                "payments": maps["payments"],
-            }
             for event in payload.get("audit_events", []):
-                entity_id = entity_maps.get(event.get("entity_type"), {}).get(
-                    event.get("entity_id")
-                )
-                conn.execute(
-                    "INSERT INTO audit_events(entity_type,entity_id,action,before_json,"
-                    "after_json,reason,created_at) VALUES (?,?,?,?,?,?,?)",
-                    (
-                        event.get("entity_type", ""),
-                        entity_id,
-                        event.get("action", ""),
-                        event.get("before_json"),
-                        event.get("after_json"),
-                        event.get("reason", ""),
-                        event.get("created_at"),
-                    ),
-                )
+                row = dict(event)
+                entity_map = maps.get(row.get("entity_type"))
+                if entity_map is not None:
+                    row["entity_id"] = _remap(row.get("entity_id"), entity_map)
+                import_record(conn, "audit_events", row)
 
-            conn.commit()
-            return True, "导入成功", stats
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        return True, "导入成功", stats
     except FileNotFoundError:
         return False, "文件不存在", {}
     except json.JSONDecodeError:
-        return False, "文件格式错误，不是有效的JSON文件", {}
-    except Exception as e:
-        return False, f"导入失败: {str(e)}", {}
-
-
-def _import_product(product, db_module):
-    """导入机型"""
-    try:
-        pid = db_module.add_product(
-            series=product.get("series", ""),
-            cpu=product.get("cpu", ""),
-            ram=product.get("ram", ""),
-            storage=product.get("storage", ""),
-            gpu=product.get("gpu", ""),
-            screen=product.get("screen", ""),
-            note=product.get("note", ""),
-        )
-        return pid
-    except:
-        return None
-
-
-def _import_supplier(supplier, db_module):
-    """导入上游"""
-    try:
-        sid = db_module.add_supplier(
-            name=supplier.get("name", ""),
-            wechat=supplier.get("wechat", ""),
-            qq=supplier.get("qq", ""),
-            phone=supplier.get("phone", ""),
-            note=supplier.get("note", ""),
-        )
-        return sid
-    except:
-        return None
-
-
-def _import_batch(batch, product_id, supplier_id, db_module):
-    """导入批次"""
-    try:
-        bid = db_module.add_batch(
-            product_id=product_id,
-            purchase_price=batch.get("purchase_price", 0),
-            quantity=batch.get("quantity", 0),
-            remaining=batch.get("remaining", 0),
-            date_str=batch.get("date", ""),
-            remark=batch.get("remark", ""),
-            supplier_id=supplier_id,
-            sn_list=batch.get("sn_list", ""),
-        )
-        return bid
-    except:
-        return None
-
-
-def _import_customer(customer, db_module):
-    """导入客户"""
-    try:
-        cid = db_module.add_customer(
-            name=customer.get("name", ""),
-            wechat=customer.get("wechat", ""),
-            qq=customer.get("qq", ""),
-            phone=customer.get("phone", ""),
-            note=customer.get("note", ""),
-        )
-        return cid
-    except:
-        return None
-
-
-def _import_quote(quote, batch_id, customer_id, db_module):
-    """导入报价"""
-    try:
-        qid = db_module.add_quote(
-            batch_id=batch_id,
-            customer_id=customer_id,
-            quote_price=quote.get("quote_price", 0),
-            quote_quantity=quote.get("quote_quantity", 1),
-            quote_date=quote.get("quote_date", ""),
-            remark=quote.get("remark", ""),
-            paid=quote.get("paid", ""),
-            status=quote.get("status", "待确认"),
-            received_amount=quote.get("received_amount", 0),
-        )
-        return qid
-    except:
-        return None
-
-
-def _import_payment(payment, quote_id, customer_id, supplier_id, db_module):
-    """导入收付款记录"""
-    try:
-        db_module.add_payment(
-            quote_id=quote_id,
-            customer_id=customer_id,
-            supplier_id=supplier_id,
-            pay_type=payment.get("type", "receivable"),
-            amount=payment.get("amount", 0),
-            pay_date=payment.get("pay_date", ""),
-            method=payment.get("method", ""),
-            remark=payment.get("remark", ""),
-        )
-    except:
-        pass
+        return False, "文件格式错误，不是有效的 JSON 文件", {}
+    except Exception as exc:
+        return False, f"导入失败: {exc}", {}
 
 
 def validate_json_file(json_path):
-    """验证 JSON 文件格式"""
     try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        if "version" not in data or "data" not in data:
-            return False, "无效的备份文件格式"
-        
+        with Path(json_path).open("r", encoding="utf-8") as stream:
+            document = json.load(stream)
+        if "version" not in document or not isinstance(document.get("data"), dict):
+            return False, "无效的备份文件格式", {}
+        payload = document["data"]
         stats = {
-            "products": len(data["data"].get("products", [])),
-            "suppliers": len(data["data"].get("suppliers", [])),
-            "batches": len(data["data"].get("batches", [])),
-            "customers": len(data["data"].get("customers", [])),
-            "quotes": len(data["data"].get("quotes", [])),
-            "payments": len(data["data"].get("payments", [])),
+            table: len(payload.get(table, []))
+            for table in ("products", "suppliers", "batches", "customers", "quotes", "payments")
         }
-        
         return True, "有效的备份文件", stats
-    
     except FileNotFoundError:
         return False, "文件不存在", {}
     except json.JSONDecodeError:
         return False, "文件格式错误", {}
-    except Exception as e:
-        return False, f"验证失败: {str(e)}", {}
+    except Exception as exc:
+        return False, f"验证失败: {exc}", {}

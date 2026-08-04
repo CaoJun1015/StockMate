@@ -6,10 +6,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
-from src.models.database import (
-    add_product, update_product, delete_product, add_operation_log,
-    search_products, get_all_products, get_total_remaining,
-)
+from src.models.queries import list_products
+from src.services.exceptions import ServiceError
+from src.services.product_service import ProductService
 from src.ui.dialogs import ProductEditDialog
 
 
@@ -25,6 +24,7 @@ class ProductTab(QWidget):
         self.edit_product_btn = None
         self.del_product_btn = None
         self.refresh_product_list_btn = None
+        self.product_service = ProductService()
         self._build_ui()
     
     def _build_ui(self):
@@ -65,10 +65,7 @@ class ProductTab(QWidget):
         layout.addWidget(self.product_table)
 
     def refresh_product_list(self, keyword=None):
-        if keyword:
-            products = search_products(keyword)
-        else:
-            products = get_all_products()
+        products = list_products(keyword or "")
 
         self.product_table.setRowCount(len(products))
         for i, p in enumerate(products):
@@ -80,7 +77,7 @@ class ProductTab(QWidget):
             self.product_table.setItem(i, 5, QTableWidgetItem(p.get("gpu", "")))
             self.product_table.setItem(i, 6, QTableWidgetItem(p.get("screen", "")))
             self.product_table.setItem(i, 7, QTableWidgetItem(p.get("note", "")))
-            remaining = get_total_remaining(p["id"])
+            remaining = p.get("total_remaining", 0)
             self.product_table.setItem(i, 8, QTableWidgetItem(str(remaining)))
 
         self.product_table.resizeColumnsToContents()
@@ -112,8 +109,11 @@ class ProductTab(QWidget):
             if not data["series"]:
                 QMessageBox.warning(self, "提示", "系列名称不能为空")
                 return
-            add_product(**data)
-            add_operation_log("新增机型", "products", 0, f"系列={data['series']}")
+            try:
+                self.product_service.create(**data)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "新增失败", str(exc))
+                return
             self.refresh_product_list(self.main.search_edit.text().strip())
 
     def on_edit_product(self):
@@ -138,7 +138,11 @@ class ProductTab(QWidget):
             if not data["series"]:
                 QMessageBox.warning(self, "提示", "系列名称不能为空")
                 return
-            update_product(pid, **data)
+            try:
+                self.product_service.update(pid, **data)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "编辑失败", str(exc))
+                return
             self.refresh_product_list(self.main.search_edit.text().strip())
 
     def on_delete_product(self):
@@ -153,6 +157,9 @@ class ProductTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            delete_product(pid)
-            add_operation_log("删除机型", "products", pid, f"系列={series}")
+            try:
+                self.product_service.delete(pid)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "删除失败", str(exc))
+                return
             self.refresh_product_list(self.main.search_edit.text().strip())

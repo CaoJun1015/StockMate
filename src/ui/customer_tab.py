@@ -5,12 +5,18 @@ from PyQt6.QtWidgets import (
     QLineEdit, QGroupBox, QMessageBox, QAbstractItemView,
 )
 
-from src.models.database import (
-    add_customer, search_customers, get_all_customers,
-    delete_customer_cascade, add_operation_log,
-    get_customer_quotes, get_customer_stats,
+from src.models.queries import (
+    get_customer,
+    get_customer_history,
+    get_customer_reference_counts,
+    get_customer_stats,
+    list_customers,
 )
+from src.services.exceptions import ServiceError
+from src.services.party_service import CustomerService
 from src.ui.dialogs import CustomerDialog
+from src.utils.money import format_yuan
+from src.utils.tax import calc_tax_adjusted_profit_cents
 
 
 class CustomerTab(QWidget):
@@ -23,6 +29,7 @@ class CustomerTab(QWidget):
         self.customer_search = None
         self.customer_stats_label = None
         self.customer_history_table = None
+        self.customer_service = CustomerService()
         self._build_ui()
     
     def _build_ui(self):
@@ -79,7 +86,7 @@ class CustomerTab(QWidget):
     
     def refresh_customer_list(self):
         keyword = self.customer_search.text().strip()
-        customers = search_customers(keyword) if keyword else get_all_customers()
+        customers = list_customers(keyword)
         self.customer_table.setRowCount(len(customers))
         for i, c in enumerate(customers):
             self.customer_table.setItem(i, 0, QTableWidgetItem(str(c["id"])))
@@ -97,8 +104,11 @@ class CustomerTab(QWidget):
             if not data["name"]:
                 QMessageBox.warning(self, "提示", "客户名称不能为空")
                 return
-            add_customer(**data)
-            add_operation_log("新增客户", "customers", 0, f"名称={data['name']}")
+            try:
+                customer_id = self.customer_service.create(**data)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "新增失败", str(exc))
+                return
             self.refresh_customer_list()
 
     def on_customer_cell_clicked(self, row, col):
@@ -110,20 +120,21 @@ class CustomerTab(QWidget):
         cid = int(self.customer_table.item(row, 0).text())
         customer_name = self.customer_table.item(row, 1).text()
         
-        quotes = get_customer_quotes(cid)
+        quotes = get_customer_history(cid)
         stats = get_customer_stats(cid)
         
         self.customer_stats_label.setText(
-            f"客户: {customer_name} | 总成交: {stats['total_quotes']}单 | 总金额: ¥{stats['total_amount']:.0f} | 总毛利: ¥{stats['total_profit']:.0f}"
+            f"客户: {customer_name} | 总成交: {stats['total_quotes']}单 | "
+            f"总金额: {format_yuan(stats['total_amount_cents'])} | "
+            f"总毛利: {format_yuan(stats['total_profit_cents'])}"
         )
         
         self.customer_history_table.setRowCount(len(quotes))
         for i, q in enumerate(quotes):
-            purchase_price = q.get("purchase_price", 0) or 0
-            quote_price = q.get("quote_price", 0) or 0
+            purchase_price = q.get("purchase_price_cents", 0) or 0
+            quote_price = q.get("quote_price_cents", 0) or 0
             quantity = q.get("quote_quantity", 1) or 1
-            from src.models.database import calc_tax_adjusted_profit
-            profit = calc_tax_adjusted_profit(
+            profit = calc_tax_adjusted_profit_cents(
                 purchase_price, quote_price, quantity,
                 q.get("tax_rate"), q.get("purchase_tax_inclusive", 0) or 0, q.get("quote_tax_inclusive", 0) or 0,
             )
@@ -132,9 +143,9 @@ class CustomerTab(QWidget):
             self.customer_history_table.setItem(i, 1, QTableWidgetItem(q.get("series", "")))
             self.customer_history_table.setItem(i, 2, QTableWidgetItem(q.get("cpu", "")))
             self.customer_history_table.setItem(i, 3, QTableWidgetItem(str(quantity)))
-            self.customer_history_table.setItem(i, 4, QTableWidgetItem(f"¥{purchase_price:.0f}"))
-            self.customer_history_table.setItem(i, 5, QTableWidgetItem(f"¥{quote_price:.0f}"))
-            self.customer_history_table.setItem(i, 6, QTableWidgetItem(f"¥{profit:.0f}"))
+            self.customer_history_table.setItem(i, 4, QTableWidgetItem(format_yuan(purchase_price)))
+            self.customer_history_table.setItem(i, 5, QTableWidgetItem(format_yuan(quote_price)))
+            self.customer_history_table.setItem(i, 6, QTableWidgetItem(format_yuan(profit)))
             self.customer_history_table.setItem(i, 7, QTableWidgetItem(q.get("remark", "")))
         
         self.customer_history_table.resizeColumnsToContents()
@@ -144,9 +155,11 @@ class CustomerTab(QWidget):
         if row < 0:
             return
         cid = int(self.customer_table.item(row, 0).text())
-        from src.models.database import get_connection
-        conn = get_connection()
-        row_data = conn.execute("SELECT name, wechat, qq, phone, note, default_tax_rate FROM customers WHERE id=?", (cid,)).fetchone()
+        row_data = get_customer(cid)
+        if not row_data:
+            QMessageBox.warning(self, "提示", "客户不存在或已删除")
+            self.refresh_customer_list()
+            return
         current = {
             "name": row_data["name"] or "",
             "wechat": row_data["wechat"] or "",
@@ -155,20 +168,16 @@ class CustomerTab(QWidget):
             "note": row_data["note"] or "",
             "default_tax_rate": row_data["default_tax_rate"],
         }
-        conn.close()
         dlg = CustomerDialog(self, current)
         if dlg.exec():
             data = dlg.get_data()
             if not data["name"]:
                 return
-            from src.models.database import get_connection
-            conn = get_connection()
-            conn.execute(
-                "UPDATE customers SET name=?, wechat=?, qq=?, phone=?, note=?, default_tax_rate=? WHERE id=?",
-                (data["name"], data["wechat"], data["qq"], data["phone"], data["note"], data.get("default_tax_rate"), cid),
-            )
-            conn.commit()
-            conn.close()
+            try:
+                self.customer_service.update(cid, **data)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "编辑失败", str(exc))
+                return
             self.refresh_customer_list()
 
     def on_delete_customer(self):
@@ -178,14 +187,14 @@ class CustomerTab(QWidget):
             return
         cid = int(self.customer_table.item(row, 0).text())
         name = self.customer_table.item(row, 1).text()
-        from src.models.database import get_connection
-        conn = get_connection()
-        quote_count = conn.execute("SELECT COUNT(*) FROM quotes WHERE customer_id=?", (cid,)).fetchone()[0]
-        conn.close()
-        if quote_count > 0:
+        references = get_customer_reference_counts(cid)
+        quote_count = references["quotes"]
+        payment_count = references["payments"]
+        if quote_count > 0 or payment_count > 0:
             reply = QMessageBox.question(
                 self, "确认删除",
-                f"客户「{name}」有 {quote_count} 条关联报价记录。\n\n确定删除该客户及其所有关联数据？\n此操作不可恢复。",
+                f"客户「{name}」有 {quote_count} 条报价和 {payment_count} 条收款记录。\n\n"
+                "删除后客户将从工作列表隐藏，历史报价和账务仍会保留。\n确定继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
         else:
@@ -194,7 +203,10 @@ class CustomerTab(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
         if reply == QMessageBox.StandardButton.Yes:
-            delete_customer_cascade(cid)
-            add_operation_log("删除客户", "customers", cid, f"名称={name}")
+            try:
+                self.customer_service.delete(cid)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "删除失败", str(exc))
+                return
             self.refresh_customer_list()
             self.main.record_tab.refresh_records()

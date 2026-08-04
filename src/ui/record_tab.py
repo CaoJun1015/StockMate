@@ -14,12 +14,20 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor, QClipboard
 
-from src.models.database import (
-    get_quote_by_id, update_quote_status, add_payment,
-    get_batches, search_quotes, export_quotes, delete_quote, update_quote,
-    add_operation_log, get_all_products, ship_quote,
-    search_products, add_product,
+from src.models.queries import (
+    export_quotes,
+    get_batch_detail,
+    get_quote_detail,
+    list_batches,
+    list_products,
+    search_quotes,
 )
+from src.services.exceptions import ServiceError
+from src.services.inventory_service import InventoryService
+from src.services.order_service import OrderService
+from src.services.payment_service import PaymentService
+from src.services.product_service import ProductService
+from src.services.return_service import ReturnService
 from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
 from src.utils.excel_export import export_quotes_to_excel
@@ -27,7 +35,10 @@ from src.utils.price_diff import save_snapshot, get_latest_snapshot, diff_snapsh
 from src.utils.follow_up import get_stale_quotes, format_reminder_text
 from src.utils.monthly_report import get_monthly_report, format_report_text
 from src.utils.shipment_flow import parse_sn_input, validate_sn, validate_sn_list, generate_shipment_receipt
-from src.ui.dialogs import ShipmentDialog, PaymentDialog, QuoteEditDialog
+from src.utils.money import format_yuan, yuan_to_cents
+from src.utils.tax import calc_tax_adjusted_profit_cents
+from src.ui.dialogs import ShipmentDialog, QuoteEditDialog
+from src.ui.finance_dialogs import PaymentDialog, ReturnDialog
 
 
 class RecordTab(QWidget):
@@ -37,6 +48,11 @@ class RecordTab(QWidget):
         super().__init__(parent)
         self.main = main_window
         self.record_table = None
+        self.inventory_service = InventoryService()
+        self.order_service = OrderService()
+        self.payment_service = PaymentService()
+        self.return_service = ReturnService()
+        self.product_service = ProductService()
         self._build_ui()
 
     def _build_ui(self):
@@ -52,6 +68,9 @@ class RecordTab(QWidget):
         self.receive_btn = QPushButton("收款")
         self.receive_btn.setObjectName("primaryBtn")
         self.receive_btn.clicked.connect(self.on_receive_payment)
+        self.return_btn = QPushButton("销售退货")
+        self.return_btn.setObjectName("warningBtn")
+        self.return_btn.clicked.connect(self.on_return_sale)
         self.cancel_record_btn = QPushButton("取消订单")
         self.cancel_record_btn.setObjectName("ghostBtn")
         self.cancel_record_btn.clicked.connect(self.on_cancel_quote)
@@ -67,6 +86,7 @@ class RecordTab(QWidget):
         btn_row.addWidget(self.confirm_record_btn)
         btn_row.addWidget(self.ship_record_btn)
         btn_row.addWidget(self.receive_btn)
+        btn_row.addWidget(self.return_btn)
         btn_row.addWidget(self.cancel_record_btn)
         btn_row.addWidget(self.edit_record_btn)
         btn_row.addWidget(self.del_record_btn)
@@ -159,9 +179,9 @@ class RecordTab(QWidget):
         total_sale = 0
         for i, q in enumerate(quotes):
             status = q.get("status", "待确认")
-            received = q.get("received_amount", 0) or 0
+            received = q.get("received_amount_cents", 0) or 0
             sn_list = q.get("sn_list", "") or q.get("batch_sn_list", "") or ""
-            quote_price = q.get("quote_price", 0) or 0
+            quote_price = q.get("quote_price_cents", 0) or 0
             quote_quantity = q.get("quote_quantity", 1) or 1
             total_amount = quote_price * quote_quantity
 
@@ -174,9 +194,19 @@ class RecordTab(QWidget):
             self.record_table.setItem(i, 6, QTableWidgetItem(q.get("storage", "")))
             self.record_table.setItem(i, 7, QTableWidgetItem(q.get("gpu", "")))
             self.record_table.setItem(i, 8, QTableWidgetItem(q.get("supplier_name", "") or ""))
-            self.record_table.setItem(i, 9, QTableWidgetItem(f"¥{q.get('purchase_price', 0):.0f}" if q.get('purchase_price') else ""))
+            self.record_table.setItem(
+                i,
+                9,
+                QTableWidgetItem(
+                    format_yuan(q.get("purchase_price_cents", 0))
+                    if q.get("purchase_price_cents")
+                    else ""
+                ),
+            )
             self.record_table.setItem(i, 10, QTableWidgetItem(str(quote_quantity)))
-            self.record_table.setItem(i, 11, QTableWidgetItem(f"¥{quote_price:.0f}" if quote_price else ""))
+            self.record_table.setItem(
+                i, 11, QTableWidgetItem(format_yuan(quote_price) if quote_price else "")
+            )
 
             status_item = QTableWidgetItem(status)
             color = STATUS_COLORS.get(status, "#333")
@@ -184,7 +214,7 @@ class RecordTab(QWidget):
             status_item.setBackground(QColor(color))
             self.record_table.setItem(i, 12, status_item)
 
-            received_text = f"¥{received:.0f}" if received > 0 else "¥0"
+            received_text = format_yuan(received)
             received_item = QTableWidgetItem(received_text)
             if received >= total_amount and total_amount > 0:
                 received_item.setForeground(QColor("#388E3C"))
@@ -198,7 +228,7 @@ class RecordTab(QWidget):
             self.record_table.setItem(i, 15, QTableWidgetItem(merged_remark))
             self.record_table.setItem(i, 16, QTableWidgetItem(q.get("paid", "否")))
 
-            total_cost += (q.get("purchase_price", 0) or 0) * quote_quantity
+            total_cost += (q.get("purchase_price_cents", 0) or 0) * quote_quantity
             total_sale += quote_price * quote_quantity
 
             # 收款提醒：已出库超过7天未收满的订单，整行红色高亮
@@ -223,26 +253,26 @@ class RecordTab(QWidget):
         self.record_table.setColumnWidth(14, 120)
 
         # 税后利润统计
-        from src.models.database import calc_tax_adjusted_profit
         tax_total_cost = 0
         tax_total_sale = 0
         total_tax_profit = 0
         for q in quotes:
-            purchase_price = q.get("purchase_price", 0) or 0
-            quote_price = q.get("quote_price", 0) or 0
+            purchase_price = q.get("purchase_price_cents", 0) or 0
+            quote_price = q.get("quote_price_cents", 0) or 0
             quantity = q.get("quote_quantity", 1) or 1
             tax_rate = q.get("tax_rate")
             purchase_tax_inclusive = q.get("purchase_tax_inclusive", 0) or 0
             quote_tax_inclusive = q.get("quote_tax_inclusive", 0) or 0
             tax_total_cost += purchase_price * quantity
             tax_total_sale += quote_price * quantity
-            total_tax_profit += calc_tax_adjusted_profit(
+            total_tax_profit += calc_tax_adjusted_profit_cents(
                 purchase_price, quote_price, quantity, tax_rate,
                 purchase_tax_inclusive, quote_tax_inclusive,
             )
         profit = total_tax_profit
         self.stats_label.setText(
-            f"共 {len(quotes)} 条记录  |  总购入: ¥{tax_total_cost:.0f}  |  总报价: ¥{tax_total_sale:.0f}  |  毛利: ¥{profit:.0f}"
+            f"共 {len(quotes)} 条记录  |  总购入: {format_yuan(tax_total_cost)}  |  "
+            f"总报价: {format_yuan(tax_total_sale)}  |  毛利: {format_yuan(profit)}"
         )
 
     def on_edit_quote(self):
@@ -251,7 +281,7 @@ class RecordTab(QWidget):
             QMessageBox.warning(self, "提示", "请先选择一条报价记录")
             return
         quote_id = int(self.record_table.item(row, 0).text())
-        quote = get_quote_by_id(quote_id)
+        quote = get_quote_detail(quote_id)
         if not quote:
             QMessageBox.warning(self, "错误", "无法获取报价记录信息")
             return
@@ -259,20 +289,26 @@ class RecordTab(QWidget):
         if dlg.exec():
             data = dlg.get_data()
             if data["batch_id"]:
-                update_quote(
-                    quote_id,
-                    data["batch_id"],
-                    data["customer_id"],
-                    data["quote_price"],
-                    data["quote_quantity"],
-                    data["quote_date"],
-                    data["remark"],
-                    data["paid"],
-                    data.get("sn_list", ""),
-                    tax_rate=data.get("tax_rate"),
-                    purchase_tax_inclusive=data.get("purchase_tax_inclusive", 0),
-                    quote_tax_inclusive=data.get("quote_tax_inclusive", 0),
-                )
+                try:
+                    self.order_service.update_quote(
+                        quote_id,
+                        batch_id=data["batch_id"],
+                        customer_id=data["customer_id"],
+                        quote_price_cents=yuan_to_cents(data["quote_price"]),
+                        quote_quantity=data["quote_quantity"],
+                        quote_date=data["quote_date"],
+                        remark=data["remark"],
+                        paid=data["paid"],
+                        sn_list=data.get("sn_list", ""),
+                        tax_rate=data.get("tax_rate"),
+                        purchase_tax_inclusive=bool(
+                            data.get("purchase_tax_inclusive", 0)
+                        ),
+                        quote_tax_inclusive=bool(data.get("quote_tax_inclusive", 0)),
+                    )
+                except ServiceError as exc:
+                    QMessageBox.warning(self, "编辑失败", str(exc))
+                    return
                 self.refresh_records()
 
     def on_delete_quote(self):
@@ -289,8 +325,14 @@ class RecordTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            delete_quote(quote_id)
-            add_operation_log("删除报价", "quotes", quote_id, f"客户={customer}, 机型={series}")
+            try:
+                self.order_service.delete_quote(
+                    quote_id,
+                    f"用户删除报价：客户={customer}, 机型={series}",
+                )
+            except ServiceError as exc:
+                QMessageBox.warning(self, "删除失败", str(exc))
+                return
             self.refresh_records()
 
     def on_confirm_quote(self):
@@ -299,7 +341,7 @@ class RecordTab(QWidget):
             QMessageBox.warning(self, "提示", "请先选择一条报价记录")
             return
         quote_id = int(self.record_table.item(row, 0).text())
-        quote = get_quote_by_id(quote_id)
+        quote = get_quote_detail(quote_id)
         if not quote:
             return
         status = quote.get("status", "")
@@ -311,7 +353,11 @@ class RecordTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            update_quote_status(quote_id, "已报价")
+            try:
+                self.order_service.transition(quote_id, "已报价", "用户确认报价")
+            except ServiceError as exc:
+                QMessageBox.warning(self, "确认失败", str(exc))
+                return
             self.refresh_records()
 
     def on_ship_quote(self):
@@ -320,7 +366,7 @@ class RecordTab(QWidget):
             QMessageBox.warning(self, "提示", "请先选择一条报价记录")
             return
         quote_id = int(self.record_table.item(row, 0).text())
-        quote = get_quote_by_id(quote_id)
+        quote = get_quote_detail(quote_id)
         if not quote:
             return
         status = quote.get("status", "")
@@ -328,13 +374,10 @@ class RecordTab(QWidget):
             QMessageBox.warning(self, "提示", f"当前状态为「{status}」，只有「待确认」或「已报价」状态的订单可以出库")
             return
 
-        from src.models.database import get_connection
-        conn = get_connection()
-        batch_row = conn.execute("SELECT product_id FROM batches WHERE id=?", (quote.get("batch_id"),)).fetchone()
-        product_id = batch_row[0] if batch_row else None
-        conn.close()
+        batch = get_batch_detail(quote.get("batch_id"))
+        product_id = batch["product_id"] if batch else None
 
-        batches = get_batches(product_id) if product_id else []
+        batches = list_batches(product_id) if product_id else []
         if not batches:
             QMessageBox.warning(self, "提示", "没有可用批次，无法出库")
             return
@@ -342,14 +385,17 @@ class RecordTab(QWidget):
         dlg = ShipmentDialog(self, quote, batches)
         if dlg.exec():
             data = dlg.get_data()
-            # 使用封装好的 ship_quote 函数（含校验+扣减+保存SN+状态更新）
-            success, msg = ship_quote(quote_id, data.get("sn_list", ""))
-            if success:
-                QMessageBox.information(self, "成功", msg)
-                add_operation_log("出库", "quotes", quote_id, f"SN={data.get('sn_list', '')}")
-                self.refresh_records()
-            else:
-                QMessageBox.warning(self, "出库失败", msg)
+            try:
+                self.inventory_service.ship_quote(
+                    quote_id,
+                    data.get("sn_list", ""),
+                    data.get("shipped_date"),
+                )
+            except ServiceError as exc:
+                QMessageBox.warning(self, "出库失败", str(exc))
+                return
+            QMessageBox.information(self, "成功", "出库成功")
+            self.refresh_records()
 
     def on_receive_payment(self):
         row = self.record_table.currentRow()
@@ -357,7 +403,7 @@ class RecordTab(QWidget):
             QMessageBox.warning(self, "提示", "请先选择一条报价记录")
             return
         quote_id = int(self.record_table.item(row, 0).text())
-        quote = get_quote_by_id(quote_id)
+        quote = get_quote_detail(quote_id)
         if not quote:
             return
         status = quote.get("status", "")
@@ -371,18 +417,59 @@ class RecordTab(QWidget):
             if data["amount"] <= 0:
                 QMessageBox.warning(self, "提示", "请输入收款金额")
                 return
-            add_payment(
-                quote_id=quote_id,
-                customer_id=quote.get("customer_id"),
-                pay_type="receivable",
-                amount=data["amount"],
-                pay_date=data["pay_date"],
-                method=data["method"],
-                remark=data["remark"],
-            )
+            customer_id = quote.get("customer_id")
+            if not customer_id:
+                QMessageBox.warning(self, "收款失败", "报价未关联客户，无法记录客户收款")
+                return
+            try:
+                self.payment_service.receive_customer_payment(
+                    customer_id,
+                    yuan_to_cents(data["amount"]),
+                    data["pay_date"],
+                    data["method"],
+                    data["remark"],
+                    account_id=data["account_id"],
+                )
+            except ServiceError as exc:
+                QMessageBox.warning(self, "收款失败", str(exc))
+                return
             QMessageBox.information(self, "成功", f"收款 ¥{data['amount']:.2f} 已记录！")
-            add_operation_log("收款", "quotes", quote_id, f"金额={data['amount']:.2f}")
             self.refresh_records()
+
+    def on_return_sale(self):
+        row = self.record_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "提示", "请先选择一条已出库记录")
+            return
+        quote_id = int(self.record_table.item(row, 0).text())
+        quote = get_quote_detail(quote_id)
+        if not quote or quote.get("status") not in ("已出库", "已收款"):
+            QMessageBox.warning(self, "提示", "只有已出库或已收款订单可以退货")
+            return
+        dialog = ReturnDialog(
+            "销售退货",
+            self,
+            max_quantity=quote.get("quote_quantity", 1),
+            allow_restock=True,
+        )
+        if not dialog.exec():
+            return
+        data = dialog.get_data()
+        try:
+            self.return_service.return_sale(
+                quote_id,
+                quantity=data["quantity"],
+                return_date=data["date"],
+                restock=data["restock"],
+                reason=data["reason"],
+                refund_account_id=data["account_id"],
+                cash_refund_cents=yuan_to_cents(data["refund"]),
+            )
+        except ServiceError as exc:
+            QMessageBox.warning(self, "销售退货失败", str(exc))
+            return
+        QMessageBox.information(self, "成功", "销售退货已记录")
+        self.refresh_records()
 
     def on_cancel_quote(self):
         row = self.record_table.currentRow()
@@ -390,7 +477,7 @@ class RecordTab(QWidget):
             QMessageBox.warning(self, "提示", "请先选择一条报价记录")
             return
         quote_id = int(self.record_table.item(row, 0).text())
-        quote = get_quote_by_id(quote_id)
+        quote = get_quote_detail(quote_id)
         if not quote:
             return
         status = quote.get("status", "")
@@ -403,8 +490,11 @@ class RecordTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            update_quote_status(quote_id, "已取消")
-            add_operation_log("取消订单", "quotes", quote_id, "取消订单")
+            try:
+                self.order_service.cancel_quote(quote_id, "用户取消订单")
+            except ServiceError as exc:
+                QMessageBox.warning(self, "取消失败", str(exc))
+                return
             self.refresh_records()
 
     # -------------------------------------------------------
@@ -455,7 +545,7 @@ class RecordTab(QWidget):
             if not series or series == "未识别":
                 continue
             # 检查是否已存在（按全部字段去重）
-            existing = search_products(series)
+            existing = list_products(series)
             skip = False
             for e in existing:
                 if (e["series"] == series and
@@ -468,7 +558,7 @@ class RecordTab(QWidget):
                     skip = True
                     break
             if not skip:
-                add_product(
+                self.product_service.create(
                     series=series,
                     cpu=p.get("cpu", ""),
                     ram=p.get("ram", ""),
@@ -562,7 +652,7 @@ class RecordTab(QWidget):
     # 群发图片
     # -------------------------------------------------------
     def on_broadcast(self):
-        products = get_all_products()
+        products = list_products()
         if not products:
             QMessageBox.warning(self, "提示", "还没有机型数据，请先导入 Word 价格表")
             return
@@ -704,7 +794,12 @@ class RecordTab(QWidget):
                 QMessageBox.warning(self, "提示", "没有有效的SN")
                 return
             receipt = generate_shipment_receipt(
-                {"series": "手动出库", "customer_name": "________", "quote_price": 0, "quote_quantity": len(valid)},
+                {
+                    "series": "手动出库",
+                    "customer_name": "________",
+                    "quote_price_cents": 0,
+                    "quote_quantity": len(valid),
+                },
                 valid
             )
             clipboard = QApplication.clipboard()

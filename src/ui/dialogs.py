@@ -6,21 +6,24 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel,
-    QComboBox, QLineEdit, QTextEdit, QSpinBox, QDateEdit,
+    QComboBox, QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QDateEdit,
     QDialogButtonBox, QMessageBox, QAbstractItemView, QHeaderView,
     QCheckBox,
 )
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 
-from src.models.database import (
-    get_connection, ship_quote, add_quote, update_quote, add_payment,
-    get_payments, get_operation_logs, get_batches, get_batch_remaining,
-    get_customer_statement, get_all_customers, search_customers,
-    add_customer, get_all_suppliers, get_supplier_payable,
-    get_quote_by_id, get_all_products, search_products,
-    add_supplier,
+from src.models.queries import (
+    get_batch_remaining,
+    get_customer_statement,
+    get_customer_default_tax_rate,
+    get_operation_logs,
+    list_customers,
+    list_suppliers,
 )
+from src.services.party_service import CustomerService, SupplierService
+from src.models.finance_queries import list_financial_accounts
+from src.utils.money import cents_to_yuan, format_yuan
 from src.utils.shipment_flow import parse_sn_input, validate_sn_list, check_sn_duplicates
 
 
@@ -63,7 +66,8 @@ class ShipmentDialog(QDialog):
         self.batch_combo = QComboBox()
         for b in self.batches:
             self.batch_combo.addItem(
-                f"批次#{b['id']} | 购入¥{b['purchase_price']:.0f} | 剩余{b['remaining']}台 | {b.get('date','')}",
+                f"批次#{b['id']} | 购入{format_yuan(b['purchase_price_cents'])} | "
+                f"剩余{b['remaining']}台 | {b.get('date','')}",
                 b["id"]
             )
         self.batch_combo.currentIndexChanged.connect(self._update_remaining)
@@ -71,6 +75,10 @@ class ShipmentDialog(QDialog):
 
         self.remaining_label = QLabel()
         self._update_remaining()
+        self.shipped_date_edit = QDateEdit()
+        self.shipped_date_edit.setDate(QDate.currentDate())
+        self.shipped_date_edit.setCalendarPopup(True)
+        layout.addRow("出库日期:", self.shipped_date_edit)
         layout.addRow("批次剩余:", self.remaining_label)
 
         self.sn_edit = QTextEdit()
@@ -138,6 +146,7 @@ class ShipmentDialog(QDialog):
             "sn_list": ",".join(sn_list),
             "sn_count": len(sn_list),
             "remark": self.remark_edit.text().strip(),
+            "shipped_date": self.shipped_date_edit.date().toString("yyyy-MM-dd"),
         }
 
 
@@ -156,10 +165,15 @@ class PaymentDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
 
         if quote:
-            total_amount = (quote.get("quote_price", 0) or 0) * (quote.get("quote_quantity", 1) or 1)
-            received = quote.get("received_amount", 0) or 0
-            remaining = total_amount - received
-            info = f"客户: {quote.get('customer_name','')} | 总金额: ¥{total_amount:.0f} | 已收: ¥{received:.0f} | 待收: ¥{remaining:.0f}"
+            total_cents = (quote.get("quote_price_cents", 0) or 0) * (
+                quote.get("quote_quantity", 1) or 1
+            )
+            received_cents = quote.get("received_amount_cents", 0) or 0
+            remaining_cents = total_cents - received_cents
+            info = (
+                f"客户: {quote.get('customer_name','')} | 总金额: {format_yuan(total_cents)} "
+                f"| 已收: {format_yuan(received_cents)} | 待收: {format_yuan(remaining_cents)}"
+            )
             info_label = QLabel(info)
             info_label.setObjectName("dialogInfoLabel")
             layout.addRow(info_label)
@@ -169,8 +183,9 @@ class PaymentDialog(QDialog):
             info_label.setObjectName("dangerSummaryLabel")
             layout.addRow(info_label)
 
-        self.amount_spin = QSpinBox()
-        self.amount_spin.setRange(1, 999999)
+        self.amount_spin = QDoubleSpinBox()
+        self.amount_spin.setDecimals(2)
+        self.amount_spin.setRange(0.01, 999999999.99)
         self.amount_spin.setPrefix("¥ ")
         self.amount_spin.setValue(0)
         layout.addRow("金额:", self.amount_spin)
@@ -233,10 +248,11 @@ class PaymentEditDialog(QDialog):
         info_label.setObjectName("dialogInfoLabel")
         layout.addRow(info_label)
 
-        self.amount_spin = QSpinBox()
-        self.amount_spin.setRange(1, 999999)
+        self.amount_spin = QDoubleSpinBox()
+        self.amount_spin.setDecimals(2)
+        self.amount_spin.setRange(0.01, 999999999.99)
         self.amount_spin.setPrefix("¥ ")
-        self.amount_spin.setValue(int(payment.get("amount", 0)))
+        self.amount_spin.setValue(cents_to_yuan(payment.get("amount_cents", 0)))
         layout.addRow("金额:", self.amount_spin)
 
         self.method_combo = QComboBox()
@@ -294,7 +310,7 @@ class StatementDialog(QDialog):
         self.customer_combo = QComboBox()
         self.customer_combo.setEditable(True)
         self.customer_combo.setPlaceholderText("选择或输入客户...")
-        customers = get_all_customers()
+        customers = list_customers()
         for c in customers:
             self.customer_combo.addItem(c["name"], c["id"])
         top_row.addWidget(self.customer_combo)
@@ -342,7 +358,7 @@ class StatementDialog(QDialog):
         customer_name = self.customer_combo.currentText().strip()
         customer_id = self.customer_combo.currentData()
         if not customer_id and customer_name:
-            matched = search_customers(customer_name)
+            matched = list_customers(customer_name)
             if matched:
                 customer_id = matched[0]["id"]
             else:
@@ -361,10 +377,10 @@ class StatementDialog(QDialog):
         total_sale = 0
         total_received = 0
         for i, r in enumerate(self._records):
-            purchase_price = r.get("purchase_price", 0) or 0
-            quote_price = r.get("quote_price", 0) or 0
+            purchase_price = r.get("purchase_price_cents", 0) or 0
+            quote_price = r.get("quote_price_cents", 0) or 0
             quantity = r.get("quote_quantity", 1) or 1
-            received = r.get("received_amount", 0) or 0
+            received = r.get("received_amount_cents", 0) or 0
             total_amount = quote_price * quantity
             profit = (quote_price - purchase_price) * quantity
             pending = total_amount - received
@@ -373,14 +389,14 @@ class StatementDialog(QDialog):
             self.statement_table.setItem(i, 1, QTableWidgetItem(r.get("series", "")))
             self.statement_table.setItem(i, 2, QTableWidgetItem(r.get("cpu", "")))
             self.statement_table.setItem(i, 3, QTableWidgetItem(str(quantity)))
-            self.statement_table.setItem(i, 4, QTableWidgetItem(f"¥{purchase_price:.0f}"))
-            self.statement_table.setItem(i, 5, QTableWidgetItem(f"¥{quote_price:.0f}"))
-            profit_item = QTableWidgetItem(f"¥{profit:.0f}" if profit >= 0 else f"-¥{-profit:.0f}")
+            self.statement_table.setItem(i, 4, QTableWidgetItem(format_yuan(purchase_price)))
+            self.statement_table.setItem(i, 5, QTableWidgetItem(format_yuan(quote_price)))
+            profit_item = QTableWidgetItem(format_yuan(profit))
             profit_item.setForeground(QColor("#388E3C") if profit >= 0 else QColor("#D32F2F"))
             self.statement_table.setItem(i, 6, profit_item)
             self.statement_table.setItem(i, 7, QTableWidgetItem(r.get("status", "")))
-            self.statement_table.setItem(i, 8, QTableWidgetItem(f"¥{received:.0f}"))
-            self.statement_table.setItem(i, 9, QTableWidgetItem(f"¥{pending:.0f}" if pending > 0 else "已结清"))
+            self.statement_table.setItem(i, 8, QTableWidgetItem(format_yuan(received)))
+            self.statement_table.setItem(i, 9, QTableWidgetItem(format_yuan(pending) if pending > 0 else "已结清"))
             merged_remark = " | ".join(filter(None, [r.get("batch_remark", "") or "", r.get("remark", "") or ""]))
             self.statement_table.setItem(i, 10, QTableWidgetItem(merged_remark))
 
@@ -392,8 +408,9 @@ class StatementDialog(QDialog):
 
         total_pending = total_sale - total_received
         self.summary_label.setText(
-            f"客户: {customer_name} | 总购入: ¥{total_cost:.0f} | 总金额: ¥{total_sale:.0f} | "
-            f"已收款: ¥{total_received:.0f} | 待收款: ¥{total_pending:.0f} | 总毛利: ¥{total_sale - total_cost:.0f}"
+            f"客户: {customer_name} | 总购入: {format_yuan(total_cost)} | "
+            f"总金额: {format_yuan(total_sale)} | 已收款: {format_yuan(total_received)} | "
+            f"待收款: {format_yuan(total_pending)} | 总毛利: {format_yuan(total_sale - total_cost)}"
         )
 
     def _export_excel(self):
@@ -439,10 +456,10 @@ def export_statement_to_excel(records, customer_name):
     total_sale = 0
     total_received = 0
     for row_idx, r in enumerate(records, 2):
-        purchase_price = r.get("purchase_price", 0) or 0
-        quote_price = r.get("quote_price", 0) or 0
+        purchase_price = r.get("purchase_price_cents", 0) or 0
+        quote_price = r.get("quote_price_cents", 0) or 0
         quantity = r.get("quote_quantity", 1) or 1
-        received = r.get("received_amount", 0) or 0
+        received = r.get("received_amount_cents", 0) or 0
         total_amount = quote_price * quantity
         profit = (quote_price - purchase_price) * quantity
         pending = total_amount - received
@@ -450,8 +467,10 @@ def export_statement_to_excel(records, customer_name):
 
         row_data = [
             r.get("quote_date", ""), r.get("series", ""), r.get("cpu", ""),
-            quantity, purchase_price, quote_price, profit, r.get("status", ""),
-            received, pending if pending > 0 else "已结清", merged_remark,
+            quantity, cents_to_yuan(purchase_price), cents_to_yuan(quote_price),
+            cents_to_yuan(profit), r.get("status", ""),
+            cents_to_yuan(received), cents_to_yuan(pending) if pending > 0 else "已结清",
+            merged_remark,
         ]
         for col_idx, val in enumerate(row_data, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
@@ -558,8 +577,9 @@ class BatchDialog(QDialog):
         layout = QFormLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        self.price_spin = QSpinBox()
-        self.price_spin.setRange(0, 999999)
+        self.price_spin = QDoubleSpinBox()
+        self.price_spin.setDecimals(2)
+        self.price_spin.setRange(0, 999999999.99)
         self.price_spin.setPrefix("¥ ")
         self.price_spin.setValue(0)
 
@@ -595,7 +615,7 @@ class BatchDialog(QDialog):
         layout.addRow(buttons)
 
     def _load_suppliers(self):
-        suppliers = get_all_suppliers()
+        suppliers = list_suppliers()
         for s in suppliers:
             self.supplier_combo.addItem(s["name"], s["id"])
 
@@ -611,7 +631,7 @@ class BatchDialog(QDialog):
         supplier_name = self.supplier_combo.currentText().strip()
         supplier_id = self.supplier_combo.currentData()
         if not supplier_id and supplier_name:
-            supplier_id = add_supplier(supplier_name)
+            supplier_id = SupplierService().create(name=supplier_name)
         return {
             "price": self.price_spin.value(),
             "quantity": self.quantity_spin.value(),
@@ -701,8 +721,9 @@ class QuoteEditDialog(QDialog):
         layout = QFormLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        self.price_spin = QSpinBox()
-        self.price_spin.setRange(0, 999999)
+        self.price_spin = QDoubleSpinBox()
+        self.price_spin.setDecimals(2)
+        self.price_spin.setRange(0, 999999999.99)
         self.price_spin.setPrefix("¥ ")
         self.price_spin.setValue(0)
 
@@ -742,7 +763,9 @@ class QuoteEditDialog(QDialog):
         self.quote_tax_check = QCheckBox("售价含税")
 
         if quote:
-            self.price_spin.setValue(int(quote.get("quote_price", 0)))
+            self.price_spin.setValue(
+                cents_to_yuan(quote.get("quote_price_cents", 0))
+            )
             self.quantity_spin.setValue(quote.get("quote_quantity", 1))
             if quote.get("quote_date"):
                 qdate = QDate.fromString(quote.get("quote_date"), "yyyy-MM-dd")
@@ -765,7 +788,6 @@ class QuoteEditDialog(QDialog):
             self.quote_tax_check.setChecked(quote.get("quote_tax_inclusive", 0) == 1)
         elif customer_id:
             # 新建报价时自动带入客户默认税率
-            from src.models.database import get_customer_default_tax_rate
             default_tax = get_customer_default_tax_rate(customer_id)
             if default_tax is not None:
                 idx = self.tax_combo.findData(default_tax)
@@ -796,7 +818,7 @@ class QuoteEditDialog(QDialog):
         layout.addRow(buttons)
 
     def _load_customers(self):
-        customers = get_all_customers()
+        customers = list_customers()
         for c in customers:
             self.customer_combo.addItem(c["name"], c["id"])
 
@@ -812,7 +834,7 @@ class QuoteEditDialog(QDialog):
         customer_name = self.customer_combo.currentText().strip()
         customer_id = self.customer_combo.currentData()
         if not customer_id and customer_name:
-            customer_id = add_customer(customer_name)
+            customer_id = CustomerService().create(name=customer_name)
         return {
             "quote_price": self.price_spin.value(),
             "quote_quantity": self.quantity_spin.value(),
@@ -865,7 +887,6 @@ class OperationLogDialog(QDialog):
         self.load_logs()
 
     def load_logs(self):
-        from src.models.database import get_operation_logs
         logs = get_operation_logs(limit=50)
         self.table.setRowCount(len(logs))
         for i, log in enumerate(logs):

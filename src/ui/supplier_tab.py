@@ -5,11 +5,16 @@ from PyQt6.QtWidgets import (
     QLineEdit, QGroupBox, QMessageBox, QAbstractItemView,
 )
 
-from src.models.database import (
-    add_supplier, search_suppliers, get_all_suppliers,
-    delete_supplier_cascade, add_operation_log,
+from src.models.queries import (
+    get_supplier,
+    get_supplier_purchase_history,
+    get_supplier_reference_counts,
+    list_suppliers,
 )
+from src.services.exceptions import ServiceError
+from src.services.party_service import SupplierService
 from src.ui.dialogs import CustomerDialog
+from src.utils.money import format_yuan
 
 
 class SupplierTab(QWidget):
@@ -22,6 +27,7 @@ class SupplierTab(QWidget):
         self.supplier_search = None
         self.supplier_stats_label = None
         self.supplier_history_table = None
+        self.supplier_service = SupplierService()
         self._build_ui()
 
     def _build_ui(self):
@@ -84,37 +90,31 @@ class SupplierTab(QWidget):
         sid = int(self.supplier_table.item(row, 0).text())
         supplier_name = self.supplier_table.item(row, 1).text()
 
-        from src.models.database import get_connection
-        conn = get_connection()
-        rows = conn.execute("""
-            SELECT b.date, p.series, p.cpu, b.quantity, b.purchase_price, b.remark
-            FROM batches b
-            JOIN products p ON b.product_id = p.id
-            WHERE b.supplier_id = ?
-            ORDER BY b.date DESC, b.id DESC
-        """, (sid,)).fetchall()
-        conn.close()
+        rows = get_supplier_purchase_history(sid)
 
         total_amount = 0
         self.supplier_history_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            total_amount += (r[4] or 0) * (r[3] or 0)
-            self.supplier_history_table.setItem(i, 0, QTableWidgetItem(r[0] or ""))
-            self.supplier_history_table.setItem(i, 1, QTableWidgetItem(r[1] or ""))
-            self.supplier_history_table.setItem(i, 2, QTableWidgetItem(r[2] or ""))
-            self.supplier_history_table.setItem(i, 3, QTableWidgetItem(str(r[3] or 0)))
-            self.supplier_history_table.setItem(i, 4, QTableWidgetItem(f"¥{(r[4] or 0):.0f}"))
-            self.supplier_history_table.setItem(i, 5, QTableWidgetItem(f"¥{(r[4] or 0) * (r[3] or 0):.0f}"))
-            self.supplier_history_table.setItem(i, 6, QTableWidgetItem(r[5] or ""))
+            price = r.get("purchase_price_cents", 0) or 0
+            quantity = r.get("quantity", 0) or 0
+            total_amount += price * quantity
+            self.supplier_history_table.setItem(i, 0, QTableWidgetItem(r.get("date") or ""))
+            self.supplier_history_table.setItem(i, 1, QTableWidgetItem(r.get("series") or ""))
+            self.supplier_history_table.setItem(i, 2, QTableWidgetItem(r.get("cpu") or ""))
+            self.supplier_history_table.setItem(i, 3, QTableWidgetItem(str(quantity)))
+            self.supplier_history_table.setItem(i, 4, QTableWidgetItem(format_yuan(price)))
+            self.supplier_history_table.setItem(i, 5, QTableWidgetItem(format_yuan(price * quantity)))
+            self.supplier_history_table.setItem(i, 6, QTableWidgetItem(r.get("remark") or ""))
         self.supplier_history_table.resizeColumnsToContents()
 
         self.supplier_stats_label.setText(
-            f"上游: {supplier_name} | 总批次数: {len(rows)} | 总金额: ¥{total_amount:.0f}"
+            f"上游: {supplier_name} | 总批次数: {len(rows)} | "
+            f"总金额: {format_yuan(total_amount)}"
         )
 
     def refresh_supplier_list(self):
         keyword = self.supplier_search.text().strip()
-        suppliers = search_suppliers(keyword) if keyword else get_all_suppliers()
+        suppliers = list_suppliers(keyword)
         self.supplier_table.setRowCount(len(suppliers))
         for i, s in enumerate(suppliers):
             self.supplier_table.setItem(i, 0, QTableWidgetItem(str(s["id"])))
@@ -133,8 +133,11 @@ class SupplierTab(QWidget):
             if not data["name"]:
                 QMessageBox.warning(self, "提示", "上游名称不能为空")
                 return
-            add_supplier(**data)
-            add_operation_log("新增供应商", "suppliers", 0, f"名称={data['name']}")
+            try:
+                supplier_id = self.supplier_service.create(**data)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "新增失败", str(exc))
+                return
             self.refresh_supplier_list()
 
     def on_edit_supplier_from_table(self):
@@ -142,12 +145,17 @@ class SupplierTab(QWidget):
         if row < 0:
             return
         sid = int(self.supplier_table.item(row, 0).text())
+        supplier = get_supplier(sid)
+        if not supplier:
+            QMessageBox.warning(self, "提示", "上游不存在或已删除")
+            self.refresh_supplier_list()
+            return
         current = {
-            "name": self.supplier_table.item(row, 1).text(),
-            "wechat": self.supplier_table.item(row, 2).text() if self.supplier_table.item(row, 2) else "",
-            "qq": self.supplier_table.item(row, 3).text() if self.supplier_table.item(row, 3) else "",
-            "phone": self.supplier_table.item(row, 4).text() if self.supplier_table.item(row, 4) else "",
-            "note": "",
+            "name": supplier["name"] or "",
+            "wechat": supplier["wechat"] or "",
+            "qq": supplier["qq"] or "",
+            "phone": supplier["phone"] or "",
+            "note": supplier["note"] or "",
         }
         dlg = CustomerDialog(self, current)
         dlg.setWindowTitle("编辑上游")
@@ -155,14 +163,11 @@ class SupplierTab(QWidget):
             data = dlg.get_data()
             if not data["name"]:
                 return
-            from src.models.database import get_connection
-            conn = get_connection()
-            conn.execute(
-                "UPDATE suppliers SET name=?, wechat=?, qq=?, phone=?, note=? WHERE id=?",
-                (data["name"], data["wechat"], data["qq"], data["phone"], data["note"], sid),
-            )
-            conn.commit()
-            conn.close()
+            try:
+                self.supplier_service.update(sid, **data)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "编辑失败", str(exc))
+                return
             self.refresh_supplier_list()
 
     def on_delete_supplier(self):
@@ -172,16 +177,14 @@ class SupplierTab(QWidget):
             return
         sid = int(self.supplier_table.item(row, 0).text())
         name = self.supplier_table.item(row, 1).text()
-        from src.models.database import get_connection
-        conn = get_connection()
-        batch_count = conn.execute("SELECT COUNT(*) FROM batches WHERE supplier_id=?", (sid,)).fetchone()[0]
-        payment_count = conn.execute("SELECT COUNT(*) FROM payments WHERE supplier_id=?", (sid,)).fetchone()[0]
-        conn.close()
+        references = get_supplier_reference_counts(sid)
+        batch_count = references["batches"]
+        payment_count = references["payments"]
         if batch_count > 0 or payment_count > 0:
             reply = QMessageBox.question(
                 self, "确认删除",
                 f"上游「{name}」有 {batch_count} 条关联批次和 {payment_count} 条付款记录。\n\n"
-                f"删除后关联批次的上游将设为空，付款记录将被删除。\n此操作不可恢复。",
+                "删除后上游将从工作列表隐藏，采购与付款历史仍会保留。\n确定继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
         else:
@@ -190,7 +193,10 @@ class SupplierTab(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
         if reply == QMessageBox.StandardButton.Yes:
-            delete_supplier_cascade(sid)
-            add_operation_log("删除供应商", "suppliers", sid, f"名称={name}")
+            try:
+                self.supplier_service.delete(sid)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "删除失败", str(exc))
+                return
             self.refresh_supplier_list()
             self.main.record_tab.refresh_records()
