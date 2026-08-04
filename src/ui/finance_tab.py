@@ -22,8 +22,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.models.database import get_all_customers, get_all_suppliers, get_payment_by_id
-from src.models.queries import get_payables, get_payment_flow, get_receivables
+from src.models.queries import (
+    get_payables,
+    get_payment_detail,
+    get_payment_flow,
+    get_receivables,
+    list_customers,
+    list_suppliers,
+)
 from src.models.repositories import yuan_to_cents
 from src.services.exceptions import ServiceError
 from src.services.payment_service import PaymentService
@@ -174,11 +180,11 @@ class FinanceTab(QWidget):
         self.payment_object_filter.blockSignals(True)
         self.payment_object_filter.clear()
         self.payment_object_filter.addItem("全部对象", None)
-        for customer in get_all_customers():
+        for customer in list_customers(db_path=self.db_path):
             self.payment_object_filter.addItem(
                 f"客户: {customer['name']}", ("customer", customer["id"])
             )
-        for supplier in get_all_suppliers():
+        for supplier in list_suppliers(db_path=self.db_path):
             self.payment_object_filter.addItem(
                 f"上游: {supplier['name']}", ("supplier", supplier["id"])
             )
@@ -287,7 +293,7 @@ class FinanceTab(QWidget):
         self._changed("流水已作废")
 
     def _correct(self, payment_id):
-        payment = get_payment_by_id(payment_id)
+        payment = get_payment_detail(payment_id, self.db_path)
         if not payment:
             QMessageBox.warning(self, "更正失败", "流水不存在")
             return

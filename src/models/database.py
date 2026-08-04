@@ -1,4 +1,4 @@
-"""v1.13 compatibility facade for the legacy function API.
+"""v1.14 compatibility facade for the legacy function API.
 
 New code should use ``src.services`` and the repository/query modules.  The
 functions in this module remain available for one compatibility release.
@@ -46,62 +46,29 @@ def backup_database():
 
 
 def verify_data_integrity():
-    """启动时检查数据完整性，返回 (is_clean, issues_list)"""
-    conn = get_connection()
-    issues = []
-    try:
-        # 检查孤儿报价（batch_id 不存在的报价）
-        orphan_quotes = conn.execute("""
-            SELECT q.id, q.quote_date, q.remark
-            FROM quotes q LEFT JOIN batches b ON q.batch_id = b.id
-            WHERE b.id IS NULL
-        """).fetchall()
-        for oq in orphan_quotes:
-            issues.append(f"孤儿报价: id={oq['id']}, 日期={oq['quote_date']}")
+    """启动时运行 v1.14 自动对账，返回旧接口形状。"""
+    from src.services.reconciliation_service import ReconciliationService
 
-        # 检查孤儿付款（quote_id 不存在或 customer_id 不存在）
-        orphan_payments = conn.execute("""
-            SELECT p.id, p.type, p.amount
-            FROM payments p
-            LEFT JOIN quotes q ON p.quote_id = q.id
-            WHERE p.quote_id IS NOT NULL AND q.id IS NULL
-        """).fetchall()
-        for op in orphan_payments:
-            issues.append(f"孤儿付款: id={op['id']}, type={op['type']}, amount={op['amount']}")
-
-        # 检查负数余额
-        neg_receivable = conn.execute("""
-            SELECT q.id, q.received_amount, q.quote_price * q.quote_quantity AS total
-            FROM quotes q WHERE q.status != '已取消' AND q.received_amount < 0
-        """).fetchall()
-        for nr in neg_receivable:
-            issues.append(f"负数已收金额: quote_id={nr['id']}, received={nr['received_amount']}")
-
-        # 检查负数供应商余额
-        neg_supplier = conn.execute(
-            "SELECT id, name, balance FROM suppliers WHERE balance_cents < -1"
-        ).fetchall()
-        for ns in neg_supplier:
-            issues.append(f"负数供应商余额: supplier_id={ns['id']}, name={ns['name']}, balance={ns['balance']}")
-    except Exception as e:
-        issues.append(f"完整性检查异常: {str(e)}")
-    finally:
-        conn.close()
-
-    return len(issues) == 0, issues
+    report = ReconciliationService(DB_PATH).run()
+    return report.is_clean, [issue.message for issue in report.issues]
 
 
 def init_db():
     """Migrate automatically, fail closed, then create a normal startup backup."""
     backup = migrate_database(Path(DB_PATH))
-    is_clean, issues = verify_data_integrity()
-    if not is_clean:
-        raise DatabaseMigrationError("；".join(issues), backup)
+    from src.services.reconciliation_service import ReconciliationService
+
+    report = ReconciliationService(DB_PATH).run()
     ok, message = backup_database()
+    reconciliation_note = (
+        "自动对账通过"
+        if report.is_clean
+        else f"自动对账发现 {len(report.issues)} 个问题，请在“数据安全”菜单查看"
+    )
     if not ok:
-        return True, f"数据库初始化成功；{message}"
+        return True, f"数据库初始化成功；{reconciliation_note}；{message}"
     migration_note = f"；迁移备份: {backup.path.name}" if backup else ""
-    return True, f"数据库初始化成功{migration_note}；{message}"
+    return True, f"数据库初始化成功{migration_note}；{reconciliation_note}；{message}"
 
 
 # ---------- 机型管理 ----------

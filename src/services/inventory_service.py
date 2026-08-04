@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from src.models.connection import transaction
-from src.models.repositories import audit, cents_to_yuan
+from src.models.repositories import (
+    adjust_supplier_balance,
+    audit,
+    decrement_batch_remaining,
+    get_active_entity,
+    insert_batch,
+    set_quote_status,
+)
 from src.services.exceptions import (
     InsufficientStockError,
     InvalidTransitionError,
@@ -30,55 +37,48 @@ class InventoryService:
         if purchase_price_cents < 0 or quantity <= 0:
             raise ValidationError("进价不能为负且数量必须大于 0")
         with transaction(self.db_path) as conn:
-            product = conn.execute(
-                "SELECT id FROM products WHERE id=? AND deleted_at IS NULL",
-                (product_id,),
-            ).fetchone()
-            if not product:
+            if not get_active_entity(conn, "products", product_id):
                 raise NotFoundError("机型不存在或已删除")
-            cursor = conn.execute(
-                "INSERT INTO batches "
-                "(product_id,purchase_price,purchase_price_cents,quantity,remaining,"
-                "date,remark,supplier_id,sn_list) VALUES (?,?,?,?,?,?,?,?,?)",
-                (
-                    product_id,
-                    cents_to_yuan(purchase_price_cents),
-                    purchase_price_cents,
-                    quantity,
-                    quantity,
-                    date,
-                    remark,
-                    supplier_id,
-                    sn_list,
-                ),
+            if supplier_id is not None and not get_active_entity(
+                conn, "suppliers", supplier_id
+            ):
+                raise NotFoundError("供应商不存在或已删除")
+            batch_id = insert_batch(
+                conn,
+                product_id=product_id,
+                purchase_price_cents=purchase_price_cents,
+                quantity=quantity,
+                date=date,
+                remark=remark,
+                supplier_id=supplier_id,
+                sn_list=sn_list,
             )
-            batch_id = int(cursor.lastrowid)
+            if supplier_id is not None:
+                adjust_supplier_balance(
+                    conn,
+                    supplier_id,
+                    purchase_price_cents * quantity,
+                )
             audit(conn, "batches", batch_id, "receive", after={"quantity": quantity})
             return batch_id
 
     def ship_quote(self, quote_id: int, sn_list: str = "") -> None:
         with transaction(self.db_path) as conn:
-            quote = conn.execute(
-                "SELECT * FROM quotes WHERE id=? AND deleted_at IS NULL", (quote_id,)
-            ).fetchone()
+            quote = get_active_entity(conn, "quotes", quote_id)
             if not quote:
                 raise NotFoundError("报价记录不存在")
             if quote["status"] not in ("待确认", "已报价"):
                 raise InvalidTransitionError(f"当前状态「{quote['status']}」不允许出库")
-            batch = conn.execute(
-                "SELECT * FROM batches WHERE id=? AND deleted_at IS NULL",
-                (quote["batch_id"],),
-            ).fetchone()
+            batch = get_active_entity(conn, "batches", quote["batch_id"])
             if not batch or batch["remaining"] < quote["quote_quantity"]:
                 raise InsufficientStockError("库存不足，无法出库")
-            conn.execute(
-                "UPDATE batches SET remaining=remaining-? WHERE id=?",
-                (quote["quote_quantity"], quote["batch_id"]),
-            )
-            conn.execute(
-                "UPDATE quotes SET status='已出库', sn_list=? WHERE id=?",
-                (sn_list, quote_id),
-            )
+            if not decrement_batch_remaining(
+                conn,
+                quote["batch_id"],
+                quote["quote_quantity"],
+            ):
+                raise InsufficientStockError("库存不足，无法出库")
+            set_quote_status(conn, quote_id, "已出库", sn_list=sn_list)
             audit(
                 conn,
                 "quotes",

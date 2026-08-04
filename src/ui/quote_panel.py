@@ -11,9 +11,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 from src.models.database import (
-    get_batches, get_batch_remaining, add_batch, delete_batch,
+    get_batches, add_batch, delete_batch,
     add_quote, add_customer, search_customers, get_all_customers,
     get_all_suppliers, add_operation_log,
+)
+from src.models.queries import (
+    get_batch_detail,
+    get_batch_remaining,
+    get_customer_default_tax_rate,
 )
 from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_single_quote_card, generate_quote_image, WATERMARK_TEXT
@@ -190,7 +195,6 @@ class QuotePanel(QWidget):
         """客户切换时自动填充默认税率"""
         customer_id = self.customer_combo.currentData()
         if customer_id:
-            from src.models.database import get_customer_default_tax_rate
             default_tax = get_customer_default_tax_rate(customer_id)
             if default_tax is not None:
                 idx = self.tax_combo.findData(default_tax)
@@ -304,7 +308,6 @@ class QuotePanel(QWidget):
         if batch_id is None:
             return False
         
-        from src.models.database import get_batch_remaining
         quote_quantity = self.quote_quantity_spin.value()
         remaining = get_batch_remaining(batch_id)
         
@@ -328,16 +331,9 @@ class QuotePanel(QWidget):
         batch_id = price_item.data(Qt.ItemDataRole.UserRole)
         if batch_id is None:
             return None, None, None, None, None, None
-        from src.models.database import get_connection
-        conn = get_connection()
-        batch_row = conn.execute(
-            "SELECT id, product_id, purchase_price, quantity, remaining, date, remark, supplier_id, sn_list FROM batches WHERE id=?",
-            (batch_id,),
-        ).fetchone()
-        conn.close()
-        if not batch_row:
+        batch = get_batch_detail(batch_id)
+        if not batch:
             return None, None, None, None, None, None
-        batch = dict(batch_row)
         product = getattr(self, 'product_specs', {})
         quote_price = self.quote_price_spin.value()
         quote_quantity = self.quote_quantity_spin.value()

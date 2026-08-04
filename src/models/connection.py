@@ -76,6 +76,19 @@ class BackupInfo:
     sha256: str
 
 
+@dataclass(frozen=True)
+class RestoreInfo:
+    restored_from: Path
+    restored_sha256: str
+    safety_backup: BackupInfo | None
+
+
+class DatabaseRestoreError(RuntimeError):
+    def __init__(self, message: str, safety_backup: BackupInfo | None = None):
+        super().__init__(message)
+        self.safety_backup = safety_backup
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -118,4 +131,86 @@ def create_backup(
             old.unlink()
 
     return BackupInfo(target, _sha256(target))
+
+
+def _database_version_and_integrity(path: Path) -> tuple[int, str]:
+    conn = connect(path, read_only=True)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        return int(version), str(integrity)
+    finally:
+        conn.close()
+
+
+def _backup_over_database(source_path: Path, destination_path: Path) -> None:
+    source = connect(source_path, read_only=True)
+    destination = sqlite3.connect(destination_path)
+    try:
+        source.backup(destination)
+        destination.commit()
+    finally:
+        destination.close()
+        source.close()
+
+
+def restore_database(
+    backup_path: str | os.PathLike[str],
+    db_path: str | os.PathLike[str] | None = None,
+) -> RestoreInfo:
+    """Restore a verified SQLite backup and preserve a pre-restore safety copy."""
+    from src.models.schema import SCHEMA_VERSION
+
+    source_path = Path(backup_path).expanduser().resolve()
+    target_path = Path(db_path or get_database_path()).expanduser().resolve()
+    if not source_path.is_file():
+        raise DatabaseRestoreError(f"备份文件不存在: {source_path}")
+    if source_path == target_path:
+        raise DatabaseRestoreError("备份文件不能与当前生产库相同")
+
+    try:
+        source_version, source_integrity = _database_version_and_integrity(source_path)
+    except sqlite3.DatabaseError as exc:
+        raise DatabaseRestoreError(f"无法读取备份数据库: {exc}") from exc
+    if source_integrity != "ok":
+        raise DatabaseRestoreError(f"备份完整性检查失败: {source_integrity}")
+    if source_version > SCHEMA_VERSION:
+        raise DatabaseRestoreError(
+            f"备份版本 {source_version} 高于程序支持的版本 {SCHEMA_VERSION}"
+        )
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    safety_backup = create_backup(
+        target_path,
+        prefix="pre_restore_v1.14",
+        retain=False,
+    )
+    try:
+        _backup_over_database(source_path, target_path)
+        restored_version, restored_integrity = _database_version_and_integrity(target_path)
+        if restored_integrity != "ok":
+            raise sqlite3.DatabaseError(f"恢复后完整性检查失败: {restored_integrity}")
+        if restored_version != source_version:
+            raise sqlite3.DatabaseError(
+                f"恢复后版本不一致: 源 {source_version}，目标 {restored_version}"
+            )
+    except Exception as exc:
+        if safety_backup is not None:
+            try:
+                _backup_over_database(safety_backup.path, target_path)
+            except Exception as rollback_exc:
+                raise DatabaseRestoreError(
+                    f"恢复失败，且安全备份回滚失败: {exc}；{rollback_exc}",
+                    safety_backup,
+                ) from exc
+        raise DatabaseRestoreError(
+            f"恢复失败，已保留当前数据库: {exc}",
+            safety_backup,
+        ) from exc
+
+    return RestoreInfo(
+        restored_from=source_path,
+        restored_sha256=_sha256(source_path),
+        safety_backup=safety_backup,
+    )
 

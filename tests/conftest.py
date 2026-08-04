@@ -192,12 +192,16 @@ def memory_db(monkeypatch):
     # MainWindow binds init_db at import time and the new FinanceTab uses
     # read-model functions. Keep UI tests fully isolated from production data.
     try:
+        import main as legacy_main_module
         import src.main as main_module
         import src.ui.finance_tab as finance_module
+        monkeypatch.setattr(legacy_main_module, "init_db", lambda: (True, "测试数据库"))
         monkeypatch.setattr(main_module, "init_db", lambda: (True, "测试数据库"))
         monkeypatch.setattr(finance_module, "get_receivables", lambda *_: [])
         monkeypatch.setattr(finance_module, "get_payables", lambda *_: [])
         monkeypatch.setattr(finance_module, "get_payment_flow", lambda *_, **__: [])
+        monkeypatch.setattr(finance_module, "list_customers", lambda *_, **__: [])
+        monkeypatch.setattr(finance_module, "list_suppliers", lambda *_, **__: [])
     except ImportError:
         pass
 

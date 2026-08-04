@@ -1,5 +1,16 @@
 # 调货助手 - 版本更新日志
 
+## v1.14 (2026-08-04)
+
+- 移除 UI 中的数据库连接和直接 SQL，统一通过 Query/Service 访问数据
+- OrderService、InventoryService、PaymentService 的 SQL 全部下沉至 Repository
+- 新增 CustomerService、SupplierService，客户和上游写操作纳入事务与审计
+- 新增库存、收款分配、供应商余额、金额双写、外键和 SQLite 完整性自动对账
+- 历史库存差异作为只读指标展示，明确异常不再伪装为迁移失败
+- 新增“数据安全”菜单，可手动运行对账并从 SQLite 备份恢复
+- 恢复前自动生成 `pre_restore_v1.14` 安全备份，恢复源损坏或版本过高时拒绝覆盖
+- 新增 v1.14 架构约束与恢复测试，全量测试达到 201 项
+
 ## v1.13 (2026-08-01)
 
 - 新增 OrderService、InventoryService、PaymentService 和事务边界

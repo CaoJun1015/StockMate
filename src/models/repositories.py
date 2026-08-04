@@ -25,6 +25,273 @@ def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+def get_active_entity(
+    conn: sqlite3.Connection,
+    table: str,
+    record_id: int,
+) -> dict[str, Any] | None:
+    allowed = {"products", "batches", "customers", "suppliers", "quotes"}
+    if table not in allowed:
+        raise ValueError(f"不支持读取表: {table}")
+    return row_dict(
+        conn.execute(
+            f'SELECT * FROM "{table}" WHERE id=? AND deleted_at IS NULL',
+            (record_id,),
+        ).fetchone()
+    )
+
+
+def get_quote(conn: sqlite3.Connection, quote_id: int) -> dict[str, Any] | None:
+    return row_dict(conn.execute("SELECT * FROM quotes WHERE id=?", (quote_id,)).fetchone())
+
+
+def get_payment(conn: sqlite3.Connection, payment_id: int) -> dict[str, Any] | None:
+    return row_dict(
+        conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
+    )
+
+
+def insert_quote(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: int,
+    customer_id: int | None,
+    quote_price_cents: int,
+    quote_quantity: int,
+    quote_date: str,
+    remark: str,
+    tax_rate: float | None,
+    purchase_tax_inclusive: bool,
+    quote_tax_inclusive: bool,
+) -> int:
+    cursor = conn.execute(
+        "INSERT INTO quotes "
+        "(batch_id,customer_id,quote_price,quote_price_cents,quote_quantity,"
+        "quote_date,remark,paid,status,received_amount,received_amount_cents,"
+        "sn_list,tax_rate,purchase_tax_inclusive,quote_tax_inclusive) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            batch_id,
+            customer_id,
+            cents_to_yuan(quote_price_cents),
+            quote_price_cents,
+            quote_quantity,
+            quote_date,
+            remark,
+            "否",
+            "待确认",
+            0,
+            0,
+            "",
+            tax_rate,
+            int(purchase_tax_inclusive),
+            int(quote_tax_inclusive),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def set_quote_status(
+    conn: sqlite3.Connection,
+    quote_id: int,
+    status: str,
+    *,
+    sn_list: str | None = None,
+) -> None:
+    if sn_list is None:
+        conn.execute("UPDATE quotes SET status=? WHERE id=?", (status, quote_id))
+    else:
+        conn.execute(
+            "UPDATE quotes SET status=?, sn_list=? WHERE id=?",
+            (status, sn_list, quote_id),
+        )
+
+
+def insert_batch(
+    conn: sqlite3.Connection,
+    *,
+    product_id: int,
+    purchase_price_cents: int,
+    quantity: int,
+    date: str,
+    remark: str,
+    supplier_id: int | None,
+    sn_list: str,
+) -> int:
+    cursor = conn.execute(
+        "INSERT INTO batches "
+        "(product_id,purchase_price,purchase_price_cents,quantity,remaining,"
+        "date,remark,supplier_id,sn_list) VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            product_id,
+            cents_to_yuan(purchase_price_cents),
+            purchase_price_cents,
+            quantity,
+            quantity,
+            date,
+            remark,
+            supplier_id,
+            sn_list,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def decrement_batch_remaining(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    quantity: int,
+) -> bool:
+    cursor = conn.execute(
+        "UPDATE batches SET remaining=remaining-? "
+        "WHERE id=? AND deleted_at IS NULL AND remaining>=?",
+        (quantity, batch_id, quantity),
+    )
+    return cursor.rowcount == 1
+
+
+def increment_batch_remaining(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    quantity: int,
+) -> None:
+    conn.execute(
+        "UPDATE batches SET remaining=remaining+? WHERE id=?",
+        (quantity, batch_id),
+    )
+
+
+def list_fifo_receivable_quotes(
+    conn: sqlite3.Connection,
+    customer_id: int,
+) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            "SELECT id, quote_price_cents, quote_quantity, received_amount_cents "
+            "FROM quotes WHERE customer_id=? AND deleted_at IS NULL "
+            "AND status IN ('待确认','已报价','已出库') "
+            "AND quote_price_cents*quote_quantity>received_amount_cents "
+            "ORDER BY quote_date,id",
+            (customer_id,),
+        ).fetchall()
+    ]
+
+
+def add_quote_received_amount(
+    conn: sqlite3.Connection,
+    quote_id: int,
+    amount_cents: int,
+) -> None:
+    conn.execute(
+        "UPDATE quotes SET received_amount_cents=received_amount_cents+? WHERE id=?",
+        (amount_cents, quote_id),
+    )
+
+
+def payment_has_reversal(conn: sqlite3.Connection, payment_id: int) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM payments WHERE reversal_of_id=?",
+            (payment_id,),
+        ).fetchone()
+        is not None
+    )
+
+
+def list_payment_allocations(
+    conn: sqlite3.Connection,
+    payment_id: int,
+) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            "SELECT quote_id, amount_cents FROM payment_allocations WHERE payment_id=?",
+            (payment_id,),
+        ).fetchall()
+    ]
+
+
+def adjust_supplier_balance(
+    conn: sqlite3.Connection,
+    supplier_id: int,
+    delta_cents: int,
+) -> None:
+    conn.execute(
+        "UPDATE suppliers SET balance_cents=balance_cents+?, balance=balance+? "
+        "WHERE id=?",
+        (delta_cents, cents_to_yuan(delta_cents), supplier_id),
+    )
+
+
+def insert_customer(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    wechat: str = "",
+    qq: str = "",
+    phone: str = "",
+    note: str = "",
+    default_tax_rate: float | None = None,
+) -> int:
+    cursor = conn.execute(
+        "INSERT INTO customers(name,wechat,qq,phone,note,default_tax_rate) "
+        "VALUES (?,?,?,?,?,?)",
+        (name, wechat, qq, phone, note, default_tax_rate),
+    )
+    return int(cursor.lastrowid)
+
+
+def update_customer(
+    conn: sqlite3.Connection,
+    customer_id: int,
+    *,
+    name: str,
+    wechat: str = "",
+    qq: str = "",
+    phone: str = "",
+    note: str = "",
+    default_tax_rate: float | None = None,
+) -> None:
+    conn.execute(
+        "UPDATE customers SET name=?,wechat=?,qq=?,phone=?,note=?,default_tax_rate=? "
+        "WHERE id=?",
+        (name, wechat, qq, phone, note, default_tax_rate, customer_id),
+    )
+
+
+def insert_supplier(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    wechat: str = "",
+    qq: str = "",
+    phone: str = "",
+    note: str = "",
+) -> int:
+    cursor = conn.execute(
+        "INSERT INTO suppliers(name,wechat,qq,phone,note) VALUES (?,?,?,?,?)",
+        (name, wechat, qq, phone, note),
+    )
+    return int(cursor.lastrowid)
+
+
+def update_supplier(
+    conn: sqlite3.Connection,
+    supplier_id: int,
+    *,
+    name: str,
+    wechat: str = "",
+    qq: str = "",
+    phone: str = "",
+    note: str = "",
+) -> None:
+    conn.execute(
+        "UPDATE suppliers SET name=?,wechat=?,qq=?,phone=?,note=? WHERE id=?",
+        (name, wechat, qq, phone, note, supplier_id),
+    )
+
+
 def audit(
     conn: sqlite3.Connection,
     entity_type: str,

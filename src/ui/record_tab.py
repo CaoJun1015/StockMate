@@ -20,6 +20,7 @@ from src.models.database import (
     add_operation_log, get_all_products, ship_quote,
     search_products, add_product,
 )
+from src.models.queries import get_batch_detail
 from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
 from src.utils.excel_export import export_quotes_to_excel
@@ -328,11 +329,8 @@ class RecordTab(QWidget):
             QMessageBox.warning(self, "提示", f"当前状态为「{status}」，只有「待确认」或「已报价」状态的订单可以出库")
             return
 
-        from src.models.database import get_connection
-        conn = get_connection()
-        batch_row = conn.execute("SELECT product_id FROM batches WHERE id=?", (quote.get("batch_id"),)).fetchone()
-        product_id = batch_row[0] if batch_row else None
-        conn.close()
+        batch = get_batch_detail(quote.get("batch_id"))
+        product_id = batch["product_id"] if batch else None
 
         batches = get_batches(product_id) if product_id else []
         if not batches:

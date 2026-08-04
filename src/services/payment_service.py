@@ -7,8 +7,15 @@ from dataclasses import dataclass
 from src.models.connection import transaction
 from src.models.repositories import (
     add_allocation,
+    add_quote_received_amount,
+    adjust_supplier_balance,
     audit,
+    get_active_entity,
+    get_payment,
     insert_payment,
+    list_fifo_receivable_quotes,
+    list_payment_allocations,
+    payment_has_reversal,
     sync_quote_payment_state,
 )
 from src.services.exceptions import DataConflictError, NotFoundError, ValidationError
@@ -31,14 +38,7 @@ class PaymentService:
         customer_id: int,
         amount_cents: int,
     ) -> None:
-        quotes = conn.execute(
-            "SELECT id, quote_price_cents, quote_quantity, received_amount_cents "
-            "FROM quotes WHERE customer_id=? AND deleted_at IS NULL "
-            "AND status IN ('待确认','已报价','已出库') "
-            "AND quote_price_cents*quote_quantity>received_amount_cents "
-            "ORDER BY quote_date,id",
-            (customer_id,),
-        ).fetchall()
+        quotes = list_fifo_receivable_quotes(conn, customer_id)
         available = sum(
             row["quote_price_cents"] * row["quote_quantity"] - row["received_amount_cents"]
             for row in quotes
@@ -54,11 +54,7 @@ class PaymentService:
             applied = min(remaining, pending)
             if applied:
                 add_allocation(conn, payment_id, quote["id"], applied)
-                conn.execute(
-                    "UPDATE quotes SET received_amount_cents=received_amount_cents+? "
-                    "WHERE id=?",
-                    (applied, quote["id"]),
-                )
+                add_quote_received_amount(conn, quote["id"], applied)
                 sync_quote_payment_state(conn, quote["id"])
                 remaining -= applied
             if remaining == 0:
@@ -77,11 +73,7 @@ class PaymentService:
         if amount_cents <= 0:
             raise ValidationError("收款金额必须大于 0")
         with transaction(self.db_path) as conn:
-            customer = conn.execute(
-                "SELECT id FROM customers WHERE id=? AND deleted_at IS NULL",
-                (customer_id,),
-            ).fetchone()
-            if not customer:
+            if not get_active_entity(conn, "customers", customer_id):
                 raise NotFoundError("客户不存在或已删除")
             payment_id = insert_payment(
                 conn,
@@ -116,11 +108,7 @@ class PaymentService:
         if amount_cents <= 0:
             raise ValidationError("付款金额必须大于 0")
         with transaction(self.db_path) as conn:
-            supplier = conn.execute(
-                "SELECT id FROM suppliers WHERE id=? AND deleted_at IS NULL",
-                (supplier_id,),
-            ).fetchone()
-            if not supplier:
+            if not get_active_entity(conn, "suppliers", supplier_id):
                 raise NotFoundError("供应商不存在或已删除")
             payment_id = insert_payment(
                 conn,
@@ -132,11 +120,7 @@ class PaymentService:
                 remark=remark,
                 supersedes_id=supersedes_id,
             )
-            conn.execute(
-                "UPDATE suppliers SET balance_cents=balance_cents-?, "
-                "balance=balance-? WHERE id=?",
-                (amount_cents, amount_cents / 100, supplier_id),
-            )
+            adjust_supplier_balance(conn, supplier_id, -amount_cents)
             audit(
                 conn,
                 "payments",
@@ -147,14 +131,12 @@ class PaymentService:
             return payment_id
 
     def _void_in_transaction(self, conn, payment_id: int, reason: str) -> int:
-        payment = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
+        payment = get_payment(conn, payment_id)
         if not payment:
             raise NotFoundError("收付款记录不存在")
         if payment["entry_kind"] != "payment":
             raise DataConflictError("冲销记录不能再次冲销")
-        if conn.execute(
-            "SELECT 1 FROM payments WHERE reversal_of_id=?", (payment_id,)
-        ).fetchone():
+        if payment_has_reversal(conn, payment_id):
             raise DataConflictError("该记录已经冲销")
 
         reversal_id = insert_payment(
@@ -171,25 +153,22 @@ class PaymentService:
             reversal_of_id=payment_id,
         )
         if payment["type"] == "receivable":
-            allocations = conn.execute(
-                "SELECT quote_id, amount_cents FROM payment_allocations WHERE payment_id=?",
-                (payment_id,),
-            ).fetchall()
+            allocations = list_payment_allocations(conn, payment_id)
             for allocation in allocations:
                 add_allocation(
                     conn, reversal_id, allocation["quote_id"], -allocation["amount_cents"]
                 )
-                conn.execute(
-                    "UPDATE quotes SET received_amount_cents=received_amount_cents-? "
-                    "WHERE id=?",
-                    (allocation["amount_cents"], allocation["quote_id"]),
+                add_quote_received_amount(
+                    conn,
+                    allocation["quote_id"],
+                    -allocation["amount_cents"],
                 )
                 sync_quote_payment_state(conn, allocation["quote_id"])
         elif payment["supplier_id"]:
-            conn.execute(
-                "UPDATE suppliers SET balance_cents=balance_cents+?, "
-                "balance=balance+? WHERE id=?",
-                (payment["amount_cents"], payment["amount"], payment["supplier_id"]),
+            adjust_supplier_balance(
+                conn,
+                payment["supplier_id"],
+                payment["amount_cents"],
             )
         audit(
             conn,
@@ -221,9 +200,7 @@ class PaymentService:
         if amount_cents <= 0 or not reason.strip():
             raise ValidationError("更正金额必须大于 0，且必须填写原因")
         with transaction(self.db_path) as conn:
-            original = conn.execute(
-                "SELECT * FROM payments WHERE id=?", (payment_id,)
-            ).fetchone()
+            original = get_payment(conn, payment_id)
             if not original:
                 raise NotFoundError("收付款记录不存在")
             self._void_in_transaction(conn, payment_id, reason)
@@ -244,10 +221,10 @@ class PaymentService:
                     conn, replacement_id, original["customer_id"], amount_cents
                 )
             elif original["supplier_id"]:
-                conn.execute(
-                    "UPDATE suppliers SET balance_cents=balance_cents-?, "
-                    "balance=balance-? WHERE id=?",
-                    (amount_cents, amount_cents / 100, original["supplier_id"]),
+                adjust_supplier_balance(
+                    conn,
+                    original["supplier_id"],
+                    -amount_cents,
                 )
             audit(
                 conn,

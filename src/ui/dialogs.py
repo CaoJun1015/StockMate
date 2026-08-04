@@ -14,12 +14,17 @@ from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 
 from src.models.database import (
-    get_connection, ship_quote, add_quote, update_quote, add_payment,
-    get_payments, get_operation_logs, get_batches, get_batch_remaining,
+    ship_quote, add_quote, update_quote, add_payment,
+    get_payments, get_batches,
     get_customer_statement, get_all_customers, search_customers,
     add_customer, get_all_suppliers, get_supplier_payable,
     get_quote_by_id, get_all_products, search_products,
     add_supplier,
+)
+from src.models.queries import (
+    get_batch_remaining,
+    get_customer_default_tax_rate,
+    get_operation_logs,
 )
 from src.utils.shipment_flow import parse_sn_input, validate_sn_list, check_sn_duplicates
 
@@ -765,7 +770,6 @@ class QuoteEditDialog(QDialog):
             self.quote_tax_check.setChecked(quote.get("quote_tax_inclusive", 0) == 1)
         elif customer_id:
             # 新建报价时自动带入客户默认税率
-            from src.models.database import get_customer_default_tax_rate
             default_tax = get_customer_default_tax_rate(customer_id)
             if default_tax is not None:
                 idx = self.tax_combo.findData(default_tax)
@@ -865,7 +869,6 @@ class OperationLogDialog(QDialog):
         self.load_logs()
 
     def load_logs(self):
-        from src.models.database import get_operation_logs
         logs = get_operation_logs(limit=50)
         self.table.setRowCount(len(logs))
         for i, log in enumerate(logs):

@@ -33,7 +33,7 @@ from src.models.database import (
     get_supplier_payable, get_customer_statement, deduct_batch_remaining,
     delete_supplier_cascade,
     get_payment_by_id, get_all_payments_with_details, update_payment, delete_payment,
-    get_connection, ship_quote, add_operation_log,
+    ship_quote, add_operation_log,
 )
 from src.ui.style import APP_STYLE
 from src.ui.dialogs import (
@@ -49,6 +49,12 @@ from src.ui.supplier_tab import SupplierTab
 from src.ui.finance_tab import FinanceTab
 from src.ui.utils import _validate_date, _global_excepthook
 from src.models.migrations import DatabaseMigrationError
+from src.models.connection import (
+    DatabaseRestoreError,
+    get_backup_dir,
+    restore_database,
+)
+from src.services.reconciliation_service import ReconciliationService
 from src.version import APP_DISPLAY_NAME
 from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
@@ -204,6 +210,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_label = QLabel(f"就绪 | {self.backup_status}")
         self.status_bar.addWidget(self.status_label)
+        self._build_data_safety_menu()
 
         # 加载数据
         self.product_tab.refresh_product_list()
@@ -215,6 +222,81 @@ class MainWindow(QMainWindow):
         # 启用所有表格的列头排序
         for table in self.findChildren(QTableWidget):
             table.setSortingEnabled(True)
+
+    def _build_data_safety_menu(self):
+        data_menu = self.menuBar().addMenu("数据安全")
+
+        reconcile_action = QAction("运行自动对账", self)
+        reconcile_action.triggered.connect(self.on_reconcile_database)
+        data_menu.addAction(reconcile_action)
+
+        restore_action = QAction("从 SQLite 备份恢复…", self)
+        restore_action.triggered.connect(self.on_restore_database)
+        data_menu.addAction(restore_action)
+
+    def on_reconcile_database(self):
+        try:
+            report = ReconciliationService().run()
+        except Exception as exc:
+            QMessageBox.critical(self, "对账失败", f"无法完成自动对账：\n{exc}")
+            return
+        self.status_label.setText(
+            "自动对账通过" if report.is_clean else f"自动对账发现 {len(report.issues)} 个问题"
+        )
+        if report.is_clean:
+            QMessageBox.information(self, "自动对账", report.format_text())
+        else:
+            QMessageBox.warning(self, "自动对账", report.format_text())
+
+    def on_restore_database(self):
+        backup_dir = get_backup_dir()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 SQLite 数据库备份",
+            str(backup_dir),
+            "SQLite 数据库 (*.db);;所有文件 (*.*)",
+        )
+        if not file_path:
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认恢复数据库",
+            (
+                f"将从以下备份恢复：\n{file_path}\n\n"
+                "恢复前会自动备份当前数据库。恢复成功后程序将退出，"
+                "需要重新启动才能继续使用。\n\n确定继续？"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = restore_database(file_path)
+        except DatabaseRestoreError as exc:
+            safety_path = (
+                str(exc.safety_backup.path) if exc.safety_backup else "未生成"
+            )
+            QMessageBox.critical(
+                self,
+                "恢复失败",
+                f"{exc}\n\n恢复前安全备份：{safety_path}",
+            )
+            return
+
+        safety_path = (
+            str(result.safety_backup.path) if result.safety_backup else "原数据库不存在"
+        )
+        QMessageBox.information(
+            self,
+            "恢复成功",
+            (
+                f"数据库已从备份恢复。\n\n"
+                f"恢复源：{result.restored_from}\n"
+                f"恢复前安全备份：{safety_path}\n\n"
+                "程序现在将退出，请重新启动调货助手。"
+            ),
+        )
+        QApplication.instance().quit()
 
     def on_confirm_quote(self):
         self.record_tab.on_confirm_quote()
