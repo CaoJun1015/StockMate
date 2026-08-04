@@ -9,7 +9,10 @@ from src.models.repositories import (
     decrement_batch_remaining,
     get_active_entity,
     insert_batch,
+    list_active_batch_quotes,
+    log_operation,
     set_quote_status,
+    soft_delete,
 )
 from src.services.exceptions import (
     InsufficientStockError,
@@ -60,6 +63,13 @@ class InventoryService:
                     purchase_price_cents * quantity,
                 )
             audit(conn, "batches", batch_id, "receive", after={"quantity": quantity})
+            log_operation(
+                conn,
+                "入库",
+                "batches",
+                batch_id,
+                f"数量={quantity}, 单价分={purchase_price_cents}",
+            )
             return batch_id
 
     def ship_quote(self, quote_id: int, sn_list: str = "") -> None:
@@ -87,4 +97,31 @@ class InventoryService:
                 before=dict(quote),
                 after={"status": "已出库", "sn_list": sn_list},
             )
+            log_operation(conn, "出库", "quotes", quote_id, f"SN={sn_list}")
+
+    def delete_batch(self, batch_id: int, reason: str = "用户删除批次") -> None:
+        with transaction(self.db_path) as conn:
+            batch = get_active_entity(conn, "batches", batch_id)
+            if not batch:
+                raise NotFoundError("库存批次不存在或已删除")
+            quotes = list_active_batch_quotes(conn, batch_id)
+            blocking = [
+                quote
+                for quote in quotes
+                if quote["status"] not in ("待确认", "已取消")
+            ]
+            if blocking:
+                raise InvalidTransitionError(
+                    f"批次存在已报价、已出库或已收款记录，不能删除（报价 {blocking[0]['id']}）"
+                )
+            for quote in quotes:
+                soft_delete(conn, "quotes", quote["id"], "所属批次已删除")
+            if batch["supplier_id"]:
+                adjust_supplier_balance(
+                    conn,
+                    batch["supplier_id"],
+                    -(batch["purchase_price_cents"] * batch["quantity"]),
+                )
+            soft_delete(conn, "batches", batch_id, reason)
+            log_operation(conn, "删除批次", "batches", batch_id, reason)
 

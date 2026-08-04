@@ -3,13 +3,16 @@
 ## v1.14 (2026-08-04)
 
 - 移除 UI 中的数据库连接和直接 SQL，统一通过 Query/Service 访问数据
+- 主窗口及全部 UI 移除 `src.models.database` 兼容门面依赖
 - OrderService、InventoryService、PaymentService 的 SQL 全部下沉至 Repository
-- 新增 CustomerService、SupplierService，客户和上游写操作纳入事务与审计
+- 新增 ProductService、CustomerService、SupplierService，主数据写操作纳入事务与审计
+- 已报价、已出库或已收款记录会阻止所属批次/机型被删除，避免历史链路隐藏
 - 新增库存、收款分配、供应商余额、金额双写、外键和 SQLite 完整性自动对账
 - 历史库存差异作为只读指标展示，明确异常不再伪装为迁移失败
 - 新增“数据安全”菜单，可手动运行对账并从 SQLite 备份恢复
+- 支持立即创建带 SHA-256 的 SQLite 备份，并导出文本对账报告
 - 恢复前自动生成 `pre_restore_v1.14` 安全备份，恢复源损坏或版本过高时拒绝覆盖
-- 新增 v1.14 架构约束与恢复测试，全量测试达到 201 项
+- 新增 v1.14 架构约束、删除保护与恢复测试，全量测试达到 203 项
 
 ## v1.13 (2026-08-01)
 

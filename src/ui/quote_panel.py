@@ -10,16 +10,19 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
-from src.models.database import (
-    get_batches, add_batch, delete_batch,
-    add_quote, add_customer, search_customers, get_all_customers,
-    get_all_suppliers, add_operation_log,
-)
 from src.models.queries import (
     get_batch_detail,
     get_batch_remaining,
     get_customer_default_tax_rate,
+    list_batches,
+    list_customers,
+    list_suppliers,
 )
+from src.models.repositories import yuan_to_cents
+from src.services.exceptions import ServiceError
+from src.services.inventory_service import InventoryService
+from src.services.order_service import OrderService
+from src.services.party_service import CustomerService
 from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_single_quote_card, generate_quote_image, WATERMARK_TEXT
 
@@ -32,6 +35,9 @@ class QuotePanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_product_id = None
+        self.customer_service = CustomerService()
+        self.inventory_service = InventoryService()
+        self.order_service = OrderService()
         self.setup_ui()
 
     def setup_ui(self):
@@ -168,9 +174,9 @@ class QuotePanel(QWidget):
         if not self.current_product_id:
             return
         
-        batches = get_batches(self.current_product_id)
+        batches = list_batches(self.current_product_id)
         
-        suppliers = {s["id"]: s["name"] for s in get_all_suppliers()}
+        suppliers = {s["id"]: s["name"] for s in list_suppliers()}
         
         self.batch_table.setRowCount(len(batches))
         for i, b in enumerate(batches):
@@ -187,7 +193,7 @@ class QuotePanel(QWidget):
         self.batch_table.resizeColumnsToContents()
 
         self.customer_combo.clear()
-        customers = get_all_customers()
+        customers = list_customers()
         for c in customers:
             self.customer_combo.addItem(c["name"], c["id"])
 
@@ -210,17 +216,19 @@ class QuotePanel(QWidget):
         dlg = BatchDialog(self)
         if dlg.exec():
             data = dlg.get_data()
-            add_batch(
-                self.current_product_id,
-                data["price"],
-                data["quantity"],
-                data["quantity"],
-                data["date"],
-                data["remark"],
-                data["supplier_id"],
-                data["sn_list"],
-            )
-            add_operation_log("入库", "batches", 0, f"数量={data['quantity']}, 单价={data['price']}")
+            try:
+                self.inventory_service.receive_batch(
+                    product_id=self.current_product_id,
+                    purchase_price_cents=yuan_to_cents(data["price"]),
+                    quantity=data["quantity"],
+                    date=data["date"],
+                    remark=data["remark"],
+                    supplier_id=data["supplier_id"],
+                    sn_list=data["sn_list"],
+                )
+            except ServiceError as exc:
+                QMessageBox.warning(self, "入库失败", str(exc))
+                return
             self.refresh()
 
     def on_delete_batch(self):
@@ -235,12 +243,15 @@ class QuotePanel(QWidget):
         if batch_id is None:
             return
         reply = QMessageBox.question(
-            self, "确认删除", "确定删除此批次？此操作不可恢复。",
+            self, "确认删除", "确定删除此批次？关联的草稿报价也会从工作列表隐藏。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            delete_batch(batch_id)
-            add_operation_log("删除批次", "batches", batch_id, "删除批次")
+            try:
+                self.inventory_service.delete_batch(batch_id)
+            except ServiceError as exc:
+                QMessageBox.warning(self, "删除失败", str(exc))
+                return
             self.refresh()
 
     def on_quote_and_copy(self):
@@ -345,21 +356,30 @@ class QuotePanel(QWidget):
         customer_name = self.customer_combo.currentText().strip()
         customer_id = None
         if customer_name:
-            customers = search_customers(customer_name)
+            customers = list_customers(customer_name)
             matched = [c for c in customers if c["name"] == customer_name]
             if matched:
                 customer_id = matched[0]["id"]
             else:
-                customer_id = add_customer(customer_name)
+                customer_id = self.customer_service.create(name=customer_name)
 
         today = datetime.now().strftime("%Y-%m-%d")
-        paid = self.quote_paid_combo.currentText()
         tax_rate = _parse_tax_rate(self.tax_combo)
-        purchase_tax_inclusive = 1 if self.purchase_tax_check.isChecked() else 0
-        quote_tax_inclusive = 1 if self.quote_tax_check.isChecked() else 0
-        add_quote(batch_id, customer_id, quote_price, quote_quantity, today, remark, paid, tax_rate=tax_rate, purchase_tax_inclusive=purchase_tax_inclusive, quote_tax_inclusive=quote_tax_inclusive)
-        
-        return True, "报价已保存（待确认）"
+        try:
+            self.order_service.create_quote(
+                batch_id=batch_id,
+                customer_id=customer_id,
+                quote_price_cents=yuan_to_cents(quote_price),
+                quote_quantity=quote_quantity,
+                quote_date=today,
+                remark=remark,
+                tax_rate=tax_rate,
+                purchase_tax_inclusive=self.purchase_tax_check.isChecked(),
+                quote_tax_inclusive=self.quote_tax_check.isChecked(),
+            )
+            return True, "报价已保存（待确认）"
+        except ServiceError as exc:
+            return False, str(exc)
 
     def _format_quote_text(self, product, quote_price, customer_name, quote_quantity=1):
         parts = [product.get("series", "")]

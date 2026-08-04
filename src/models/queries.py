@@ -4,6 +4,62 @@ from __future__ import annotations
 
 from src.models.connection import connect
 from src.models.repositories import cents_to_yuan
+from src.utils.tax import calc_tax_adjusted_profit
+
+
+def list_products(keyword: str = "", db_path=None) -> list[dict]:
+    conn = connect(db_path, read_only=True)
+    try:
+        params: list[object] = []
+        where = "p.deleted_at IS NULL"
+        if keyword:
+            value = f"%{keyword}%"
+            where += (
+                " AND (p.series LIKE ? OR p.cpu LIKE ? OR p.ram LIKE ? "
+                "OR p.storage LIKE ? OR p.gpu LIKE ? OR p.screen LIKE ? OR p.note LIKE ?)"
+            )
+            params.extend([value] * 7)
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT p.id,p.series,p.cpu,p.ram,p.storage,p.gpu,p.screen,p.note,
+                       COALESCE((
+                           SELECT SUM(b.remaining) FROM batches b
+                           WHERE b.product_id=p.id AND b.deleted_at IS NULL
+                       ),0) AS total_remaining
+                FROM products p
+                WHERE """
+                + where
+                + " ORDER BY p.series,p.cpu",
+                params,
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def list_batches(product_id: int, db_path=None) -> list[dict]:
+    conn = connect(db_path, read_only=True)
+    try:
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT b.id,b.product_id,b.purchase_price,b.purchase_price_cents,
+                       b.quantity,b.remaining,b.date,b.remark,
+                       CASE WHEN s.deleted_at IS NULL THEN b.supplier_id END AS supplier_id,
+                       b.sn_list
+                FROM batches b
+                LEFT JOIN suppliers s ON b.supplier_id=s.id
+                WHERE b.product_id=? AND b.deleted_at IS NULL
+                ORDER BY b.date DESC,b.id DESC
+                """,
+                (product_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
 
 
 def list_customers(keyword: str = "", db_path=None) -> list[dict]:
@@ -188,6 +244,207 @@ def get_operation_logs(limit: int = 100, db_path=None) -> list[dict]:
         ]
     finally:
         conn.close()
+
+
+def get_quote_detail(quote_id: int, db_path=None) -> dict | None:
+    conn = connect(db_path, read_only=True)
+    try:
+        row = conn.execute(
+            """
+            SELECT q.id,q.batch_id,q.customer_id,q.quote_price,q.quote_price_cents,
+                   q.quote_quantity,q.quote_date,q.remark,q.paid,q.status,
+                   q.received_amount,q.received_amount_cents,q.sn_list,
+                   q.tax_rate,q.purchase_tax_inclusive,q.quote_tax_inclusive,
+                   p.series,p.cpu,p.ram,p.storage,p.gpu,
+                   b.purchase_price,b.purchase_price_cents,b.sn_list AS batch_sn_list,
+                   c.name AS customer_name
+            FROM quotes q
+            JOIN batches b ON q.batch_id=b.id
+            JOIN products p ON b.product_id=p.id
+            LEFT JOIN customers c ON q.customer_id=c.id
+            WHERE q.id=? AND q.deleted_at IS NULL
+              AND b.deleted_at IS NULL AND p.deleted_at IS NULL
+              AND (c.id IS NULL OR c.deleted_at IS NULL)
+            """,
+            (quote_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def search_quotes(
+    keyword: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    customer_id: int | None = None,
+    db_path=None,
+) -> list[dict]:
+    conditions = [
+        "q.deleted_at IS NULL",
+        "b.deleted_at IS NULL",
+        "p.deleted_at IS NULL",
+        "(c.id IS NULL OR c.deleted_at IS NULL)",
+    ]
+    params: list[object] = []
+    if keyword:
+        value = f"%{keyword}%"
+        conditions.append(
+            "(p.series LIKE ? OR p.cpu LIKE ? OR p.ram LIKE ? OR p.storage LIKE ? "
+            "OR p.gpu LIKE ? OR c.name LIKE ? OR b.remark LIKE ? OR q.remark LIKE ? "
+            "OR b.sn_list LIKE ? OR s.name LIKE ?)"
+        )
+        params.extend([value] * 10)
+    if date_from:
+        conditions.append("q.quote_date>=?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("q.quote_date<=?")
+        params.append(date_to)
+    if customer_id is not None:
+        conditions.append("q.customer_id=?")
+        params.append(customer_id)
+    conn = connect(db_path, read_only=True)
+    try:
+        return [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT q.id,q.quote_price,q.quote_price_cents,q.quote_quantity,
+                       q.quote_date,q.remark,q.paid,q.status,q.received_amount,
+                       q.received_amount_cents,q.sn_list,q.tax_rate,
+                       q.purchase_tax_inclusive,q.quote_tax_inclusive,
+                       p.series,p.cpu,p.ram,p.storage,p.gpu,p.screen,p.note,
+                       b.purchase_price,b.purchase_price_cents,b.remark AS batch_remark,
+                       b.id AS batch_id,b.sn_list AS batch_sn_list,
+                       c.name AS customer_name,c.id AS customer_id,
+                       s.name AS supplier_name
+                FROM quotes q
+                JOIN batches b ON q.batch_id=b.id
+                JOIN products p ON b.product_id=p.id
+                LEFT JOIN customers c ON q.customer_id=c.id
+                LEFT JOIN suppliers s ON b.supplier_id=s.id
+                WHERE {" AND ".join(conditions)}
+                ORDER BY q.quote_date DESC,q.id DESC
+                """,
+                params,
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def export_quotes(
+    date_from: str = "",
+    date_to: str = "",
+    customer_id: int | None = None,
+    db_path=None,
+) -> list[dict]:
+    return search_quotes(
+        date_from=date_from,
+        date_to=date_to,
+        customer_id=customer_id,
+        db_path=db_path,
+    )
+
+
+def get_customer_statement(
+    customer_id: int,
+    date_from: str = "",
+    date_to: str = "",
+    db_path=None,
+) -> list[dict]:
+    conditions = ["q.customer_id=?", "q.deleted_at IS NULL"]
+    params: list[object] = [customer_id]
+    if date_from:
+        conditions.append("q.quote_date>=?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("q.quote_date<=?")
+        params.append(date_to)
+    conn = connect(db_path, read_only=True)
+    try:
+        return [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT q.id,q.quote_date,q.quote_price,q.quote_quantity,q.status,
+                       q.paid,q.received_amount,p.series,p.cpu,p.ram,p.storage,p.gpu,
+                       b.purchase_price,b.remark AS batch_remark,q.remark,
+                       s.name AS supplier_name
+                FROM quotes q
+                JOIN batches b ON q.batch_id=b.id
+                JOIN products p ON b.product_id=p.id
+                LEFT JOIN suppliers s ON b.supplier_id=s.id
+                WHERE {" AND ".join(conditions)}
+                ORDER BY q.quote_date,q.id
+                """,
+                params,
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def get_customer_history(customer_id: int, db_path=None) -> list[dict]:
+    conn = connect(db_path, read_only=True)
+    try:
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT q.id,q.quote_price,q.quote_quantity,q.quote_date,q.remark,q.paid,
+                       p.series,p.cpu,p.ram,p.storage,p.gpu,p.screen,p.note,
+                       b.purchase_price,q.tax_rate,q.purchase_tax_inclusive,
+                       q.quote_tax_inclusive
+                FROM quotes q
+                JOIN batches b ON q.batch_id=b.id
+                JOIN products p ON b.product_id=p.id
+                WHERE q.customer_id=? AND q.deleted_at IS NULL
+                ORDER BY q.quote_date DESC,q.id DESC
+                """,
+                (customer_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def get_customer_stats(customer_id: int, db_path=None) -> dict:
+    conn = connect(db_path, read_only=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT q.quote_price,q.quote_quantity,b.purchase_price,q.tax_rate,
+                   q.purchase_tax_inclusive,q.quote_tax_inclusive
+            FROM quotes q
+            JOIN batches b ON q.batch_id=b.id
+            WHERE q.customer_id=? AND q.deleted_at IS NULL AND q.status!='已取消'
+            """,
+            (customer_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    total_amount = 0.0
+    total_profit = 0.0
+    for row in rows:
+        quantity = row["quote_quantity"] or 1
+        quote_price = row["quote_price"] or 0
+        purchase_price = row["purchase_price"] or 0
+        total_amount += quote_price * quantity
+        total_profit += calc_tax_adjusted_profit(
+            purchase_price,
+            quote_price,
+            quantity,
+            row["tax_rate"],
+            bool(row["purchase_tax_inclusive"]),
+            bool(row["quote_tax_inclusive"]),
+        )
+    return {
+        "total_quotes": len(rows),
+        "total_amount": total_amount,
+        "total_profit": total_profit,
+    }
 
 
 def get_receivables(db_path=None) -> list[dict]:

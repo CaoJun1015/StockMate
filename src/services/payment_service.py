@@ -15,6 +15,7 @@ from src.models.repositories import (
     insert_payment,
     list_fifo_receivable_quotes,
     list_payment_allocations,
+    log_operation,
     payment_has_reversal,
     sync_quote_payment_state,
 )
@@ -93,6 +94,13 @@ class PaymentService:
                 "receive",
                 after={"amount_cents": amount_cents, "customer_id": customer_id},
             )
+            log_operation(
+                conn,
+                "收款",
+                "payments",
+                payment_id,
+                f"金额分={amount_cents}",
+            )
             return PaymentReceipt(payment_id, amount_cents)
 
     def record_supplier_payment(
@@ -127,6 +135,13 @@ class PaymentService:
                 payment_id,
                 "pay",
                 after={"amount_cents": amount_cents, "supplier_id": supplier_id},
+            )
+            log_operation(
+                conn,
+                "付款",
+                "payments",
+                payment_id,
+                f"金额分={amount_cents}",
             )
             return payment_id
 
@@ -179,6 +194,7 @@ class PaymentService:
             after={"reversal_id": reversal_id},
             reason=reason,
         )
+        log_operation(conn, "作废流水", "payments", payment_id, reason)
         return reversal_id
 
     def void_payment(self, payment_id: int, reason: str) -> int:
@@ -233,6 +249,13 @@ class PaymentService:
                 "correct",
                 after={"supersedes_id": payment_id, "amount_cents": amount_cents},
                 reason=reason,
+            )
+            log_operation(
+                conn,
+                "更正流水",
+                "payments",
+                replacement_id,
+                f"原流水={payment_id}; {reason}",
             )
             return replacement_id
 

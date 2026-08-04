@@ -5,14 +5,17 @@ from PyQt6.QtWidgets import (
     QLineEdit, QGroupBox, QMessageBox, QAbstractItemView,
 )
 
-from src.models.database import (
-    add_operation_log, calc_tax_adjusted_profit,
-    get_all_customers, get_customer_quotes, get_customer_stats, search_customers,
+from src.models.queries import (
+    get_customer,
+    get_customer_history,
+    get_customer_reference_counts,
+    get_customer_stats,
+    list_customers,
 )
-from src.models.queries import get_customer, get_customer_reference_counts
 from src.services.exceptions import ServiceError
 from src.services.party_service import CustomerService
 from src.ui.dialogs import CustomerDialog
+from src.utils.tax import calc_tax_adjusted_profit
 
 
 class CustomerTab(QWidget):
@@ -82,7 +85,7 @@ class CustomerTab(QWidget):
     
     def refresh_customer_list(self):
         keyword = self.customer_search.text().strip()
-        customers = search_customers(keyword) if keyword else get_all_customers()
+        customers = list_customers(keyword)
         self.customer_table.setRowCount(len(customers))
         for i, c in enumerate(customers):
             self.customer_table.setItem(i, 0, QTableWidgetItem(str(c["id"])))
@@ -105,7 +108,6 @@ class CustomerTab(QWidget):
             except ServiceError as exc:
                 QMessageBox.warning(self, "新增失败", str(exc))
                 return
-            add_operation_log("新增客户", "customers", customer_id, f"名称={data['name']}")
             self.refresh_customer_list()
 
     def on_customer_cell_clicked(self, row, col):
@@ -117,7 +119,7 @@ class CustomerTab(QWidget):
         cid = int(self.customer_table.item(row, 0).text())
         customer_name = self.customer_table.item(row, 1).text()
         
-        quotes = get_customer_quotes(cid)
+        quotes = get_customer_history(cid)
         stats = get_customer_stats(cid)
         
         self.customer_stats_label.setText(
@@ -173,7 +175,6 @@ class CustomerTab(QWidget):
             except ServiceError as exc:
                 QMessageBox.warning(self, "编辑失败", str(exc))
                 return
-            add_operation_log("编辑客户", "customers", cid, f"名称={data['name']}")
             self.refresh_customer_list()
 
     def on_delete_customer(self):
@@ -204,6 +205,5 @@ class CustomerTab(QWidget):
             except ServiceError as exc:
                 QMessageBox.warning(self, "删除失败", str(exc))
                 return
-            add_operation_log("删除客户", "customers", cid, f"名称={name}")
             self.refresh_customer_list()
             self.main.record_tab.refresh_records()

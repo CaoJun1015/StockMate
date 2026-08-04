@@ -8,6 +8,7 @@ from src.models.repositories import (
     get_active_entity,
     insert_customer,
     insert_supplier,
+    log_operation,
     soft_delete,
     update_customer,
     update_supplier,
@@ -54,6 +55,7 @@ class CustomerService:
                 "create",
                 after={"name": name},
             )
+            log_operation(conn, "新增客户", "customers", customer_id, f"名称={name}")
             return customer_id
 
     def update(
@@ -97,12 +99,22 @@ class CustomerService:
                     "default_tax_rate": default_tax_rate,
                 },
             )
+            log_operation(conn, "编辑客户", "customers", customer_id, f"名称={name}")
 
     def delete(self, customer_id: int, reason: str = "用户删除客户") -> bool:
         with transaction(self.db_path) as conn:
-            if not get_active_entity(conn, "customers", customer_id):
+            customer = get_active_entity(conn, "customers", customer_id)
+            if not customer:
                 raise NotFoundError("客户不存在或已删除")
-            return soft_delete(conn, "customers", customer_id, reason)
+            deleted = soft_delete(conn, "customers", customer_id, reason)
+            log_operation(
+                conn,
+                "删除客户",
+                "customers",
+                customer_id,
+                f"名称={customer['name']}",
+            )
+            return deleted
 
 
 class SupplierService:
@@ -136,6 +148,7 @@ class SupplierService:
                 "create",
                 after={"name": name},
             )
+            log_operation(conn, "新增供应商", "suppliers", supplier_id, f"名称={name}")
             return supplier_id
 
     def update(
@@ -177,9 +190,19 @@ class SupplierService:
                     "note": note,
                 },
             )
+            log_operation(conn, "编辑供应商", "suppliers", supplier_id, f"名称={name}")
 
     def delete(self, supplier_id: int, reason: str = "用户删除供应商") -> bool:
         with transaction(self.db_path) as conn:
-            if not get_active_entity(conn, "suppliers", supplier_id):
+            supplier = get_active_entity(conn, "suppliers", supplier_id)
+            if not supplier:
                 raise NotFoundError("上游不存在或已删除")
-            return soft_delete(conn, "suppliers", supplier_id, reason)
+            deleted = soft_delete(conn, "suppliers", supplier_id, reason)
+            log_operation(
+                conn,
+                "删除供应商",
+                "suppliers",
+                supplier_id,
+                f"名称={supplier['name']}",
+            )
+            return deleted

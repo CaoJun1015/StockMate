@@ -13,19 +13,15 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 
-from src.models.database import (
-    ship_quote, add_quote, update_quote, add_payment,
-    get_payments, get_batches,
-    get_customer_statement, get_all_customers, search_customers,
-    add_customer, get_all_suppliers, get_supplier_payable,
-    get_quote_by_id, get_all_products, search_products,
-    add_supplier,
-)
 from src.models.queries import (
     get_batch_remaining,
+    get_customer_statement,
     get_customer_default_tax_rate,
     get_operation_logs,
+    list_customers,
+    list_suppliers,
 )
+from src.services.party_service import CustomerService, SupplierService
 from src.utils.shipment_flow import parse_sn_input, validate_sn_list, check_sn_duplicates
 
 
@@ -299,7 +295,7 @@ class StatementDialog(QDialog):
         self.customer_combo = QComboBox()
         self.customer_combo.setEditable(True)
         self.customer_combo.setPlaceholderText("选择或输入客户...")
-        customers = get_all_customers()
+        customers = list_customers()
         for c in customers:
             self.customer_combo.addItem(c["name"], c["id"])
         top_row.addWidget(self.customer_combo)
@@ -347,7 +343,7 @@ class StatementDialog(QDialog):
         customer_name = self.customer_combo.currentText().strip()
         customer_id = self.customer_combo.currentData()
         if not customer_id and customer_name:
-            matched = search_customers(customer_name)
+            matched = list_customers(customer_name)
             if matched:
                 customer_id = matched[0]["id"]
             else:
@@ -600,7 +596,7 @@ class BatchDialog(QDialog):
         layout.addRow(buttons)
 
     def _load_suppliers(self):
-        suppliers = get_all_suppliers()
+        suppliers = list_suppliers()
         for s in suppliers:
             self.supplier_combo.addItem(s["name"], s["id"])
 
@@ -616,7 +612,7 @@ class BatchDialog(QDialog):
         supplier_name = self.supplier_combo.currentText().strip()
         supplier_id = self.supplier_combo.currentData()
         if not supplier_id and supplier_name:
-            supplier_id = add_supplier(supplier_name)
+            supplier_id = SupplierService().create(name=supplier_name)
         return {
             "price": self.price_spin.value(),
             "quantity": self.quantity_spin.value(),
@@ -800,7 +796,7 @@ class QuoteEditDialog(QDialog):
         layout.addRow(buttons)
 
     def _load_customers(self):
-        customers = get_all_customers()
+        customers = list_customers()
         for c in customers:
             self.customer_combo.addItem(c["name"], c["id"])
 
@@ -816,7 +812,7 @@ class QuoteEditDialog(QDialog):
         customer_name = self.customer_combo.currentText().strip()
         customer_id = self.customer_combo.currentData()
         if not customer_id and customer_name:
-            customer_id = add_customer(customer_name)
+            customer_id = CustomerService().create(name=customer_name)
         return {
             "quote_price": self.price_spin.value(),
             "quote_quantity": self.quantity_spin.value(),

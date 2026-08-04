@@ -51,6 +51,70 @@ def get_payment(conn: sqlite3.Connection, payment_id: int) -> dict[str, Any] | N
     )
 
 
+def insert_product(
+    conn: sqlite3.Connection,
+    *,
+    series: str,
+    cpu: str = "",
+    ram: str = "",
+    storage: str = "",
+    gpu: str = "",
+    screen: str = "",
+    note: str = "",
+) -> int:
+    cursor = conn.execute(
+        "INSERT INTO products(series,cpu,ram,storage,gpu,screen,note) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (series, cpu, ram, storage, gpu, screen, note),
+    )
+    return int(cursor.lastrowid)
+
+
+def update_product(
+    conn: sqlite3.Connection,
+    product_id: int,
+    *,
+    series: str,
+    cpu: str = "",
+    ram: str = "",
+    storage: str = "",
+    gpu: str = "",
+    screen: str = "",
+    note: str = "",
+) -> None:
+    conn.execute(
+        "UPDATE products SET series=?,cpu=?,ram=?,storage=?,gpu=?,screen=?,note=? "
+        "WHERE id=?",
+        (series, cpu, ram, storage, gpu, screen, note, product_id),
+    )
+
+
+def list_active_product_batches(
+    conn: sqlite3.Connection,
+    product_id: int,
+) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            "SELECT * FROM batches WHERE product_id=? AND deleted_at IS NULL",
+            (product_id,),
+        ).fetchall()
+    ]
+
+
+def list_active_batch_quotes(
+    conn: sqlite3.Connection,
+    batch_id: int,
+) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            "SELECT * FROM quotes WHERE batch_id=? AND deleted_at IS NULL",
+            (batch_id,),
+        ).fetchall()
+    ]
+
+
 def insert_quote(
     conn: sqlite3.Connection,
     *,
@@ -105,6 +169,44 @@ def set_quote_status(
             "UPDATE quotes SET status=?, sn_list=? WHERE id=?",
             (status, sn_list, quote_id),
         )
+
+
+def update_quote(
+    conn: sqlite3.Connection,
+    quote_id: int,
+    *,
+    batch_id: int,
+    customer_id: int | None,
+    quote_price_cents: int,
+    quote_quantity: int,
+    quote_date: str,
+    remark: str,
+    paid: str,
+    sn_list: str,
+    tax_rate: float | None,
+    purchase_tax_inclusive: bool,
+    quote_tax_inclusive: bool,
+) -> None:
+    conn.execute(
+        "UPDATE quotes SET batch_id=?,customer_id=?,quote_price=?,quote_price_cents=?,"
+        "quote_quantity=?,quote_date=?,remark=?,paid=?,sn_list=?,tax_rate=?,"
+        "purchase_tax_inclusive=?,quote_tax_inclusive=? WHERE id=?",
+        (
+            batch_id,
+            customer_id,
+            cents_to_yuan(quote_price_cents),
+            quote_price_cents,
+            quote_quantity,
+            quote_date,
+            remark,
+            paid,
+            sn_list,
+            tax_rate,
+            int(purchase_tax_inclusive),
+            int(quote_tax_inclusive),
+            quote_id,
+        ),
+    )
 
 
 def insert_batch(
@@ -289,6 +391,20 @@ def update_supplier(
     conn.execute(
         "UPDATE suppliers SET name=?,wechat=?,qq=?,phone=?,note=? WHERE id=?",
         (name, wechat, qq, phone, note, supplier_id),
+    )
+
+
+def log_operation(
+    conn: sqlite3.Connection,
+    operation: str,
+    table_name: str,
+    record_id: int | None,
+    description: str = "",
+) -> None:
+    conn.execute(
+        "INSERT INTO operation_logs(operation,table_name,record_id,description) "
+        "VALUES (?,?,?,?)",
+        (operation, table_name, record_id, description),
     )
 
 

@@ -7,6 +7,7 @@ import os
 import re
 import traceback
 from datetime import datetime, timedelta
+from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
@@ -22,19 +23,7 @@ from PyQt6.QtGui import QAction, QClipboard, QColor
 # 确保能找到 src 包
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from src.models.database import (
-    init_db, add_product, update_product, delete_product,
-    search_products, get_all_products,
-    add_batch, get_batches, update_batch_remaining, delete_batch, get_total_remaining,
-    get_all_customers,
-    add_supplier, search_suppliers, get_all_suppliers,
-    add_quote, update_quote, delete_quote, search_quotes, export_quotes, get_quote_by_id,
-    update_quote_status, add_payment, _add_payment_raw, get_payments, get_customer_balance,
-    get_supplier_payable, get_customer_statement, deduct_batch_remaining,
-    delete_supplier_cascade,
-    get_payment_by_id, get_all_payments_with_details, update_payment, delete_payment,
-    ship_quote, add_operation_log,
-)
+from src.services.database_service import initialize_database
 from src.ui.style import APP_STYLE
 from src.ui.dialogs import (
     ShipmentDialog, PaymentDialog, PaymentEditDialog, StatementDialog,
@@ -51,7 +40,9 @@ from src.ui.utils import _validate_date, _global_excepthook
 from src.models.migrations import DatabaseMigrationError
 from src.models.connection import (
     DatabaseRestoreError,
+    create_backup,
     get_backup_dir,
+    get_database_path,
     restore_database,
 )
 from src.services.reconciliation_service import ReconciliationService
@@ -77,7 +68,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 700)
 
         # 初始化数据库（含自动备份 + 完整性检查）
-        init_ok, init_msg = init_db()
+        init_ok, init_msg = initialize_database()
         self.backup_status = init_msg
 
         # 中心控件
@@ -230,6 +221,15 @@ class MainWindow(QMainWindow):
         reconcile_action.triggered.connect(self.on_reconcile_database)
         data_menu.addAction(reconcile_action)
 
+        export_reconcile_action = QAction("导出对账报告…", self)
+        export_reconcile_action.triggered.connect(self.on_export_reconciliation_report)
+        data_menu.addAction(export_reconcile_action)
+
+        data_menu.addSeparator()
+        backup_action = QAction("立即创建 SQLite 备份", self)
+        backup_action.triggered.connect(self.on_create_database_backup)
+        data_menu.addAction(backup_action)
+
         restore_action = QAction("从 SQLite 备份恢复…", self)
         restore_action.triggered.connect(self.on_restore_database)
         data_menu.addAction(restore_action)
@@ -247,6 +247,48 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "自动对账", report.format_text())
         else:
             QMessageBox.warning(self, "自动对账", report.format_text())
+
+    def on_export_reconciliation_report(self):
+        try:
+            report = ReconciliationService().run()
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"无法生成自动对账报告：\n{exc}")
+            return
+        default_path = get_backup_dir() / (
+            f"reconciliation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出自动对账报告",
+            str(default_path),
+            "文本文件 (*.txt);;所有文件 (*.*)",
+        )
+        if not file_path:
+            return
+        try:
+            output_path = Path(file_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(report.format_text(), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(self, "导出成功", f"对账报告已保存：\n{output_path}")
+
+    def on_create_database_backup(self):
+        try:
+            backup = create_backup(get_database_path())
+        except Exception as exc:
+            QMessageBox.critical(self, "备份失败", str(exc))
+            return
+        if backup is None:
+            QMessageBox.warning(self, "备份失败", "当前数据库文件不存在")
+            return
+        self.status_label.setText(f"备份成功：{backup.path.name}")
+        QMessageBox.information(
+            self,
+            "备份成功",
+            f"文件：{backup.path}\nSHA-256：{backup.sha256}",
+        )
 
     def on_restore_database(self):
         backup_dir = get_backup_dir()

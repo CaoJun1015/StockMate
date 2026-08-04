@@ -194,9 +194,55 @@ def memory_db(monkeypatch):
     try:
         import main as legacy_main_module
         import src.main as main_module
+        import src.ui.customer_tab as customer_module
         import src.ui.finance_tab as finance_module
-        monkeypatch.setattr(legacy_main_module, "init_db", lambda: (True, "测试数据库"))
-        monkeypatch.setattr(main_module, "init_db", lambda: (True, "测试数据库"))
+        import src.ui.product_tab as product_module
+        import src.ui.record_tab as record_module
+        import src.ui.supplier_tab as supplier_module
+        monkeypatch.setattr(
+            legacy_main_module,
+            "initialize_database",
+            lambda: (True, "测试数据库"),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "initialize_database",
+            lambda: (True, "测试数据库"),
+        )
+        monkeypatch.setattr(
+            product_module,
+            "list_products",
+            lambda keyword="": [
+                {
+                    **product,
+                    "total_remaining": db_module.get_total_remaining(product["id"]),
+                }
+                for product in (
+                    db_module.search_products(keyword)
+                    if keyword
+                    else db_module.get_all_products()
+                )
+            ],
+        )
+        monkeypatch.setattr(
+            customer_module,
+            "list_customers",
+            lambda keyword="": (
+                db_module.search_customers(keyword)
+                if keyword
+                else db_module.get_all_customers()
+            ),
+        )
+        monkeypatch.setattr(
+            supplier_module,
+            "list_suppliers",
+            lambda keyword="": (
+                db_module.search_suppliers(keyword)
+                if keyword
+                else db_module.get_all_suppliers()
+            ),
+        )
+        monkeypatch.setattr(record_module, "search_quotes", db_module.search_quotes)
         monkeypatch.setattr(finance_module, "get_receivables", lambda *_: [])
         monkeypatch.setattr(finance_module, "get_payables", lambda *_: [])
         monkeypatch.setattr(finance_module, "get_payment_flow", lambda *_, **__: [])

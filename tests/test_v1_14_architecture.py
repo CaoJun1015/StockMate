@@ -15,10 +15,12 @@ from src.models.connection import (
 )
 from src.models.migrations import migrate_database
 from src.models.queries import get_customer, get_supplier
+from src.services.exceptions import InvalidTransitionError
 from src.services.inventory_service import InventoryService
 from src.services.order_service import OrderService
 from src.services.party_service import CustomerService, SupplierService
 from src.services.payment_service import PaymentService
+from src.services.product_service import ProductService
 from src.services.reconciliation_service import ReconciliationService
 
 
@@ -41,6 +43,8 @@ def test_ui_has_no_direct_sql_or_connection_access():
     violations = []
     for path in ui_files:
         source = path.read_text(encoding="utf-8-sig")
+        if "src.models.database" in source:
+            violations.append(f"{path.name}: compatibility facade import")
         if "get_connection" in source:
             violations.append(f"{path.name}: get_connection")
         for line in _attribute_calls(path, "execute"):
@@ -228,3 +232,78 @@ def test_future_version_backup_is_rejected_before_safety_backup(tmp_path):
         restore_database(backup_path, db_path)
 
     assert not (tmp_path / "backup").exists()
+
+
+def test_shipped_history_blocks_product_and_batch_deletion(tmp_path):
+    db_path = tmp_path / "delete-guard.db"
+    batch_id = _seed_reconciled_flow(db_path)
+    conn = connect(db_path, read_only=True)
+    try:
+        product_id = conn.execute(
+            "SELECT product_id FROM batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    with pytest.raises(InvalidTransitionError, match="不能删除"):
+        InventoryService(db_path).delete_batch(batch_id)
+    with pytest.raises(InvalidTransitionError, match="不能删除"):
+        ProductService(db_path).delete(product_id)
+
+    conn = connect(db_path, read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT deleted_at FROM batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()[0] is None
+        assert conn.execute(
+            "SELECT deleted_at FROM products WHERE id=?",
+            (product_id,),
+        ).fetchone()[0] is None
+    finally:
+        conn.close()
+
+
+def test_draft_batch_delete_is_atomic_and_updates_payable(tmp_path):
+    db_path = tmp_path / "draft-delete.db"
+    migrate_database(db_path)
+    product_id = ProductService(db_path).create(series="可删除机型")
+    supplier_id = SupplierService(db_path).create(name="可删除上游")
+    customer_id = CustomerService(db_path).create(name="草稿客户")
+    batch_id = InventoryService(db_path).receive_batch(
+        product_id=product_id,
+        purchase_price_cents=300_000,
+        quantity=2,
+        date="2026-08-04",
+        supplier_id=supplier_id,
+    )
+    quote_id = OrderService(db_path).create_quote(
+        batch_id=batch_id,
+        customer_id=customer_id,
+        quote_price_cents=350_000,
+        quote_quantity=1,
+        quote_date="2026-08-04",
+    )
+
+    InventoryService(db_path).delete_batch(batch_id)
+
+    conn = connect(db_path, read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT deleted_at FROM batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()[0] is not None
+        assert conn.execute(
+            "SELECT deleted_at FROM quotes WHERE id=?",
+            (quote_id,),
+        ).fetchone()[0] is not None
+        assert conn.execute(
+            "SELECT balance_cents FROM suppliers WHERE id=?",
+            (supplier_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM operation_logs WHERE operation='删除批次'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()

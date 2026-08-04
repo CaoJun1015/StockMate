@@ -5,13 +5,11 @@ from PyQt6.QtWidgets import (
     QLineEdit, QGroupBox, QMessageBox, QAbstractItemView,
 )
 
-from src.models.database import (
-    add_operation_log, get_all_suppliers, search_suppliers,
-)
 from src.models.queries import (
     get_supplier,
     get_supplier_purchase_history,
     get_supplier_reference_counts,
+    list_suppliers,
 )
 from src.services.exceptions import ServiceError
 from src.services.party_service import SupplierService
@@ -114,7 +112,7 @@ class SupplierTab(QWidget):
 
     def refresh_supplier_list(self):
         keyword = self.supplier_search.text().strip()
-        suppliers = search_suppliers(keyword) if keyword else get_all_suppliers()
+        suppliers = list_suppliers(keyword)
         self.supplier_table.setRowCount(len(suppliers))
         for i, s in enumerate(suppliers):
             self.supplier_table.setItem(i, 0, QTableWidgetItem(str(s["id"])))
@@ -138,7 +136,6 @@ class SupplierTab(QWidget):
             except ServiceError as exc:
                 QMessageBox.warning(self, "新增失败", str(exc))
                 return
-            add_operation_log("新增供应商", "suppliers", supplier_id, f"名称={data['name']}")
             self.refresh_supplier_list()
 
     def on_edit_supplier_from_table(self):
@@ -169,7 +166,6 @@ class SupplierTab(QWidget):
             except ServiceError as exc:
                 QMessageBox.warning(self, "编辑失败", str(exc))
                 return
-            add_operation_log("编辑供应商", "suppliers", sid, f"名称={data['name']}")
             self.refresh_supplier_list()
 
     def on_delete_supplier(self):
@@ -200,6 +196,5 @@ class SupplierTab(QWidget):
             except ServiceError as exc:
                 QMessageBox.warning(self, "删除失败", str(exc))
                 return
-            add_operation_log("删除供应商", "suppliers", sid, f"名称={name}")
             self.refresh_supplier_list()
             self.main.record_tab.refresh_records()

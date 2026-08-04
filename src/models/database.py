@@ -4,8 +4,6 @@ New code should use ``src.services`` and the repository/query modules.  The
 functions in this module remain available for one compatibility release.
 """
 
-from pathlib import Path
-
 from src.models.connection import (
     BACKUP_DIR,
     DB_PATH,
@@ -15,7 +13,6 @@ from src.models.connection import (
     get_app_path,
     get_data_dir,
 )
-from src.models.migrations import DatabaseMigrationError, migrate_database
 from src.models.repositories import (
     add_allocation,
     audit,
@@ -47,28 +44,17 @@ def backup_database():
 
 def verify_data_integrity():
     """启动时运行 v1.14 自动对账，返回旧接口形状。"""
-    from src.services.reconciliation_service import ReconciliationService
+    from src.services.database_service import reconcile_database
 
-    report = ReconciliationService(DB_PATH).run()
+    report = reconcile_database(DB_PATH)
     return report.is_clean, [issue.message for issue in report.issues]
 
 
 def init_db():
     """Migrate automatically, fail closed, then create a normal startup backup."""
-    backup = migrate_database(Path(DB_PATH))
-    from src.services.reconciliation_service import ReconciliationService
+    from src.services.database_service import initialize_database
 
-    report = ReconciliationService(DB_PATH).run()
-    ok, message = backup_database()
-    reconciliation_note = (
-        "自动对账通过"
-        if report.is_clean
-        else f"自动对账发现 {len(report.issues)} 个问题，请在“数据安全”菜单查看"
-    )
-    if not ok:
-        return True, f"数据库初始化成功；{reconciliation_note}；{message}"
-    migration_note = f"；迁移备份: {backup.path.name}" if backup else ""
-    return True, f"数据库初始化成功{migration_note}；{reconciliation_note}；{message}"
+    return initialize_database(DB_PATH)
 
 
 # ---------- 机型管理 ----------
