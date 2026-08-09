@@ -408,12 +408,22 @@ def list_counterparty_balances(kind: str, db_path=None) -> list[dict]:
     if kind not in ("customer", "supplier"):
         raise ValueError("kind must be customer or supplier")
     table = "customers" if kind == "customer" else "suppliers"
-    dimension = "customer_id" if kind == "customer" else "supplier_id"
-    code = "AR" if kind == "customer" else "AP"
-    sign = "l.debit_cents-l.credit_cents" if kind == "customer" else (
-        "l.credit_cents-l.debit_cents"
-    )
     if kind == "customer":
+        balance_expr = """
+            COALESCE((
+                SELECT SUM(
+                    q.quote_price_cents * q.quote_quantity
+                    - q.received_amount_cents
+                    - COALESCE((
+                        SELECT SUM(sr.revenue_cents)
+                        FROM sales_returns sr WHERE sr.quote_id=q.id
+                      ), 0)
+                )
+                FROM quotes q
+                WHERE q.customer_id=p.id AND q.status='已出库'
+                  AND q.deleted_at IS NULL
+            ), 0)
+        """
         open_items = """
             (SELECT COUNT(*) FROM quotes q
              WHERE q.customer_id=p.id AND q.status='已出库'
@@ -438,7 +448,10 @@ def list_counterparty_balances(kind: str, db_path=None) -> list[dict]:
                      ),0)
                    - q.received_amount_cents > 0)
         """
+        where_clause = f"{balance_expr} != 0"
+        order_clause = f"ABS({balance_expr}) DESC, p.id"
     else:
+        balance_expr = "p.balance_cents"
         open_items = """
             (SELECT COUNT(*) FROM batches b
              WHERE b.supplier_id=p.id AND b.deleted_at IS NULL
@@ -467,6 +480,8 @@ def list_counterparty_balances(kind: str, db_path=None) -> list[dict]:
                        WHERE spa.batch_id=b.id
                      ),0) > 0)
         """
+        where_clause = "p.balance_cents != 0"
+        order_clause = "ABS(p.balance_cents) DESC, p.id"
     conn = connect(db_path, read_only=True)
     try:
         return [
@@ -474,20 +489,14 @@ def list_counterparty_balances(kind: str, db_path=None) -> list[dict]:
             for row in conn.execute(
                 f"""
                 SELECT p.id,p.name,p.wechat,p.phone,
-                       COALESCE(SUM({sign}),0) AS balance_cents,
+                       {balance_expr} AS balance_cents,
                        {open_items} AS open_item_count,
                        {oldest_date} AS oldest_open_date
                 FROM {table} p
-                LEFT JOIN ledger_lines l ON l.{dimension}=p.id
-                    AND l.account_id=(
-                        SELECT id FROM ledger_accounts WHERE code=?
-                    )
                 WHERE p.deleted_at IS NULL
-                GROUP BY p.id
-                HAVING balance_cents!=0
-                ORDER BY ABS(balance_cents) DESC,p.id
+                  AND {where_clause}
+                ORDER BY {order_clause}
                 """,
-                (code,),
             ).fetchall()
         ]
     finally:
@@ -583,7 +592,38 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
             dict(row)
             for row in conn.execute(
                 """
-                SELECT c.id,c.name,c.balance_cents,
+                SELECT c.id,c.name,
+                       COALESCE((
+                           SELECT SUM(
+                               q.quote_price_cents * q.quote_quantity
+                               - q.received_amount_cents
+                               - COALESCE((
+                                   SELECT SUM(sr.revenue_cents)
+                                   FROM sales_returns sr WHERE sr.quote_id=q.id
+                                 ), 0)
+                           )
+                           FROM quotes q
+                           WHERE q.customer_id=c.id AND q.status='已出库'
+                             AND q.deleted_at IS NULL
+                       ), 0) - COALESCE((
+                           SELECT SUM(
+                               CASE WHEN p.entry_kind='reversal'
+                                    THEN -p.amount_cents ELSE p.amount_cents END
+                               - COALESCE((
+                                   SELECT SUM(pa.amount_cents)
+                                   FROM payment_allocations pa
+                                   WHERE pa.payment_id=p.id
+                                 ), 0)
+                           )
+                           FROM payments p
+                           WHERE p.customer_id=c.id
+                             AND p.type='receivable'
+                       ), 0) + COALESCE((
+                           SELECT SUM(sr.cash_refund_cents)
+                           FROM sales_returns sr
+                           JOIN quotes rq ON rq.id=sr.quote_id
+                           WHERE rq.customer_id=c.id
+                       ), 0) AS business_cents,
                        COALESCE(SUM(l.debit_cents-l.credit_cents),0)
                            AS ledger_cents
                 FROM customers c
@@ -591,8 +631,9 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
                     AND l.account_id=(
                         SELECT id FROM ledger_accounts WHERE code='AR'
                     )
+                WHERE c.deleted_at IS NULL
                 GROUP BY c.id
-                HAVING balance_cents!=ledger_cents
+                HAVING business_cents!=ledger_cents
                 """
             ).fetchall()
         ]

@@ -492,15 +492,20 @@ def get_receivables(db_path=None) -> list[dict]:
         rows = conn.execute("""
             SELECT c.id, c.name, c.wechat, c.phone,
                    COALESCE(SUM(
-                       q.quote_price_cents * q.quote_quantity - q.received_amount_cents
+                       q.quote_price_cents * q.quote_quantity
+                       - q.received_amount_cents
+                       - COALESCE((
+                           SELECT SUM(sr.revenue_cents)
+                           FROM sales_returns sr WHERE sr.quote_id=q.id
+                         ), 0)
                    ), 0) AS debt_cents,
-                   COUNT(q.id) AS order_count
+                   COUNT(*) AS order_count
             FROM customers c
-            LEFT JOIN quotes q ON q.customer_id=c.id
-                AND q.deleted_at IS NULL
-                AND q.status IN ('已报价','已出库')
+            JOIN quotes q ON q.customer_id = c.id
             WHERE c.deleted_at IS NULL
-            GROUP BY c.id
+              AND q.deleted_at IS NULL
+              AND q.status = '已出库'
+            GROUP BY c.id, c.name, c.wechat, c.phone
             HAVING debt_cents > 0
             ORDER BY debt_cents DESC
         """).fetchall()
@@ -514,25 +519,14 @@ def get_payables(db_path=None) -> list[dict]:
     try:
         rows = conn.execute("""
             SELECT s.id, s.name, s.wechat, s.phone,
-                   COALESCE(SUM(
-                       CASE WHEN b.deleted_at IS NULL
-                            THEN b.purchase_price_cents * b.quantity ELSE 0 END
-                   ), 0) -
-                   COALESCE((
-                       SELECT SUM(
-                           CASE WHEN p.entry_kind='reversal'
-                                THEN -p.amount_cents ELSE p.amount_cents END
-                       )
-                       FROM payments p
-                       WHERE p.supplier_id=s.id AND p.type='payable'
-                   ), 0) AS debt_cents,
-                   SUM(CASE WHEN b.deleted_at IS NULL THEN 1 ELSE 0 END) AS batch_count
+                   s.balance_cents AS debt_cents,
+                   (SELECT COUNT(*) FROM batches b
+                      WHERE b.supplier_id=s.id
+                        AND b.deleted_at IS NULL) AS batch_count
             FROM suppliers s
-            LEFT JOIN batches b ON b.supplier_id=s.id
             WHERE s.deleted_at IS NULL
-            GROUP BY s.id
-            HAVING debt_cents > 0
-            ORDER BY debt_cents DESC
+              AND s.balance_cents > 0
+            ORDER BY s.balance_cents DESC
         """).fetchall()
         return [dict(row) for row in rows]
     finally:

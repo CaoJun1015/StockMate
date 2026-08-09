@@ -24,7 +24,6 @@ from src.services.inventory_service import InventoryService
 from src.services.order_service import OrderService
 from src.services.party_service import CustomerService
 from src.services.return_service import ReturnService
-from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_single_quote_card, generate_quote_image, WATERMARK_TEXT
 
 from src.ui.dialogs import CustomerDialog, ProductEditDialog, _parse_tax_rate
@@ -90,8 +89,8 @@ class QuotePanel(QWidget):
         glayout = QGridLayout(group)
 
         self.quote_price_spin = QDoubleSpinBox()
-        self.quote_price_spin.setDecimals(2)
-        self.quote_price_spin.setRange(0, 999999999.99)
+        self.quote_price_spin.setDecimals(0)
+        self.quote_price_spin.setRange(0, 999999999)
         self.quote_price_spin.setPrefix("¥ ")
         self.quote_price_spin.setValue(0)
 
@@ -168,15 +167,6 @@ class QuotePanel(QWidget):
         if gpu: parts.append(gpu)
         self.product_label.setText("  ".join(parts))
         self.refresh()
-
-        # Skill 1: 加载报价建议
-        try:
-            from src.utils.quote_assist import suggest_price
-            suggestion = suggest_price(series=series, cpu=cpu, ram=ram, storage=storage, gpu=gpu)
-            if suggestion and suggestion.get("suggested_mid", 0) > 0:
-                self.quote_price_spin.setValue(suggestion["suggested_mid"])
-        except Exception:
-            pass
 
     def refresh(self):
         if not self.current_product_id:
@@ -340,9 +330,9 @@ class QuotePanel(QWidget):
             screen=product.get("screen", ""),
             note=product.get("note", ""),
             customer_name=customer_name,
-            quote_price=f"¥ {quote_price:,.2f}",
+            quote_price=f"¥ {quote_price:,.0f}",
             quote_quantity=quote_quantity,
-            total_price=f"¥ {total:,.2f}",
+            total_price=f"¥ {total:,.0f}",
         )
         QMessageBox.information(self, "成功", f"{message}\n报价图片已生成:\n{output}")
         self.refresh()

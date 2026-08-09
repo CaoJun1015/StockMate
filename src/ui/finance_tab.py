@@ -49,6 +49,7 @@ from src.ui.finance_dialogs import (
     PaymentEditDialog,
     TransferDialog,
 )
+from src.ui.display_labels import format_source_label
 from src.utils.excel_export import export_finance_to_excel
 from src.utils.money import format_yuan, yuan_to_cents
 
@@ -490,7 +491,7 @@ class FinanceTab(QWidget):
                     str(row["id"]),
                     row["entry_date"],
                     EVENT_LABELS.get(row["event_type"], row["event_type"]),
-                    f"{row['source_type']}#{row.get('source_id') or ''}",
+                    format_source_label(row["source_type"], row.get("source_id")),
                     name,
                     format_yuan(row["debit_total_cents"]),
                     row["status"],
@@ -724,7 +725,7 @@ class FinanceTab(QWidget):
         lines = [
             f"日期：{detail['entry_date']}",
             f"业务：{EVENT_LABELS.get(detail['event_type'], detail['event_type'])}",
-            f"来源：{detail['source_type']}#{detail.get('source_id') or ''}",
+            f"来源：{format_source_label(detail['source_type'], detail.get('source_id'))}",
             f"状态：{detail['status']}",
             f"原因：{detail.get('reason') or '—'}",
             "",

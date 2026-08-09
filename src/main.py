@@ -12,8 +12,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QPushButton, QLineEdit, QLabel, QComboBox, QTextEdit,
-    QMessageBox, QFileDialog, QDialog, QFormLayout,
-    QSpinBox, QDateEdit, QDialogButtonBox,
+    QMessageBox, QFileDialog, QDialog,
+    QDateEdit, QDialogButtonBox,
     QFrame, QHeaderView, QAbstractItemView, QCheckBox, QGroupBox,
     QGridLayout, QMenu, QMenuBar, QStatusBar,
 )
@@ -47,14 +47,11 @@ from src.models.connection import (
 )
 from src.services.reconciliation_service import ReconciliationService
 from src.version import APP_DISPLAY_NAME
-from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
 from src.utils.excel_export import export_quotes_to_excel
-from src.utils.price_diff import save_snapshot, get_latest_snapshot, diff_snapshots, get_all_snapshots
 from src.utils.follow_up import get_stale_quotes, format_reminder_text
 from src.utils.monthly_report import get_monthly_report, format_report_text
 from src.utils.shipment_flow import parse_sn_input, validate_sn, validate_sn_list, check_sn_duplicates, generate_shipment_receipt
-from src.utils.quote_assist import get_quote_history, suggest_price, get_customer_price_history
 from src.utils.remote_diagnose import search_diagnose, get_diagnose_tree, get_all_diagnose_keys, generate_diagnose_report
 
 
@@ -85,9 +82,6 @@ class MainWindow(QMainWindow):
         self.search_edit.textChanged.connect(self.on_search)
         self.search_edit.setMinimumWidth(250)
 
-        self.import_btn = QPushButton("导入 Word 价格表")
-        self.import_btn.setObjectName("ghostBtn")
-        self.import_btn.clicked.connect(self.on_import_word)
         self.broadcast_btn = QPushButton("群发图片")
         self.broadcast_btn.setObjectName("ghostBtn")
         self.broadcast_btn.clicked.connect(self.on_broadcast)
@@ -115,12 +109,6 @@ class MainWindow(QMainWindow):
         self.diagnose_btn = QPushButton("🔧 远程诊断")
         self.diagnose_btn.setObjectName("ghostBtn")
         self.diagnose_btn.clicked.connect(self.on_remote_diagnose)
-        self.price_diff_btn = QPushButton("价格异动")
-        self.price_diff_btn.setObjectName("ghostBtn")
-        self.price_diff_btn.clicked.connect(self.on_price_diff)
-        self.quote_assist_btn = QPushButton("报价助手")
-        self.quote_assist_btn.setObjectName("ghostBtn")
-        self.quote_assist_btn.clicked.connect(self.on_quote_assist)
         self.shipment_flow_btn = QPushButton("出库一条龙")
         self.shipment_flow_btn.setObjectName("ghostBtn")
         self.shipment_flow_btn.clicked.connect(self.on_shipment_flow)
@@ -138,11 +126,8 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.follow_up_btn)
         top_bar.addWidget(self.report_btn)
         top_bar.addWidget(self.diagnose_btn)
-        top_bar.addWidget(self.price_diff_btn)
-        top_bar.addWidget(self.quote_assist_btn)
         top_bar.addWidget(self.shipment_flow_btn)
         _add_sep(top_bar)
-        top_bar.addWidget(self.import_btn)
         top_bar.addWidget(self.broadcast_btn)
         top_bar.addWidget(self.export_btn)
         top_bar.addWidget(self.statement_btn)
@@ -390,12 +375,6 @@ class MainWindow(QMainWindow):
         self.record_tab.on_delete_quote()
 
     # -------------------------------------------------------
-    # 导入 Word（委托到 RecordTab）
-    # -------------------------------------------------------
-    def on_import_word(self):
-        self.record_tab.on_import_word()
-
-    # -------------------------------------------------------
     # Skill 3: 智能跟单提醒（委托到 RecordTab）
     # -------------------------------------------------------
     def on_follow_up(self):
@@ -535,162 +514,10 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "诊断报告", f"报告已复制到剪贴板！\n\n{report}")
 
     # -------------------------------------------------------
-    # Skill: 价格异动哨兵
-    # -------------------------------------------------------
-    def on_price_diff(self):
-        """价格异动哨兵 - 在导入Word时自动对比"""
-        snapshots = get_all_snapshots()
-        if not snapshots:
-            QMessageBox.information(self, "价格异动", "暂无历史价格快照。\n导入 Word 价格表时会自动保存快照。")
-            return
-
-        latest = get_latest_snapshot()
-        if not latest:
-            QMessageBox.information(self, "价格异动", "无法获取最新快照")
-            return
-
-        # 显示快照列表
-        items_text = "\n".join([f"  {s['import_date']} | {s['item_count']} 条机型" for s in snapshots[:10]])
-        QMessageBox.information(self, "价格快照历史", f"已有 {len(snapshots)} 个快照：\n\n{items_text}\n\n下次导入 Word 价格表时将自动对比异动。")
-
-    # -------------------------------------------------------
-    # Skill: 报价决策助手
-    # -------------------------------------------------------
-    def on_quote_assist(self):
-        """报价决策助手"""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("报价决策助手")
-        dlg.setMinimumWidth(450)
-        layout = QFormLayout(dlg)
-
-        series_edit = QLineEdit()
-        series_edit.setPlaceholderText("输入系列名称（如 Y7000P）")
-        cpu_edit = QLineEdit()
-        cpu_edit.setPlaceholderText("CPU（选填）")
-        price_spin = QSpinBox()
-        price_spin.setRange(0, 999999)
-        price_spin.setPrefix("¥ ")
-        customer_edit = QLineEdit()
-        customer_edit.setPlaceholderText("客户名称（选填）")
-
-        layout.addRow("系列:", series_edit)
-        layout.addRow("CPU:", cpu_edit)
-        layout.addRow("进货价:", price_spin)
-        layout.addRow("客户:", customer_edit)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        layout.addRow(buttons)
-
-        if dlg.exec():
-            series = series_edit.text().strip()
-            if not series:
-                QMessageBox.warning(self, "提示", "请输入系列名称")
-                return
-            suggestion = suggest_price(
-                series=series,
-                cpu=cpu_edit.text().strip(),
-                purchase_price=price_spin.value(),
-                customer_name=customer_edit.text().strip(),
-            )
-
-            conf_text = {"high": "高", "medium": "中", "low": "低"}[suggestion["confidence"]]
-            text = (
-                f"建议报价范围: ¥{suggestion['suggested_min']:,.0f} ~ ¥{suggestion['suggested_max']:,.0f}\n"
-                f"建议中间价: ¥{suggestion['suggested_mid']:,.0f}\n"
-                f"利润率: {suggestion['margin_at_mid']:.1f}%\n"
-                f"置信度: {conf_text}\n\n"
-                f"依据: {suggestion['basis']}"
-            )
-            if suggestion.get("history"):
-                h = suggestion["history"]
-                text += f"\n\n历史报价: {h['total_quotes']} 条\n区间: ¥{h['min_price']:,.0f} ~ ¥{h['max_price']:,.0f}\n均价: ¥{h['avg_price']:,.0f}"
-
-            QMessageBox.information(self, "报价建议", text)
-
-    # -------------------------------------------------------
     # Skill: 出库一条龙
     # -------------------------------------------------------
     def on_shipment_flow(self):
         self.record_tab.on_shipment_flow()
-
-    # -------------------------------------------------------
-    # 价格异动报告（Skill 2）
-    # -------------------------------------------------------
-    def _show_diff_report(self, diff):
-        """弹出价格异动报告对话框"""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("📊 价格异动报告")
-        dlg.setMinimumSize(700, 500)
-        layout = QVBoxLayout(dlg)
-
-        # 标题
-        title = QLabel(f"📊 价格异动报告（{diff['old_date']} → {diff['new_date']}）")
-        title.setObjectName("sectionTitleBlue")
-        layout.addWidget(title)
-
-        # 摘要
-        summary = QLabel(diff["summary"])
-        summary.setObjectName("summaryLabel")
-        layout.addWidget(summary)
-
-        # Tab 切换
-        tabs = QTabWidget()
-
-        # === 新增 ===
-        if diff["added"]:
-            add_tab = QWidget()
-            add_layout = QVBoxLayout(add_tab)
-            add_table = QTableWidget()
-            add_table.setAlternatingRowColors(True)
-            add_table.setColumnCount(6)
-            add_table.setHorizontalHeaderLabels(["系列", "CPU", "内存", "硬盘", "显卡", "备注"])
-            add_table.setRowCount(len(diff["added"]))
-            for i, item in enumerate(diff["added"]):
-                add_table.setItem(i, 0, QTableWidgetItem(item.get("series", "")))
-                add_table.setItem(i, 1, QTableWidgetItem(item.get("cpu", "")))
-                add_table.setItem(i, 2, QTableWidgetItem(item.get("ram", "")))
-                add_table.setItem(i, 3, QTableWidgetItem(item.get("storage", "")))
-                add_table.setItem(i, 4, QTableWidgetItem(item.get("gpu", "")))
-                add_table.setItem(i, 5, QTableWidgetItem(item.get("note", "")))
-            add_table.horizontalHeader().setStretchLastSection(True)
-            add_table.resizeColumnsToContents()
-            add_layout.addWidget(add_table)
-            tabs.addTab(add_tab, f"🔵 新增 ({len(diff['added'])})")
-
-        # === 下架 ===
-        if diff["removed"]:
-            rm_tab = QWidget()
-            rm_layout = QVBoxLayout(rm_tab)
-            rm_label = QLabel("⚠️ 以下机型在新价格表中已下架，请检查是否有库存需要尽快出货：")
-            rm_label.setObjectName("dangerSummaryLabel")
-            rm_layout.addWidget(rm_label)
-            rm_table = QTableWidget()
-            rm_table.setAlternatingRowColors(True)
-            rm_table.setColumnCount(6)
-            rm_table.setHorizontalHeaderLabels(["系列", "CPU", "内存", "硬盘", "显卡", "备注"])
-            rm_table.setRowCount(len(diff["removed"]))
-            for i, item in enumerate(diff["removed"]):
-                rm_table.setItem(i, 0, QTableWidgetItem(item.get("series", "")))
-                rm_table.setItem(i, 1, QTableWidgetItem(item.get("cpu", "")))
-                rm_table.setItem(i, 2, QTableWidgetItem(item.get("ram", "")))
-                rm_table.setItem(i, 3, QTableWidgetItem(item.get("storage", "")))
-                rm_table.setItem(i, 4, QTableWidgetItem(item.get("gpu", "")))
-                rm_table.setItem(i, 5, QTableWidgetItem(item.get("note", "")))
-            rm_table.horizontalHeader().setStretchLastSection(True)
-            rm_table.resizeColumnsToContents()
-            rm_layout.addWidget(rm_table)
-            tabs.addTab(rm_tab, f"⚠️ 下架 ({len(diff['removed'])})")
-
-        layout.addWidget(tabs)
-
-        # 底部按钮
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-        buttons.accepted.connect(dlg.accept)
-        layout.addWidget(buttons)
-
-        dlg.exec()
 
     # -------------------------------------------------------
     # 群发图片

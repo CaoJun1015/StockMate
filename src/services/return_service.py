@@ -136,12 +136,6 @@ class ReturnService:
                 )
 
             customer_id = quote["customer_id"]
-            if customer_id is not None:
-                adjust_customer_balance(conn, customer_id, -revenue_cents)
-                if cash_refund_cents:
-                    adjust_customer_balance(
-                        conn, customer_id, cash_refund_cents
-                    )
             lines = [
                 {
                     "account_code": "SALES",

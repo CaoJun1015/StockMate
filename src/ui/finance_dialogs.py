@@ -52,10 +52,10 @@ def _remember_account(combo: QComboBox) -> None:
 
 def _money_spin(*, allow_negative: bool = False) -> QDoubleSpinBox:
     spin = QDoubleSpinBox()
-    spin.setDecimals(2)
+    spin.setDecimals(0)
     spin.setRange(
-        -999_999_999.99 if allow_negative else 0.01,
-        999_999_999.99,
+        -999_999_999 if allow_negative else 0,
+        999_999_999,
     )
     spin.setPrefix("¥ ")
     spin.setSingleStep(1.0)
@@ -89,7 +89,7 @@ class PaymentDialog(QDialog):
                 )
             )
         elif preview_pending is not None:
-            layout.addRow(QLabel(f"当前往来余额：¥ {preview_pending:.2f}"))
+            layout.addRow(QLabel(f"当前往来余额：¥ {preview_pending:.0f}"))
         self.amount_spin = _money_spin()
         layout.addRow("金额：", self.amount_spin)
         self.account_combo = QComboBox()

@@ -16,7 +16,6 @@ from src.models.finance_repository import (
 from src.models.repositories import (
     add_allocation,
     add_quote_received_amount,
-    adjust_customer_balance,
     adjust_supplier_balance,
     audit,
     decrement_batch_remaining,
@@ -287,8 +286,6 @@ class InventoryService:
             cost_cents = batch["purchase_price_cents"] * quantity
             customer_id = quote["customer_id"]
             set_quote_status(conn, quote_id, "已出库", sn_list=sn_list)
-            if customer_id is not None:
-                adjust_customer_balance(conn, customer_id, revenue_cents)
             entry_id = LedgerPostingService.post(
                 conn,
                 entry_date=shipped_date,

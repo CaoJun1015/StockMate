@@ -1,12 +1,11 @@
 """报价记录 Tab"""
-import os
 from datetime import datetime, date as date_type
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem,
     QPushButton, QLineEdit, QLabel, QComboBox, QTextEdit,
-    QMessageBox, QFileDialog, QDialog,
+    QMessageBox, QDialog,
     QSpinBox, QDateEdit, QDialogButtonBox,
     QFrame, QHeaderView, QAbstractItemView, QCheckBox, QGroupBox,
     QApplication,
@@ -28,10 +27,8 @@ from src.services.order_service import OrderService
 from src.services.payment_service import PaymentService
 from src.services.product_service import ProductService
 from src.services.return_service import ReturnService
-from src.utils.word_parser import parse_word_pricelist, preview_parse
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
 from src.utils.excel_export import export_quotes_to_excel
-from src.utils.price_diff import save_snapshot, get_latest_snapshot, diff_snapshots
 from src.utils.follow_up import get_stale_quotes, format_reminder_text
 from src.utils.monthly_report import get_monthly_report, format_report_text
 from src.utils.shipment_flow import parse_sn_input, validate_sn, validate_sn_list, generate_shipment_receipt
@@ -433,7 +430,7 @@ class RecordTab(QWidget):
             except ServiceError as exc:
                 QMessageBox.warning(self, "收款失败", str(exc))
                 return
-            QMessageBox.information(self, "成功", f"收款 ¥{data['amount']:.2f} 已记录！")
+            QMessageBox.information(self, "成功", f"收款 ¥{data['amount']:.0f} 已记录！")
             self.refresh_records()
 
     def on_return_sale(self):
@@ -498,112 +495,6 @@ class RecordTab(QWidget):
             self.refresh_records()
 
     # -------------------------------------------------------
-    # 导入 Word
-    # -------------------------------------------------------
-    def on_import_word(self):
-        filepath, _ = QFileDialog.getOpenFileName(
-            self, "选择 Word 价格表", "", "Word 文档 (*.docx *.doc)"
-        )
-        if not filepath:
-            return
-
-        # 文件大小校验（最大 50 MB）
-        file_size = os.path.getsize(filepath)
-        if file_size > 50 * 1024 * 1024:
-            QMessageBox.warning(self, "文件过大",
-                f"文件大小 {file_size / (1024*1024):.1f} MB 超过限制（最大 50 MB）")
-            return
-
-        try:
-            products = parse_word_pricelist(filepath)
-        except Exception as e:
-            QMessageBox.critical(self, "解析失败", f"无法解析 Word 文件:\n{str(e)}")
-            return
-
-        if not products:
-            QMessageBox.warning(self, "提示", "未从文档中识别到任何机型")
-            return
-
-        # 预览确认
-        preview = "\n".join([f"{p.get('series','?')} | {p.get('cpu','')} | {p.get('ram','')} | {p.get('storage','')} | {p.get('gpu','')}" for p in products[:20]])
-        if len(products) > 20:
-            preview += f"\n... 及其他 {len(products)-20} 条"
-
-        reply = QMessageBox.question(
-            self, "确认导入",
-            f"识别到 {len(products)} 条机型，预览如下:\n\n{preview}\n\n是否导入？"
-            "\n（已存在的机型将被跳过）",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # 导入
-        imported = 0
-        for p in products:
-            series = p.get("series", "")
-            if not series or series == "未识别":
-                continue
-            # 检查是否已存在（按全部字段去重）
-            existing = list_products(series)
-            skip = False
-            for e in existing:
-                if (e["series"] == series and
-                    e.get("cpu", "") == p.get("cpu", "") and
-                    e.get("ram", "") == p.get("ram", "") and
-                    e.get("storage", "") == p.get("storage", "") and
-                    e.get("gpu", "") == p.get("gpu", "") and
-                    e.get("screen", "") == p.get("screen", "") and
-                    e.get("note", "") == p.get("note", "")):
-                    skip = True
-                    break
-            if not skip:
-                self.product_service.create(
-                    series=series,
-                    cpu=p.get("cpu", ""),
-                    ram=p.get("ram", ""),
-                    storage=p.get("storage", ""),
-                    gpu=p.get("gpu", ""),
-                    screen=p.get("screen", ""),
-                    note=p.get("note", ""),
-                )
-                imported += 1
-
-        self.main.product_tab.refresh_product_list(self.main.search_edit.text().strip())
-        QMessageBox.information(self, "导入完成", f"成功导入 {imported} 条新机型\n跳过 {len(products)-imported} 条已存在的记录")
-
-        # ---- Skill 2: 价格异动哨兵 ----
-        # 保存本次快照
-        try:
-            snapshot_id, count = save_snapshot(products)
-        except Exception:
-            snapshot_id = None
-
-        # 和上一次快照做对比
-        if snapshot_id:
-            try:
-                today = datetime.now().strftime("%Y-%m-%d")
-                old_snapshot = get_latest_snapshot(before_date=today)
-                # 如果今天之前没有更早的快照，再取最新的（可能是今天刚导入的前一次）
-                if old_snapshot is None:
-                    old_snapshot = get_latest_snapshot()
-                    # 排除当前这次刚保存的
-                    if old_snapshot and old_snapshot["snapshot_id"] == snapshot_id:
-                        old_snapshot = None
-
-                if old_snapshot:
-                    diff = diff_snapshots(old_snapshot, products)
-                    if diff["added"] or diff["removed"]:
-                        self.main._show_diff_report(diff)
-                else:
-                    QMessageBox.information(
-                        self, "首次快照",
-                        f"已保存价格快照（{count} 条机型）。\n下次导入时将自动对比变动。"
-                    )
-            except Exception as e:
-                pass  # 异动分析失败不影响主流程
-
-    # -------------------------------------------------------
     # Skill 3: 智能跟单提醒
     # -------------------------------------------------------
     def on_follow_up(self):
@@ -654,7 +545,7 @@ class RecordTab(QWidget):
     def on_broadcast(self):
         products = list_products()
         if not products:
-            QMessageBox.warning(self, "提示", "还没有机型数据，请先导入 Word 价格表")
+            QMessageBox.warning(self, "提示", "还没有机型数据，请先新增机型")
             return
 
         # 弹出选择对话框

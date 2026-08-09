@@ -15,7 +15,6 @@ from src.models.finance_repository import (
 from src.models.repositories import (
     add_allocation,
     add_quote_received_amount,
-    adjust_customer_balance,
     adjust_supplier_balance,
     audit,
     get_active_entity,
@@ -132,7 +131,6 @@ class PaymentService:
             allocations, unapplied = self._allocate_customer_payment(
                 conn, payment_id, customer_id, amount_cents
             )
-            adjust_customer_balance(conn, customer_id, -amount_cents)
             LedgerPostingService.post(
                 conn,
                 entry_date=pay_date,
@@ -304,9 +302,6 @@ class PaymentService:
                     -allocation["amount_cents"],
                 )
                 sync_quote_payment_state(conn, allocation["quote_id"])
-            adjust_customer_balance(
-                conn, payment["customer_id"], payment["amount_cents"]
-            )
         else:
             allocations = list_supplier_payment_allocations(conn, payment_id)
             for allocation in allocations:
@@ -402,9 +397,6 @@ class PaymentService:
                     replacement_id,
                     original["customer_id"],
                     amount_cents,
-                )
-                adjust_customer_balance(
-                    conn, original["customer_id"], -amount_cents
                 )
                 lines = [
                     {

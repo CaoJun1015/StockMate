@@ -14,6 +14,7 @@
 import pytest
 import sys
 import os
+from PyQt6.QtWidgets import QPushButton
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -103,7 +104,6 @@ class TestUIInstantiation:
     def test_toolbar_buttons_have_ghostbtn(self):
         """工具栏按钮应有 ghostBtn objectName"""
         ghost_buttons = [
-            self.window.import_btn,
             self.window.broadcast_btn,
             self.window.export_btn,
             self.window.export_json_btn,
@@ -113,13 +113,21 @@ class TestUIInstantiation:
             self.window.follow_up_btn,
             self.window.report_btn,
             self.window.diagnose_btn,
-            self.window.price_diff_btn,
-            self.window.quote_assist_btn,
             self.window.shipment_flow_btn,
         ]
         for btn in ghost_buttons:
             assert btn.objectName() == "ghostBtn", \
                 f"按钮 '{btn.text()}' 的 objectName 应为 'ghostBtn'，实际为 '{btn.objectName()}'"
+
+    def test_low_usage_toolbar_features_are_removed(self):
+        """价格异动、报价助手和 Word 导入不应再出现在主窗口。"""
+        assert not hasattr(self.window, "price_diff_btn")
+        assert not hasattr(self.window, "quote_assist_btn")
+        assert not hasattr(self.window, "import_btn")
+        button_texts = {button.text() for button in self.window.findChildren(QPushButton)}
+        assert "价格异动" not in button_texts
+        assert "报价助手" not in button_texts
+        assert "导入 Word 价格表" not in button_texts
 
     def test_search_edit_has_globalsearch(self):
         """搜索框应有 globalSearch objectName"""

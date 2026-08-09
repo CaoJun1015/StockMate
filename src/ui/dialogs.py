@@ -23,6 +23,7 @@ from src.models.queries import (
 )
 from src.services.party_service import CustomerService, SupplierService
 from src.models.finance_queries import list_financial_accounts
+from src.ui.display_labels import format_operation_object
 from src.utils.money import cents_to_yuan, format_yuan
 from src.utils.shipment_flow import parse_sn_input, validate_sn_list, check_sn_duplicates
 
@@ -184,8 +185,8 @@ class PaymentDialog(QDialog):
             layout.addRow(info_label)
 
         self.amount_spin = QDoubleSpinBox()
-        self.amount_spin.setDecimals(2)
-        self.amount_spin.setRange(0.01, 999999999.99)
+        self.amount_spin.setDecimals(0)
+        self.amount_spin.setRange(0, 999999999)
         self.amount_spin.setPrefix("¥ ")
         self.amount_spin.setValue(0)
         layout.addRow("金额:", self.amount_spin)
@@ -249,8 +250,8 @@ class PaymentEditDialog(QDialog):
         layout.addRow(info_label)
 
         self.amount_spin = QDoubleSpinBox()
-        self.amount_spin.setDecimals(2)
-        self.amount_spin.setRange(0.01, 999999999.99)
+        self.amount_spin.setDecimals(0)
+        self.amount_spin.setRange(0, 999999999)
         self.amount_spin.setPrefix("¥ ")
         self.amount_spin.setValue(cents_to_yuan(payment.get("amount_cents", 0)))
         layout.addRow("金额:", self.amount_spin)
@@ -578,8 +579,8 @@ class BatchDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
 
         self.price_spin = QDoubleSpinBox()
-        self.price_spin.setDecimals(2)
-        self.price_spin.setRange(0, 999999999.99)
+        self.price_spin.setDecimals(0)
+        self.price_spin.setRange(0, 999999999)
         self.price_spin.setPrefix("¥ ")
         self.price_spin.setValue(0)
 
@@ -722,8 +723,8 @@ class QuoteEditDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
 
         self.price_spin = QDoubleSpinBox()
-        self.price_spin.setDecimals(2)
-        self.price_spin.setRange(0, 999999999.99)
+        self.price_spin.setDecimals(0)
+        self.price_spin.setRange(0, 999999999)
         self.price_spin.setPrefix("¥ ")
         self.price_spin.setValue(0)
 
@@ -892,8 +893,14 @@ class OperationLogDialog(QDialog):
         for i, log in enumerate(logs):
             self.table.setItem(i, 0, QTableWidgetItem(log.get("created_at", "")))
             self.table.setItem(i, 1, QTableWidgetItem(log.get("operation", "")))
-            self.table.setItem(i, 2, QTableWidgetItem(
-                f"{log.get('table_name', '')}(ID:{log.get('record_id', '')})"
-            ))
+            self.table.setItem(
+                i,
+                2,
+                QTableWidgetItem(
+                    format_operation_object(
+                        log.get("table_name"), log.get("record_id")
+                    )
+                ),
+            )
             self.table.setItem(i, 3, QTableWidgetItem(log.get("description", "")))
         self.table.resizeColumnsToContents()

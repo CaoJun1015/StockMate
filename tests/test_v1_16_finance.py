@@ -19,6 +19,7 @@ from src.models.finance_queries import (
     list_operating_entries,
 )
 from src.models.migrations import migrate_database
+from src.models.queries import get_receivables
 from src.models.schema import SCHEMA_VERSION
 from src.services.exceptions import DataConflictError, ValidationError
 from src.services.finance_service import FinanceService
@@ -443,3 +444,143 @@ def test_finance_tab_has_five_pages(qapp, tmp_path):
     assert [
         tab.section_tabs.tabText(index) for index in range(5)
     ] == ["经营总览", "日常收支", "应收应付", "利润分析", "流水审计"]
+
+
+def test_customer_receivable_after_shipment(tmp_path):
+    """出库后客户应收应正确反映在 get_receivables() 中"""
+    db = tmp_path / "test.db"
+    product, customer, supplier = _seed(db)
+    account = _enabled(db)
+
+    inv = InventoryService(db)
+    batch_id = inv.receive_batch(
+        product_id=product,
+        purchase_price_cents=500000,
+        quantity=10,
+        date="2026-08-02",
+        settlement_mode="paid",
+        account_id=account,
+    )
+    order = OrderService(db)
+    quote_id = order.create_quote(
+        customer_id=customer,
+        batch_id=batch_id,
+        quote_price_cents=600000,
+        quote_quantity=3,
+        quote_date="2026-08-02",
+    )
+    inv.ship_quote(quote_id, shipped_date="2026-08-03")
+
+    receivables = {r["id"]: r for r in get_receivables(db)}
+    assert customer in receivables
+    assert receivables[customer]["debt_cents"] == 600000 * 3
+
+
+def test_customer_receivable_after_payment(tmp_path):
+    """收款后客户应收应正确减少"""
+    db = tmp_path / "test.db"
+    product, customer, supplier = _seed(db)
+    account = _enabled(db)
+
+    inv = InventoryService(db)
+    batch_id = inv.receive_batch(
+        product_id=product,
+        purchase_price_cents=500000,
+        quantity=10,
+        date="2026-08-02",
+        settlement_mode="paid",
+        account_id=account,
+    )
+    order = OrderService(db)
+    quote_id = order.create_quote(
+        customer_id=customer,
+        batch_id=batch_id,
+        quote_price_cents=600000,
+        quote_quantity=3,
+        quote_date="2026-08-02",
+    )
+    inv.ship_quote(quote_id, shipped_date="2026-08-03")
+
+    pay = PaymentService(db)
+    pay.receive_customer_payment(
+        customer_id=customer,
+        amount_cents=1000000,
+        pay_date="2026-08-04",
+        account_id=account,
+    )
+
+    receivables = {r["id"]: r for r in get_receivables(db)}
+    assert customer in receivables
+    assert receivables[customer]["debt_cents"] == 600000 * 3 - 1000000
+
+
+def test_customer_balance_cents_unchanged_after_shipment(tmp_path):
+    """出库后 customers.balance_cents 应保持为 0"""
+    db = tmp_path / "test.db"
+    product, customer, supplier = _seed(db)
+    account = _enabled(db)
+
+    inv = InventoryService(db)
+    batch_id = inv.receive_batch(
+        product_id=product,
+        purchase_price_cents=500000,
+        quantity=10,
+        date="2026-08-02",
+        settlement_mode="paid",
+        account_id=account,
+    )
+    order = OrderService(db)
+    quote_id = order.create_quote(
+        customer_id=customer,
+        batch_id=batch_id,
+        quote_price_cents=600000,
+        quote_quantity=3,
+        quote_date="2026-08-02",
+    )
+    inv.ship_quote(quote_id, shipped_date="2026-08-03")
+
+    with transaction(db) as conn:
+        row = conn.execute(
+            "SELECT balance_cents FROM customers WHERE id=?", (customer,)
+        ).fetchone()
+        assert row["balance_cents"] == 0
+
+
+def test_customer_balance_cents_unchanged_after_payment(tmp_path):
+    """收款后 customers.balance_cents 应保持为 0"""
+    db = tmp_path / "test.db"
+    product, customer, supplier = _seed(db)
+    account = _enabled(db)
+
+    inv = InventoryService(db)
+    batch_id = inv.receive_batch(
+        product_id=product,
+        purchase_price_cents=500000,
+        quantity=10,
+        date="2026-08-02",
+        settlement_mode="paid",
+        account_id=account,
+    )
+    order = OrderService(db)
+    quote_id = order.create_quote(
+        customer_id=customer,
+        batch_id=batch_id,
+        quote_price_cents=600000,
+        quote_quantity=3,
+        quote_date="2026-08-02",
+    )
+    inv.ship_quote(quote_id, shipped_date="2026-08-03")
+
+    pay = PaymentService(db)
+    pay.receive_customer_payment(
+        customer_id=customer,
+        amount_cents=1000000,
+        pay_date="2026-08-04",
+        account_id=account,
+    )
+
+    with transaction(db) as conn:
+        row = conn.execute(
+            "SELECT balance_cents FROM customers WHERE id=?", (customer,)
+        ).fetchone()
+        assert row["balance_cents"] == 0

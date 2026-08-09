@@ -520,6 +520,13 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
                     "INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (1,?)",
                     ("legacy_schema_validated",),
                 )
+            if version < 3:
+                v3_cols = _columns(conn, "customers")
+                if "balance" not in v3_cols and "balance_cents" in v3_cols:
+                    raise DatabaseMigrationError(
+                        f"数据库 schema 已是 v3+（无 REAL 金额列），但 user_version={version}。"
+                        "请勿手动修改数据库版本号。"
+                    )
             if version < 2:
                 _migrate_legacy_to_v2(conn)
                 conn.execute(
