@@ -55,7 +55,7 @@ class ShipmentDialog(QDialog):
         self.quote = quote
         self.batches = batches or []
         self.setWindowTitle("确认出库")
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(760)
         layout = QFormLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
 
@@ -64,28 +64,40 @@ class ShipmentDialog(QDialog):
         self.info_label.setObjectName("dialogInfoLabel")
         layout.addRow(self.info_label)
 
-        self.batch_combo = QComboBox()
-        for b in self.batches:
-            self.batch_combo.addItem(
-                f"批次#{b['id']} | 购入{format_yuan(b['purchase_price_cents'])} | "
-                f"剩余{b['remaining']}台 | {b.get('date','')}",
-                b["id"]
-            )
-        self.batch_combo.currentIndexChanged.connect(self._update_remaining)
-        layout.addRow("扣减批次:", self.batch_combo)
+        self.allocation_table = QTableWidget(len(self.batches), 6)
+        self.allocation_table.setHorizontalHeaderLabels(
+            ["批次", "日期", "进价", "可用", "出库数量", "该批次SN"]
+        )
+        self.allocation_table.horizontalHeader().setSectionResizeMode(
+            5, QHeaderView.ResizeMode.Stretch
+        )
+        self.allocation_rows = []
+        for row, batch in enumerate(self.batches):
+            for col, value in enumerate((
+                f"#{batch['id']}", batch.get("date", ""),
+                format_yuan(batch["purchase_price_cents"]), batch.get("remaining", 0),
+            )):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.allocation_table.setItem(row, col, item)
+            quantity_edit = QSpinBox()
+            quantity_edit.setRange(0, max(int(batch.get("remaining", 0)), 0))
+            sn_edit = QLineEdit()
+            sn_edit.setPlaceholderText("逗号/空格分隔；不录可留空")
+            self.allocation_table.setCellWidget(row, 4, quantity_edit)
+            self.allocation_table.setCellWidget(row, 5, sn_edit)
+            self.allocation_rows.append((batch, quantity_edit, sn_edit))
+        self.allocation_table.setMinimumHeight(min(280, 85 + len(self.batches) * 32))
+        layout.addRow("批次分配:", self.allocation_table)
 
-        self.remaining_label = QLabel()
-        self._update_remaining()
+        self.remaining_label = QLabel(
+            f"请手工分配，共需 {quote.get('quote_quantity', 1) or 1} 台"
+        )
         self.shipped_date_edit = QDateEdit()
         self.shipped_date_edit.setDate(QDate.currentDate())
         self.shipped_date_edit.setCalendarPopup(True)
         layout.addRow("出库日期:", self.shipped_date_edit)
-        layout.addRow("批次剩余:", self.remaining_label)
-
-        self.sn_edit = QTextEdit()
-        self.sn_edit.setPlaceholderText("条码枪扫码输入，每扫一条自动换行。也可手动输入，支持逗号/空格分隔。")
-        self.sn_edit.setMaximumHeight(100)
-        layout.addRow("出库SN:", self.sn_edit)
+        layout.addRow("分配提示:", self.remaining_label)
 
         self.remark_edit = QLineEdit()
         self.remark_edit.setPlaceholderText("出库备注（选填）")
@@ -96,39 +108,19 @@ class ShipmentDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
 
-        # 条码枪支持：拦截回车键，不让它提交对话框
-        from PyQt6.QtCore import QEvent
-        self.sn_edit.installEventFilter(self)
-
-    def eventFilter(self, obj, event):
-        from PyQt6.QtCore import QEvent, Qt
-        if obj == self.sn_edit and event.type() == QEvent.Type.KeyPress:
-            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self.sn_edit.insertPlainText("\n")
-                return True
-        return super().eventFilter(obj, event)
-
-    def _update_remaining(self):
-        idx = self.batch_combo.currentIndex()
-        if 0 <= idx < len(self.batches):
-            remaining = self.batches[idx].get("remaining", 0)
-            self.remaining_label.setText(f"{remaining} 台")
-            color = "#D32F2F" if remaining < (self.quote.get("quote_quantity", 1) or 1) else "#388E3C"
-            self.remaining_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-
     def _validate_and_accept(self):
         quantity = self.quote.get("quote_quantity", 1) or 1
-        idx = self.batch_combo.currentIndex()
-        if idx < 0 or idx >= len(self.batches):
-            QMessageBox.warning(self, "提示", "请选择批次")
+        allocations = self._allocations()
+        if sum(item["quantity"] for item in allocations) != quantity:
+            QMessageBox.warning(self, "提示", f"批次分配合计必须等于 {quantity} 台")
             return
-        remaining = self.batches[idx].get("remaining", 0)
-        if remaining < quantity:
-            QMessageBox.warning(self, "提示", f"批次剩余不足！需要 {quantity} 台，剩余 {remaining} 台")
-            return
-        raw_sn = self.sn_edit.toPlainText().strip()
-        if raw_sn:
-            sn_list = parse_sn_input(raw_sn)
+        for item in allocations:
+            sn_list = parse_sn_input(item["sn_list"])
+            if sn_list and len(sn_list) != item["quantity"]:
+                QMessageBox.warning(
+                    self, "提示", f"批次#{item['batch_id']}的SN数量必须等于出库数量"
+                )
+                return
             sn_pattern = re.compile(r"^[A-Za-z0-9\-]{4,20}$")
             for sn in sn_list:
                 if not sn_pattern.match(sn):
@@ -138,14 +130,21 @@ class ShipmentDialog(QDialog):
                     return
         self.accept()
 
+    def _allocations(self):
+        result = []
+        for batch, quantity_edit, sn_edit in self.allocation_rows:
+            quantity = quantity_edit.value()
+            if quantity:
+                result.append({
+                    "batch_id": batch["id"],
+                    "quantity": quantity,
+                    "sn_list": ",".join(parse_sn_input(sn_edit.text().strip())),
+                })
+        return result
+
     def get_data(self):
-        idx = self.batch_combo.currentIndex()
-        raw_sn = self.sn_edit.toPlainText().strip()
-        sn_list = parse_sn_input(raw_sn)
         return {
-            "batch_id": self.batch_combo.currentData() if idx >= 0 else None,
-            "sn_list": ",".join(sn_list),
-            "sn_count": len(sn_list),
+            "allocations": self._allocations(),
             "remark": self.remark_edit.text().strip(),
             "shipped_date": self.shipped_date_edit.date().toString("yyyy-MM-dd"),
         }

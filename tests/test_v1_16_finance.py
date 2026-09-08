@@ -82,8 +82,8 @@ def test_fresh_schema_v4_contains_balanced_ledger(tmp_path):
     assert migrate_database(path) is None
     conn = connect(path, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert SCHEMA_VERSION == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert SCHEMA_VERSION == 5
         tables = {
             row[0]
             for row in conn.execute(
@@ -137,6 +137,17 @@ def test_finance_setup_builds_reconciled_opening_balances(tmp_path):
             """,
             (product, 300_000, 2, 1, "2026-07-01", supplier),
         ).lastrowid
+        conn.execute(
+            """INSERT INTO inventory_movements(
+                movement_date,movement_type,product_id,batch_id,quantity_delta,
+                unit_cost_cents,total_cost_cents,source_type,source_id,idempotency_key
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "2026-07-01", "migration_adjustment", product, batch, 1,
+                300_000, 300_000, "test_opening", str(batch),
+                f"test-opening:batch:{batch}",
+            ),
+        )
         conn.execute(
             "UPDATE suppliers SET balance_cents=600000 WHERE id=?",
             (supplier,),
@@ -378,7 +389,7 @@ def test_v4_json_and_finance_excel_round_trip(tmp_path):
     _sale(source, quantity=1)
     export_all_to_json(export, source)
     document = json.loads(export.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 4
+    assert document["schema_version"] == 5
     assert "ledger_entries" in document["data"]
     migrate_database(target)
     ok, _, _ = import_from_json(export, target)

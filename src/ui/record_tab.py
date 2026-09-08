@@ -19,6 +19,7 @@ from src.models.queries import (
     get_quote_detail,
     list_batches,
     list_products,
+    list_shipment_allocations,
     search_quotes,
 )
 from src.services.exceptions import ServiceError
@@ -68,6 +69,9 @@ class RecordTab(QWidget):
         self.return_btn = QPushButton("销售退货")
         self.return_btn.setObjectName("warningBtn")
         self.return_btn.clicked.connect(self.on_return_sale)
+        self.shipment_detail_btn = QPushButton("出库明细")
+        self.shipment_detail_btn.setObjectName("ghostBtn")
+        self.shipment_detail_btn.clicked.connect(self.on_shipment_detail)
         self.cancel_record_btn = QPushButton("取消订单")
         self.cancel_record_btn.setObjectName("ghostBtn")
         self.cancel_record_btn.clicked.connect(self.on_cancel_quote)
@@ -84,6 +88,7 @@ class RecordTab(QWidget):
         btn_row.addWidget(self.ship_record_btn)
         btn_row.addWidget(self.receive_btn)
         btn_row.addWidget(self.return_btn)
+        btn_row.addWidget(self.shipment_detail_btn)
         btn_row.addWidget(self.cancel_record_btn)
         btn_row.addWidget(self.edit_record_btn)
         btn_row.addWidget(self.del_record_btn)
@@ -383,15 +388,21 @@ class RecordTab(QWidget):
         if dlg.exec():
             data = dlg.get_data()
             try:
-                self.inventory_service.ship_quote(
+                result = self.inventory_service.ship_quote(
                     quote_id,
-                    data.get("sn_list", ""),
-                    data.get("shipped_date"),
+                    shipped_date=data.get("shipped_date"),
+                    allocations=data.get("allocations"),
+                    remark=data.get("remark", ""),
                 )
             except ServiceError as exc:
                 QMessageBox.warning(self, "出库失败", str(exc))
                 return
-            QMessageBox.information(self, "成功", "出库成功")
+            warnings = result.get("sn_compatibility_warnings", []) if result else []
+            message = "出库成功"
+            if warnings:
+                message += "\n\n以下SN因历史入库SN不完整已兼容放行，并写入审计：\n"
+                message += "、".join(warnings[:10])
+            QMessageBox.information(self, "成功", message)
             self.refresh_records()
 
     def on_receive_payment(self):
@@ -448,6 +459,7 @@ class RecordTab(QWidget):
             self,
             max_quantity=quote.get("quote_quantity", 1),
             allow_restock=True,
+            allocations=list_shipment_allocations(quote_id),
         )
         if not dialog.exec():
             return
@@ -461,12 +473,44 @@ class RecordTab(QWidget):
                 reason=data["reason"],
                 refund_account_id=data["account_id"],
                 cash_refund_cents=yuan_to_cents(data["refund"]),
+                restock_allocations=data.get("restock_allocations"),
             )
         except ServiceError as exc:
             QMessageBox.warning(self, "销售退货失败", str(exc))
             return
         QMessageBox.information(self, "成功", "销售退货已记录")
         self.refresh_records()
+
+    def on_shipment_detail(self):
+        row = self.record_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "提示", "请先选择报价记录")
+            return
+        quote_id = int(self.record_table.item(row, 0).text())
+        allocations = list_shipment_allocations(quote_id)
+        if not allocations:
+            QMessageBox.information(self, "出库明细", "该报价尚无出库批次分配")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"报价#{quote_id} 出库明细")
+        dialog.resize(720, 360)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(allocations), 5)
+        table.setHorizontalHeaderLabels(["批次", "数量", "单位成本", "总成本", "SN"])
+        for r, allocation in enumerate(allocations):
+            values = (
+                allocation["batch_id"], allocation["quantity"],
+                format_yuan(allocation["unit_cost_cents"]),
+                format_yuan(allocation["cost_cents"]), allocation.get("sn_list", ""),
+            )
+            for col, value in enumerate(values):
+                table.setItem(r, col, QTableWidgetItem(str(value)))
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+        close = QPushButton("关闭")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
 
     def on_cancel_quote(self):
         row = self.record_table.currentRow()

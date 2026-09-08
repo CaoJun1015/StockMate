@@ -7,7 +7,7 @@
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&logo=windows&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.16-brightgreen?style=flat-square)
+![Version](https://img.shields.io/badge/version-v1.17-brightgreen?style=flat-square)
 ![GitHub](https://img.shields.io/badge/GitHub-CaoJun1015-181717?style=flat-square&logo=github&logoColor=white)
 
 从上游价格表解析、报价、出库、收款到对账，一站式管理你的调货生意。
@@ -136,6 +136,7 @@ diaohuo-assistant/
 
 | 版本 | 日期 | 主要更新 |
 |------|------|---------|
+| v1.17 | 2026-08 | 不可变库存流水、跨批次出库分配、精确批次成本追溯 |
 | v1.16 | 2026-08 | 经营记账闭环、不可变复式账本、预收预付、退货退款与利润分析 |
 | v1.15 | 2026-08 | 移除旧数据库门面、金额统一整数分、账务审计追踪 |
 | v1.14 | 2026-08 | UI/Service 数据边界收口、自动对账、可回滚 SQLite 备份恢复 |

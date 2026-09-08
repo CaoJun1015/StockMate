@@ -1,6 +1,6 @@
 """Current (schema v4) SQLite schema."""
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 CURRENT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -207,12 +207,51 @@ CREATE TABLE IF NOT EXISTS shipment_snapshots (
     shipped_date TEXT NOT NULL,
     quantity INTEGER NOT NULL CHECK (quantity > 0),
     unit_sale_cents INTEGER NOT NULL,
-    unit_cost_cents INTEGER NOT NULL,
+    unit_cost_cents INTEGER,
     revenue_cents INTEGER NOT NULL,
     cost_cents INTEGER NOT NULL,
     ledger_entry_id INTEGER NOT NULL UNIQUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (quote_id) REFERENCES quotes(id),
+    FOREIGN KEY (ledger_entry_id) REFERENCES ledger_entries(id)
+);
+
+CREATE TABLE IF NOT EXISTS shipment_allocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shipment_snapshot_id INTEGER NOT NULL,
+    batch_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    unit_cost_cents INTEGER NOT NULL CHECK (unit_cost_cents >= 0),
+    cost_cents INTEGER NOT NULL CHECK (cost_cents >= 0),
+    sn_list TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (shipment_snapshot_id) REFERENCES shipment_snapshots(id),
+    FOREIGN KEY (batch_id) REFERENCES batches(id),
+    UNIQUE(shipment_snapshot_id, batch_id)
+);
+
+CREATE TABLE IF NOT EXISTS inventory_movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    movement_date TEXT NOT NULL,
+    movement_type TEXT NOT NULL CHECK (movement_type IN (
+        'purchase_receipt','sales_shipment','sales_return',
+        'purchase_return','migration_adjustment'
+    )),
+    product_id INTEGER NOT NULL,
+    batch_id INTEGER NOT NULL,
+    quantity_delta INTEGER NOT NULL CHECK (quantity_delta != 0),
+    unit_cost_cents INTEGER NOT NULL CHECK (unit_cost_cents >= 0),
+    total_cost_cents INTEGER NOT NULL CHECK (total_cost_cents >= 0),
+    source_type TEXT NOT NULL,
+    source_id TEXT,
+    shipment_allocation_id INTEGER,
+    ledger_entry_id INTEGER,
+    sn_list TEXT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (product_id) REFERENCES products(id),
+    FOREIGN KEY (batch_id) REFERENCES batches(id),
+    FOREIGN KEY (shipment_allocation_id) REFERENCES shipment_allocations(id),
     FOREIGN KEY (ledger_entry_id) REFERENCES ledger_entries(id)
 );
 
@@ -327,6 +366,16 @@ CREATE INDEX IF NOT EXISTS idx_logs_time ON operation_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_snapshot_date ON price_snapshots(import_date);
 CREATE INDEX IF NOT EXISTS idx_snapshot_items ON price_snapshot_items(snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_snapshot_normkey ON price_snapshot_items(norm_key);
+CREATE INDEX IF NOT EXISTS idx_shipment_alloc_snapshot
+    ON shipment_allocations(shipment_snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_shipment_alloc_batch
+    ON shipment_allocations(batch_id);
+CREATE INDEX IF NOT EXISTS idx_inventory_movement_batch_date
+    ON inventory_movements(batch_id, movement_date, id);
+CREATE INDEX IF NOT EXISTS idx_inventory_movement_source
+    ON inventory_movements(source_type, source_id);
+CREATE INDEX IF NOT EXISTS idx_inventory_movement_allocation
+    ON inventory_movements(shipment_allocation_id);
 
 INSERT OR IGNORE INTO finance_settings(id) VALUES (1);
 INSERT OR IGNORE INTO ledger_accounts(code,name,account_type,is_system) VALUES

@@ -5,6 +5,13 @@ from __future__ import annotations
 from uuid import uuid4
 
 from src.models.connection import transaction
+from src.models.inventory_repository import (
+    apply_inventory_delta,
+    insert_inventory_movement,
+    list_shipment_allocations,
+    normalize_sn_list,
+    returned_quantity_for_allocation,
+)
 from src.models.finance_repository import (
     add_supplier_payment_allocation,
     get_shipment_snapshot,
@@ -21,9 +28,7 @@ from src.models.repositories import (
     adjust_customer_balance,
     adjust_supplier_balance,
     audit,
-    decrement_batch_remaining,
     get_active_entity,
-    increment_batch_remaining,
     log_operation,
 )
 from src.services.exceptions import (
@@ -91,6 +96,7 @@ class ReturnService:
         reason: str,
         refund_account_id: int | None = None,
         cash_refund_cents: int = 0,
+        restock_allocations: list[dict] | None = None,
     ) -> int:
         self._validate_quantity(quantity)
         if not reason.strip():
@@ -116,7 +122,48 @@ class ReturnService:
                 )
 
             revenue_cents = snapshot["unit_sale_cents"] * quantity
-            cost_cents = snapshot["unit_cost_cents"] * quantity
+            shipment_allocations = list_shipment_allocations(conn, quote_id=quote_id)
+            if not shipment_allocations:
+                raise DataConflictError("出库缺少批次分配，无法确定退货成本")
+            if restock_allocations is None:
+                if len(shipment_allocations) != 1:
+                    raise ValidationError("跨批次出库退货必须选择原出库批次和数量")
+                restock_allocations = [{
+                    "shipment_allocation_id": shipment_allocations[0]["id"],
+                    "quantity": quantity,
+                    "sn_list": "",
+                }]
+            by_id = {row["id"]: row for row in shipment_allocations}
+            selected: list[dict] = []
+            seen: set[int] = set()
+            for item in restock_allocations:
+                try:
+                    allocation_id = int(item["shipment_allocation_id"])
+                    item_quantity = int(item["quantity"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValidationError("退货批次分配格式无效") from exc
+                if allocation_id in seen or allocation_id not in by_id:
+                    raise ValidationError("退货包含重复或不属于本订单的出库分配")
+                if item_quantity <= 0:
+                    raise ValidationError("退货批次数量必须大于 0")
+                original = by_id[allocation_id]
+                already_restocked = returned_quantity_for_allocation(conn, allocation_id)
+                if already_restocked + item_quantity > original["quantity"]:
+                    raise ValidationError("退回原批次的数量超过该批次净出库数量")
+                item_sns = normalize_sn_list(item.get("sn_list", ""))
+                if item_sns and len(item_sns) != item_quantity:
+                    raise ValidationError("退货SN数量必须等于对应批次退货数量")
+                original_sns = set(normalize_sn_list(original.get("sn_list", "")))
+                if item_sns and original_sns and not set(item_sns).issubset(original_sns):
+                    raise ValidationError("退货SN不属于所选原出库批次")
+                selected.append({**original, "return_quantity": item_quantity,
+                                 "return_sn_list": ",".join(item_sns)})
+                seen.add(allocation_id)
+            if sum(item["return_quantity"] for item in selected) != quantity:
+                raise ValidationError("各原出库批次退货数量合计必须等于本次退货数量")
+            cost_cents = sum(
+                item["unit_cost_cents"] * item["return_quantity"] for item in selected
+            )
             previous_return_revenue = return_totals["revenue_cents"]
             net_total_before = snapshot["revenue_cents"] - previous_return_revenue
             outstanding_before = max(
@@ -151,25 +198,25 @@ class ReturnService:
                 },
             ]
             if restock:
-                increment_batch_remaining(conn, quote["batch_id"], quantity)
-                lines.extend(
-                    [
+                for item in selected:
+                    if not apply_inventory_delta(
+                        conn, batch_id=item["batch_id"],
+                        quantity_delta=item["return_quantity"]
+                    ):
+                        raise DataConflictError("退货回库批次已删除")
+                    item_cost = item["unit_cost_cents"] * item["return_quantity"]
+                    lines.extend([
                         {
-                            "account_code": "INVENTORY",
-                            "debit_cents": cost_cents,
-                            "customer_id": customer_id,
-                            "quote_id": quote_id,
-                            "batch_id": quote["batch_id"],
+                            "account_code": "INVENTORY", "debit_cents": item_cost,
+                            "customer_id": customer_id, "quote_id": quote_id,
+                            "batch_id": item["batch_id"],
                         },
                         {
-                            "account_code": "COGS",
-                            "credit_cents": cost_cents,
-                            "customer_id": customer_id,
-                            "quote_id": quote_id,
-                            "batch_id": quote["batch_id"],
+                            "account_code": "COGS", "credit_cents": item_cost,
+                            "customer_id": customer_id, "quote_id": quote_id,
+                            "batch_id": item["batch_id"],
                         },
-                    ]
-                )
+                    ])
             if cash_refund_cents:
                 lines.extend(
                     [
@@ -211,6 +258,25 @@ class ReturnService:
                 ledger_entry_id=entry_id,
                 reason=reason,
             )
+            if restock:
+                for item in selected:
+                    insert_inventory_movement(
+                        conn,
+                        movement_date=return_date,
+                        movement_type="sales_return",
+                        product_id=item["product_id"],
+                        batch_id=item["batch_id"],
+                        quantity_delta=item["return_quantity"],
+                        unit_cost_cents=item["unit_cost_cents"],
+                        source_type="sales_return",
+                        source_id=return_id,
+                        shipment_allocation_id=item["id"],
+                        ledger_entry_id=entry_id,
+                        sn_list=item["return_sn_list"],
+                        idempotency_key=(
+                            f"sales-return:{return_id}:allocation:{item['id']}"
+                        ),
+                    )
             audit(
                 conn,
                 "sales_returns",
@@ -224,6 +290,15 @@ class ReturnService:
                     "restock": restock,
                     "cash_refund_cents": cash_refund_cents,
                     "account_name": account["name"] if account else None,
+                    "allocations": [
+                        {
+                            "shipment_allocation_id": item["id"],
+                            "batch_id": item["batch_id"],
+                            "quantity": item["return_quantity"],
+                            "sn_list": item["return_sn_list"],
+                        }
+                        for item in selected
+                    ],
                 },
                 reason=reason,
             )
@@ -263,7 +338,9 @@ class ReturnService:
                 if refund_account_id is None:
                     raise ValidationError("供应商退款必须选择资金账户")
                 LedgerPostingService.require_cash_account(conn, refund_account_id)
-            if not decrement_batch_remaining(conn, batch_id, quantity):
+            if not apply_inventory_delta(
+                conn, batch_id=batch_id, quantity_delta=-quantity
+            ):
                 raise InsufficientStockError("采购退货数量超过当前可用库存")
             self._unallocate_supplier_payments(conn, batch_id, amount_cents)
             adjust_supplier_balance(
@@ -322,6 +399,19 @@ class ReturnService:
                 account_id=refund_account_id,
                 ledger_entry_id=entry_id,
                 reason=reason,
+            )
+            insert_inventory_movement(
+                conn,
+                movement_date=return_date,
+                movement_type="purchase_return",
+                product_id=batch["product_id"],
+                batch_id=batch_id,
+                quantity_delta=-quantity,
+                unit_cost_cents=batch["purchase_price_cents"],
+                source_type="purchase_return",
+                source_id=return_id,
+                ledger_entry_id=entry_id,
+                idempotency_key=f"purchase-return:{return_id}:inventory",
             )
             audit(
                 conn,

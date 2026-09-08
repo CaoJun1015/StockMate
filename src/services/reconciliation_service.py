@@ -81,8 +81,8 @@ class ReconciliationService:
                 ReconciliationIssue(
                     "INVENTORY_BALANCE",
                     (
-                        f"批次 {row['id']} 库存不守恒：入库 {row['quantity']}，"
-                        f"剩余 {row['remaining']}，现存已出库 {row['shipped']}"
+                        f"批次 {row['id']} 库存不守恒：缓存剩余 {row['remaining']}，"
+                        f"流水余额 {row['movement_balance']}"
                     ),
                     "batches",
                     row["id"],
@@ -156,6 +156,10 @@ class ReconciliationService:
             )
 
         finance = collect_finance_reconciliation_snapshot(self.db_path)
+        subledger_matches_batches = (
+            finance["movement_inventory_cents"]
+            == finance["inventory"]["business_cents"]
+        )
         if not finance["enabled"]:
             for key in (
                 "unbalanced_entries",
@@ -165,6 +169,9 @@ class ReconciliationService:
                 "sales_returns",
                 "customer_allocations",
                 "supplier_allocations",
+                "shipment_allocations",
+                "inventory_movements",
+                "inventory_sns",
             ):
                 finance[key] = []
             finance["inventory"] = {"business_cents": 0, "ledger_cents": 0}
@@ -203,11 +210,21 @@ class ReconciliationService:
                     "库存业务金额与账本库存金额不一致",
                 )
             )
+        if not subledger_matches_batches:
+            issues.append(
+                ReconciliationIssue(
+                    "INVENTORY_SUBLEDGER",
+                    "库存流水成本余额与批次库存金额不一致",
+                )
+            )
         for key, code, entity in (
             ("shipment_snapshots", "SHIPMENT_SNAPSHOT", "quotes"),
             ("sales_returns", "RETURN_QUANTITY", "quotes"),
             ("customer_allocations", "CUSTOMER_ADVANCE", "payments"),
             ("supplier_allocations", "SUPPLIER_ADVANCE", "payments"),
+            ("shipment_allocations", "SHIPMENT_ALLOCATION", "shipment_snapshots"),
+            ("inventory_movements", "INVENTORY_MOVEMENT", "batches"),
+            ("inventory_sns", "INVENTORY_SN", "shipment_allocations"),
         ):
             for row in finance[key]:
                 entity_id = row.get("id", row.get("quote_id"))

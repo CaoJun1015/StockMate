@@ -75,6 +75,16 @@ IMPORT_COLUMNS = {
         "unit_cost_cents", "revenue_cents", "cost_cents", "ledger_entry_id",
         "created_at",
     ),
+    "shipment_allocations": (
+        "shipment_snapshot_id", "batch_id", "quantity", "unit_cost_cents",
+        "cost_cents", "sn_list", "created_at",
+    ),
+    "inventory_movements": (
+        "movement_date", "movement_type", "product_id", "batch_id",
+        "quantity_delta", "unit_cost_cents", "total_cost_cents",
+        "source_type", "source_id", "shipment_allocation_id",
+        "ledger_entry_id", "sn_list", "idempotency_key", "created_at",
+    ),
     "supplier_payment_allocations": (
         "payment_id", "batch_id", "amount_cents", "created_at",
     ),
@@ -359,30 +369,6 @@ def insert_batch(
         ),
     )
     return int(cursor.lastrowid)
-
-
-def decrement_batch_remaining(
-    conn: sqlite3.Connection,
-    batch_id: int,
-    quantity: int,
-) -> bool:
-    cursor = conn.execute(
-        "UPDATE batches SET remaining=remaining-? "
-        "WHERE id=? AND deleted_at IS NULL AND remaining>=?",
-        (quantity, batch_id, quantity),
-    )
-    return cursor.rowcount == 1
-
-
-def increment_batch_remaining(
-    conn: sqlite3.Connection,
-    batch_id: int,
-    quantity: int,
-) -> None:
-    conn.execute(
-        "UPDATE batches SET remaining=remaining+? WHERE id=?",
-        (quantity, batch_id),
-    )
 
 
 def list_fifo_receivable_quotes(

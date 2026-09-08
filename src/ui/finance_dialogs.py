@@ -432,7 +432,8 @@ class AdjustmentDialog(QDialog):
 
 
 class ReturnDialog(QDialog):
-    def __init__(self, title: str, parent=None, *, max_quantity=1, db_path=None, allow_restock=False):
+    def __init__(self, title: str, parent=None, *, max_quantity=1, db_path=None,
+                 allow_restock=False, allocations=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         layout = QFormLayout(self)
@@ -458,6 +459,34 @@ class ReturnDialog(QDialog):
         layout.addRow("实际退款：", self.refund_spin)
         layout.addRow("退款账户：", self.account_combo)
         layout.addRow("原因：", self.reason_edit)
+        self.allocation_rows = []
+        if allocations:
+            self.auto_sn_edit = QLineEdit()
+            self.auto_sn_edit.setPlaceholderText("输入退货SN可自动定位原出库批次；未知SN再手工选择")
+            self.auto_sn_edit.editingFinished.connect(self._match_return_sns)
+            layout.addRow("退货SN自动匹配：", self.auto_sn_edit)
+            self.allocation_table = QTableWidget(len(allocations), 5)
+            self.allocation_table.setHorizontalHeaderLabels(
+                ["原批次", "原出库", "已回库", "本次数量", "退货SN"]
+            )
+            self.allocation_table.horizontalHeader().setStretchLastSection(True)
+            for row, allocation in enumerate(allocations):
+                for col, value in enumerate((
+                    f"#{allocation['batch_id']}", allocation["quantity"],
+                    allocation.get("returned_quantity", 0),
+                )):
+                    self.allocation_table.setItem(row, col, QTableWidgetItem(str(value)))
+                spin = QSpinBox()
+                available = max(
+                    allocation["quantity"] - allocation.get("returned_quantity", 0), 0
+                )
+                spin.setRange(0, available)
+                sn_edit = QLineEdit()
+                sn_edit.setPlaceholderText("可留空；逗号/空格分隔")
+                self.allocation_table.setCellWidget(row, 3, spin)
+                self.allocation_table.setCellWidget(row, 4, sn_edit)
+                self.allocation_rows.append((allocation, spin, sn_edit))
+            layout.addRow("原出库分配：", self.allocation_table)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
@@ -473,8 +502,51 @@ class ReturnDialog(QDialog):
         if not self.reason_edit.text().strip():
             QMessageBox.warning(self, "提示", "必须填写退货原因")
             return
+        if self.allocation_rows:
+            selected = self._return_allocations()
+            if sum(item["quantity"] for item in selected) != self.quantity_spin.value():
+                QMessageBox.warning(self, "提示", "原出库批次分配合计必须等于退货数量")
+                return
+            for item in selected:
+                sns = [value for value in item["sn_list"].replace(" ", ",").split(",") if value]
+                if sns and len(sns) != item["quantity"]:
+                    QMessageBox.warning(self, "提示", "填写SN后数量必须与对应批次退货数量一致")
+                    return
         _remember_account(self.account_combo)
         self.accept()
+
+    def _match_return_sns(self):
+        if not self.allocation_rows:
+            return
+        raw = self.auto_sn_edit.text().strip().replace(" ", ",").replace("\n", ",")
+        sns = [value.strip() for value in raw.split(",") if value.strip()]
+        if not sns:
+            return
+        matched: dict[int, list[str]] = {}
+        unknown = []
+        for sn in sns:
+            target = next(
+                (
+                    allocation for allocation, _, _ in self.allocation_rows
+                    if sn in [value.strip() for value in
+                              (allocation.get("sn_list", "") or "").split(",")]
+                ),
+                None,
+            )
+            if target is None:
+                unknown.append(sn)
+            else:
+                matched.setdefault(target["id"], []).append(sn)
+        for allocation, spin, sn_edit in self.allocation_rows:
+            values = matched.get(allocation["id"], [])
+            if values:
+                spin.setValue(len(values))
+                sn_edit.setText(",".join(values))
+        if unknown:
+            QMessageBox.information(
+                self, "SN未完全匹配",
+                "以下SN没有完整历史来源，请手工选择原批次：\n" + "、".join(unknown[:10]),
+            )
 
     def get_data(self):
         return {
@@ -484,4 +556,19 @@ class ReturnDialog(QDialog):
             "refund": self.refund_spin.value(),
             "account_id": self.account_combo.currentData(),
             "reason": self.reason_edit.text().strip(),
+            "restock_allocations": self._return_allocations(),
         }
+
+    def _return_allocations(self):
+        result = []
+        for allocation, spin, sn_edit in self.allocation_rows:
+            quantity = spin.value()
+            if quantity:
+                raw = sn_edit.text().strip().replace(" ", ",")
+                sns = [value.strip() for value in raw.split(",") if value.strip()]
+                result.append({
+                    "shipment_allocation_id": allocation["id"],
+                    "quantity": quantity,
+                    "sn_list": ",".join(sns),
+                })
+        return result

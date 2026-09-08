@@ -283,8 +283,11 @@ def finance_setup_control_totals(conn: sqlite3.Connection) -> dict[str, int]:
            FROM ledger_lines l
            JOIN ledger_accounts a ON a.id=l.account_id
            WHERE a.code='AP') AS supplier_ledger_cents,
-          (SELECT COALESCE(SUM(remaining*purchase_price_cents),0)
-           FROM batches WHERE deleted_at IS NULL)
+          (SELECT COALESCE(SUM(
+               (SELECT COALESCE(SUM(im.quantity_delta),0)
+                FROM inventory_movements im WHERE im.batch_id=b.id)
+               * b.purchase_price_cents
+           ),0) FROM batches b WHERE b.deleted_at IS NULL)
               AS inventory_expected_cents,
           (SELECT COALESCE(SUM(l.debit_cents-l.credit_cents),0)
            FROM ledger_lines l
@@ -635,7 +638,8 @@ def insert_shipment_snapshot(
     shipped_date: str,
     quantity: int,
     unit_sale_cents: int,
-    unit_cost_cents: int,
+    unit_cost_cents: int | None,
+    cost_cents: int | None = None,
     ledger_entry_id: int,
 ) -> int:
     cursor = conn.execute(
@@ -649,7 +653,7 @@ def insert_shipment_snapshot(
             unit_sale_cents,
             unit_cost_cents,
             unit_sale_cents * quantity,
-            unit_cost_cents * quantity,
+            cost_cents if cost_cents is not None else unit_cost_cents * quantity,
             ledger_entry_id,
         ),
     )

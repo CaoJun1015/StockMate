@@ -129,7 +129,7 @@ def test_fresh_database_is_schema_v4_without_real_money_columns(tmp_path):
     assert migrate_database(path) is None
     conn = connect(path, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
         assert "purchase_price" not in _columns(conn, "batches")
         assert {"quote_price", "received_amount"}.isdisjoint(_columns(conn, "quotes"))
         assert "amount" not in _columns(conn, "payments")
@@ -144,10 +144,10 @@ def test_v2_migration_drops_real_columns_and_creates_hashed_backup(tmp_path):
     _make_v2(path)
     backup = migrate_database(path)
     assert backup and backup.path.exists() and len(backup.sha256) == 64
-    assert backup.path.name.startswith("pre_migration_v1.16_")
+    assert backup.path.name.startswith("pre_migration_v1.17_")
     conn = connect(path, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert "purchase_price" not in _columns(conn, "batches")
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert not conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -178,11 +178,11 @@ def test_version_zero_database_runs_v2_v3_and_v4_chain(tmp_path):
     migrate_database(path)
     conn = connect(path, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         versions = {
             row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
         }
-        assert {1, 2, 3, 4}.issubset(versions)
+        assert {1, 2, 3, 4, 5}.issubset(versions)
     finally:
         conn.close()
 
@@ -206,7 +206,7 @@ def test_restoring_v2_backup_upgrades_it_to_v4(tmp_path):
     restore_database(backup, target)
     conn = connect(target, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert "amount" not in _columns(conn, "payments")
     finally:
         conn.close()
@@ -313,7 +313,7 @@ def test_v115_json_is_cents_only_and_roundtrips(tmp_path):
     exported = tmp_path / "backup.json"
     export_all_to_json(exported, source)
     document = json.loads(exported.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 4
+    assert document["schema_version"] == 5
     assert document["money_unit"] == "cents"
     assert "amount" not in document["data"]["payments"][0]
     assert "quote_price" not in document["data"]["quotes"][0]

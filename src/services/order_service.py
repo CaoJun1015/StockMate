@@ -7,7 +7,6 @@ from src.models.repositories import (
     audit,
     get_active_entity,
     get_quote,
-    increment_batch_remaining,
     insert_quote,
     log_operation,
     set_quote_status,
@@ -157,15 +156,7 @@ class OrderService:
                 )
             if new_status not in VALID_TRANSITIONS.get(old_status, set()):
                 raise InvalidTransitionError(f"不允许从「{old_status}」变更为「{new_status}」")
-            if old_status == "已出库" and new_status == "已取消":
-                increment_batch_remaining(
-                    conn,
-                    quote["batch_id"],
-                    quote["quote_quantity"],
-                )
-                set_quote_status(conn, quote_id, new_status, sn_list="")
-            else:
-                set_quote_status(conn, quote_id, new_status)
+            set_quote_status(conn, quote_id, new_status)
             audit(
                 conn,
                 "quotes",

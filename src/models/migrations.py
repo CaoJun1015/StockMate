@@ -316,6 +316,189 @@ def _verify_v4_schema(conn: sqlite3.Connection) -> None:
         raise DatabaseMigrationError("schema v4 system ledger accounts are incomplete")
 
 
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    """Add the inventory subledger and reconstruct all explainable history."""
+    # Make the legacy unit-cost cache nullable. Mixed-cost shipments use the
+    # exact aggregate cost plus allocation rows instead of a rounded unit cost.
+    if _table_exists(conn, "shipment_snapshots"):
+        unit_column = next(
+            row for row in conn.execute("PRAGMA table_info(shipment_snapshots)")
+            if row[1] == "unit_cost_cents"
+        )
+        if unit_column[3]:
+            conn.execute("""
+                CREATE TABLE shipment_snapshots_v5 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    quote_id INTEGER NOT NULL UNIQUE,
+                    shipped_date TEXT NOT NULL,
+                    quantity INTEGER NOT NULL CHECK (quantity > 0),
+                    unit_sale_cents INTEGER NOT NULL,
+                    unit_cost_cents INTEGER,
+                    revenue_cents INTEGER NOT NULL,
+                    cost_cents INTEGER NOT NULL,
+                    ledger_entry_id INTEGER NOT NULL UNIQUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (quote_id) REFERENCES quotes(id),
+                    FOREIGN KEY (ledger_entry_id) REFERENCES ledger_entries(id)
+                )
+            """)
+            conn.execute("""
+                INSERT INTO shipment_snapshots_v5
+                SELECT id,quote_id,shipped_date,quantity,unit_sale_cents,
+                       unit_cost_cents,revenue_cents,cost_cents,ledger_entry_id,created_at
+                FROM shipment_snapshots
+            """)
+            conn.execute("DROP TABLE shipment_snapshots")
+            conn.execute("ALTER TABLE shipment_snapshots_v5 RENAME TO shipment_snapshots")
+
+    _execute_current_schema(conn)
+
+    # Every batch starts with one immutable receipt movement.
+    for batch in conn.execute("SELECT * FROM batches ORDER BY id").fetchall():
+        ledger = conn.execute(
+            """SELECT id FROM ledger_entries
+               WHERE event_type='inventory_receipt' AND source_type='batch'
+                 AND source_id=CAST(? AS TEXT) ORDER BY id LIMIT 1""",
+            (batch["id"],),
+        ).fetchone()
+        conn.execute(
+            """INSERT OR IGNORE INTO inventory_movements(
+                movement_date,movement_type,product_id,batch_id,quantity_delta,
+                unit_cost_cents,total_cost_cents,source_type,source_id,
+                ledger_entry_id,sn_list,idempotency_key
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                batch["date"], "purchase_receipt", batch["product_id"], batch["id"],
+                batch["quantity"], batch["purchase_price_cents"],
+                batch["quantity"] * batch["purchase_price_cents"], "batch",
+                str(batch["id"]), ledger["id"] if ledger else None,
+                batch["sn_list"] or "", f"batch:{batch['id']}:receipt",
+            ),
+        )
+
+    # v4 supports one snapshot per quote and historically one batch per quote.
+    for snapshot in conn.execute(
+        """SELECT ss.*,q.batch_id,q.sn_list,b.product_id,b.purchase_price_cents
+           FROM shipment_snapshots ss
+           JOIN quotes q ON q.id=ss.quote_id
+           JOIN batches b ON b.id=q.batch_id ORDER BY ss.id"""
+    ).fetchall():
+        allocation = conn.execute(
+            "SELECT id FROM shipment_allocations WHERE shipment_snapshot_id=? AND batch_id=?",
+            (snapshot["id"], snapshot["batch_id"]),
+        ).fetchone()
+        if allocation is None:
+            allocation_id = conn.execute(
+                """INSERT INTO shipment_allocations(
+                    shipment_snapshot_id,batch_id,quantity,unit_cost_cents,cost_cents,sn_list
+                ) VALUES (?,?,?,?,?,?)""",
+                (
+                    snapshot["id"], snapshot["batch_id"], snapshot["quantity"],
+                    snapshot["purchase_price_cents"], snapshot["cost_cents"],
+                    snapshot["sn_list"] or "",
+                ),
+            ).lastrowid
+        else:
+            allocation_id = allocation["id"]
+        conn.execute(
+            """INSERT OR IGNORE INTO inventory_movements(
+                movement_date,movement_type,product_id,batch_id,quantity_delta,
+                unit_cost_cents,total_cost_cents,source_type,source_id,
+                shipment_allocation_id,ledger_entry_id,sn_list,idempotency_key
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                snapshot["shipped_date"], "sales_shipment", snapshot["product_id"],
+                snapshot["batch_id"], -snapshot["quantity"],
+                snapshot["purchase_price_cents"], snapshot["cost_cents"], "quote",
+                str(snapshot["quote_id"]), allocation_id, snapshot["ledger_entry_id"],
+                snapshot["sn_list"] or "", f"shipment-allocation:{allocation_id}",
+            ),
+        )
+
+    for record in conn.execute(
+        """SELECT sr.*,q.batch_id,b.product_id,b.purchase_price_cents,sa.id allocation_id
+           FROM sales_returns sr JOIN quotes q ON q.id=sr.quote_id
+           JOIN batches b ON b.id=q.batch_id
+           LEFT JOIN shipment_snapshots ss ON ss.quote_id=q.id
+           LEFT JOIN shipment_allocations sa
+             ON sa.shipment_snapshot_id=ss.id AND sa.batch_id=q.batch_id
+           WHERE sr.restock_quantity>0 ORDER BY sr.id"""
+    ).fetchall():
+        conn.execute(
+            """INSERT OR IGNORE INTO inventory_movements(
+                movement_date,movement_type,product_id,batch_id,quantity_delta,
+                unit_cost_cents,total_cost_cents,source_type,source_id,
+                shipment_allocation_id,ledger_entry_id,sn_list,idempotency_key
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                record["return_date"], "sales_return", record["product_id"],
+                record["batch_id"], record["restock_quantity"],
+                record["purchase_price_cents"],
+                record["restock_quantity"] * record["purchase_price_cents"],
+                "sales_return", str(record["id"]), record["allocation_id"],
+                record["ledger_entry_id"], "", f"sales-return:{record['id']}:batch:{record['batch_id']}",
+            ),
+        )
+
+    for record in conn.execute(
+        """SELECT pr.*,b.product_id,b.purchase_price_cents
+           FROM purchase_returns pr JOIN batches b ON b.id=pr.batch_id ORDER BY pr.id"""
+    ).fetchall():
+        conn.execute(
+            """INSERT OR IGNORE INTO inventory_movements(
+                movement_date,movement_type,product_id,batch_id,quantity_delta,
+                unit_cost_cents,total_cost_cents,source_type,source_id,
+                ledger_entry_id,sn_list,idempotency_key
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                record["return_date"], "purchase_return", record["product_id"],
+                record["batch_id"], -record["quantity"], record["purchase_price_cents"],
+                record["amount_cents"], "purchase_return", str(record["id"]),
+                record["ledger_entry_id"], "", f"purchase-return:{record['id']}:inventory",
+            ),
+        )
+
+    # Preserve unexplained legacy stock as an explicit, non-GL migration event.
+    for batch in conn.execute("SELECT * FROM batches ORDER BY id").fetchall():
+        calculated = int(conn.execute(
+            "SELECT COALESCE(SUM(quantity_delta),0) FROM inventory_movements WHERE batch_id=?",
+            (batch["id"],),
+        ).fetchone()[0])
+        delta = batch["remaining"] - calculated
+        if delta:
+            conn.execute(
+                """INSERT INTO inventory_movements(
+                    movement_date,movement_type,product_id,batch_id,quantity_delta,
+                    unit_cost_cents,total_cost_cents,source_type,source_id,
+                    sn_list,idempotency_key
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    batch["date"], "migration_adjustment", batch["product_id"],
+                    batch["id"], delta, batch["purchase_price_cents"],
+                    abs(delta) * batch["purchase_price_cents"], "migration_v5",
+                    str(batch["id"]), "", f"migration-v5:batch:{batch['id']}:gap",
+                ),
+            )
+
+
+def _verify_v5_schema(conn: sqlite3.Connection) -> None:
+    _verify_v4_schema(conn)
+    for table in ("shipment_allocations", "inventory_movements"):
+        if not _table_exists(conn, table):
+            raise DatabaseMigrationError(f"schema v5 missing table: {table}")
+    mismatches = conn.execute(
+        """SELECT b.id,b.remaining,COALESCE(SUM(im.quantity_delta),0) movement_balance
+           FROM batches b LEFT JOIN inventory_movements im ON im.batch_id=b.id
+           GROUP BY b.id HAVING b.remaining!=movement_balance LIMIT 10"""
+    ).fetchall()
+    if mismatches:
+        detail = ", ".join(
+            f"batch#{row['id']}={row['remaining']}/{row['movement_balance']}"
+            for row in mismatches
+        )
+        raise DatabaseMigrationError("库存流水回建后不守恒: " + detail)
+
+
 def _migration_snapshot(conn: sqlite3.Connection) -> dict[str, int]:
     snapshot = {
         f"count:{table}": int(
@@ -353,7 +536,7 @@ def _verify_database(
     conn: sqlite3.Connection,
     backup: BackupInfo | None,
 ) -> None:
-    _verify_v4_schema(conn)
+    _verify_v5_schema(conn)
     check = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if check != "ok":
         raise DatabaseMigrationError(f"迁移后完整性检查失败: {check}", backup)
@@ -495,7 +678,7 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
             _execute_current_schema(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (?,?)",
-                (SCHEMA_VERSION, "fresh_schema_v4"),
+                (SCHEMA_VERSION, "fresh_schema_v5"),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _verify_database(conn, None)
@@ -505,7 +688,7 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
         if version < SCHEMA_VERSION:
             before = _migration_snapshot(conn)
             conn.close()
-            backup = create_backup(path, prefix="pre_migration_v1.16", retain=False)
+            backup = create_backup(path, prefix="pre_migration_v1.17", retain=False)
             conn = connect(path)
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
@@ -547,7 +730,13 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
                     "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (4,?)",
                     ("operating_finance_ledger",),
                 )
-            conn.execute("PRAGMA user_version=4")
+            if version < 5:
+                _migrate_v4_to_v5(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (5,?)",
+                    ("inventory_subledger_allocations",),
+                )
+            conn.execute("PRAGMA user_version=5")
             after = _migration_snapshot(conn)
             changed = {
                 key: (value, after.get(key))

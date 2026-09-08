@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPushButton, QLabel,
     QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QGroupBox,
     QMessageBox, QApplication, QAbstractItemView,
-    QCheckBox,
+    QCheckBox, QDialog,
 )
 from PyQt6.QtCore import Qt
 
@@ -17,6 +17,7 @@ from src.models.queries import (
     list_batches,
     list_customers,
     list_suppliers,
+    list_inventory_movements,
 )
 from src.utils.money import format_yuan, yuan_to_cents
 from src.services.exceptions import ServiceError
@@ -76,9 +77,13 @@ class QuotePanel(QWidget):
         self.refresh_batch_btn = QPushButton("刷新")
         self.refresh_batch_btn.setObjectName("ghostBtn")
         self.refresh_batch_btn.clicked.connect(self.refresh)
+        self.movement_btn = QPushButton("库存流水")
+        self.movement_btn.setObjectName("ghostBtn")
+        self.movement_btn.clicked.connect(self.on_view_movements)
         btn_row1.addWidget(self.add_batch_btn)
         btn_row1.addWidget(self.del_batch_btn)
         btn_row1.addWidget(self.return_batch_btn)
+        btn_row1.addWidget(self.movement_btn)
         btn_row1.addWidget(self.refresh_batch_btn)
         btn_row1.addStretch()
         layout.addLayout(btn_row1)
@@ -291,6 +296,44 @@ class QuotePanel(QWidget):
                 QMessageBox.warning(self, "删除失败", str(exc))
                 return
             self.refresh()
+
+    def on_view_movements(self):
+        row = self.batch_table.currentRow()
+        item = self.batch_table.item(row, 0) if row >= 0 else None
+        if not item:
+            QMessageBox.warning(self, "提示", "请先选择库存批次")
+            return
+        batch_id = item.data(Qt.ItemDataRole.UserRole)
+        movements = list_inventory_movements(batch_id)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"批次#{batch_id} 库存流水")
+        dialog.resize(860, 420)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(movements), 7)
+        table.setHorizontalHeaderLabels(
+            ["日期", "类型", "数量变化", "单位成本", "总成本", "来源", "SN"]
+        )
+        labels = {
+            "purchase_receipt": "采购入库", "sales_shipment": "销售出库",
+            "sales_return": "销售退货", "purchase_return": "采购退货",
+            "migration_adjustment": "历史迁移调整",
+        }
+        for r, movement in enumerate(movements):
+            values = (
+                movement["movement_date"], labels.get(movement["movement_type"], movement["movement_type"]),
+                movement["quantity_delta"], format_yuan(movement["unit_cost_cents"]),
+                format_yuan(movement["total_cost_cents"]),
+                f"{movement['source_type']}#{movement.get('source_id') or ''}",
+                movement.get("sn_list", ""),
+            )
+            for col, value in enumerate(values):
+                table.setItem(r, col, QTableWidgetItem(str(value)))
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+        close = QPushButton("关闭")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
 
     def on_quote_and_copy(self):
         """报价并复制文本到剪贴板"""

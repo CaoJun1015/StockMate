@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 from src.models.connection import connect
+from src.models.inventory_repository import duplicate_active_shipped_sns
 
 
 def get_finance_setup_state(db_path=None) -> dict:
@@ -21,8 +22,10 @@ def get_finance_setup_state(db_path=None) -> dict:
         ).fetchone()
         inventory = conn.execute(
             "SELECT COUNT(*) AS count,"
-            "COALESCE(SUM(remaining*purchase_price_cents),0) AS cents "
-            "FROM batches WHERE deleted_at IS NULL AND remaining>0"
+            "COALESCE(SUM((SELECT COALESCE(SUM(im.quantity_delta),0) "
+            "FROM inventory_movements im WHERE im.batch_id=b.id) "
+            "*b.purchase_price_cents),0) AS cents "
+            "FROM batches b WHERE b.deleted_at IS NULL"
         ).fetchone()
         supplier = conn.execute(
             "SELECT COALESCE(SUM(balance_cents),0) AS cents "
@@ -670,6 +673,72 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
                 ),0) AS ledger_cents
             """
         ).fetchone()
+        movement_inventory_cents = int(conn.execute(
+            """SELECT COALESCE(SUM(im.quantity_delta*im.unit_cost_cents),0)
+               FROM inventory_movements im JOIN batches b ON b.id=im.batch_id
+               WHERE b.deleted_at IS NULL"""
+        ).fetchone()[0])
+        allocation_issues = [dict(row) for row in conn.execute(
+            """
+            SELECT ss.id,ss.quantity,ss.cost_cents,
+                   COALESCE(SUM(sa.quantity),0) allocated_quantity,
+                   COALESCE(SUM(sa.cost_cents),0) allocated_cost,
+                   COALESCE((
+                       SELECT SUM(l.debit_cents-l.credit_cents)
+                       FROM ledger_lines l
+                       WHERE l.entry_id=ss.ledger_entry_id
+                         AND l.account_id=(
+                             SELECT id FROM ledger_accounts WHERE code='COGS'
+                         )
+                   ),0) shipment_ledger_cost
+            FROM shipment_snapshots ss
+            LEFT JOIN shipment_allocations sa ON sa.shipment_snapshot_id=ss.id
+            GROUP BY ss.id
+            HAVING ss.quantity!=allocated_quantity OR ss.cost_cents!=allocated_cost
+                OR ss.cost_cents!=shipment_ledger_cost
+            """
+        ).fetchall()]
+        movement_issues = [dict(row) for row in conn.execute(
+            """
+            SELECT b.id,b.remaining,COALESCE(SUM(im.quantity_delta),0) movement_balance
+            FROM batches b LEFT JOIN inventory_movements im ON im.batch_id=b.id
+            GROUP BY b.id HAVING b.remaining!=movement_balance
+            UNION ALL
+            SELECT sa.batch_id,NULL,NULL FROM shipment_allocations sa
+            JOIN shipment_snapshots ss ON ss.id=sa.shipment_snapshot_id
+            JOIN quotes q ON q.id=ss.quote_id
+            JOIN batches qb ON qb.id=q.batch_id
+            JOIN batches ab ON ab.id=sa.batch_id
+            WHERE qb.product_id!=ab.product_id
+            UNION ALL
+            SELECT sa.batch_id,NULL,NULL FROM shipment_allocations sa
+            WHERE NOT EXISTS(
+                SELECT 1 FROM inventory_movements im
+                WHERE im.shipment_allocation_id=sa.id
+                  AND im.movement_type='sales_shipment'
+            )
+            UNION ALL
+            SELECT sa.batch_id,NULL,NULL FROM shipment_allocations sa
+            WHERE COALESCE((
+                SELECT SUM(im.quantity_delta) FROM inventory_movements im
+                WHERE im.shipment_allocation_id=sa.id
+                  AND im.movement_type='sales_return'
+            ),0)>sa.quantity
+            UNION ALL
+            SELECT q.batch_id,NULL,NULL FROM sales_returns sr
+            JOIN quotes q ON q.id=sr.quote_id
+            WHERE sr.restock_quantity>COALESCE((
+                SELECT SUM(im.quantity_delta) FROM inventory_movements im
+                WHERE im.source_type='sales_return'
+                  AND im.source_id=CAST(sr.id AS TEXT)
+                  AND im.movement_type='sales_return'
+            ),0)
+            """
+        ).fetchall()]
+        sn_issues = [
+            {"id": None, "sn_list": sn}
+            for sn in duplicate_active_shipped_sns(conn)
+        ]
         shipment_issues = [
             dict(row)
             for row in conn.execute(
@@ -746,10 +815,14 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
             "customer_balances": customer_balances,
             "supplier_balances": supplier_balances,
             "inventory": dict(inventory),
+            "movement_inventory_cents": movement_inventory_cents,
             "shipment_snapshots": shipment_issues,
             "sales_returns": sales_return_issues,
             "customer_allocations": customer_allocations,
             "supplier_allocations": supplier_allocations,
+            "shipment_allocations": allocation_issues,
+            "inventory_movements": movement_issues,
+            "inventory_sns": sn_issues,
         }
     finally:
         conn.close()

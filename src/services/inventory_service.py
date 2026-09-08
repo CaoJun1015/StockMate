@@ -5,6 +5,14 @@ from __future__ import annotations
 from datetime import date
 
 from src.models.connection import transaction
+from src.models.inventory_repository import (
+    apply_inventory_delta,
+    insert_inventory_movement,
+    insert_shipment_allocation,
+    normalize_sn_list,
+    serialize_sn_list,
+    shipped_sns,
+)
 from src.models.finance_repository import (
     add_supplier_payment_allocation,
     customer_payment_allocated_cents,
@@ -18,7 +26,6 @@ from src.models.repositories import (
     add_quote_received_amount,
     adjust_supplier_balance,
     audit,
-    decrement_batch_remaining,
     get_active_entity,
     insert_batch,
     insert_payment,
@@ -174,7 +181,7 @@ class InventoryService:
                         "batch_id": batch_id,
                     },
                 ]
-            LedgerPostingService.post(
+            purchase_entry_id = LedgerPostingService.post(
                 conn,
                 entry_date=date,
                 event_type="inventory_receipt",
@@ -183,6 +190,20 @@ class InventoryService:
                 idempotency_key=f"batch:{batch_id}:receive",
                 lines=purchase_lines,
                 remark=remark,
+            )
+            insert_inventory_movement(
+                conn,
+                movement_date=date,
+                movement_type="purchase_receipt",
+                product_id=product_id,
+                batch_id=batch_id,
+                quantity_delta=quantity,
+                unit_cost_cents=purchase_price_cents,
+                source_type="batch",
+                source_id=batch_id,
+                ledger_entry_id=purchase_entry_id,
+                sn_list=sn_list,
+                idempotency_key=f"batch:{batch_id}:receipt",
             )
 
             advance_applied = 0
@@ -262,7 +283,10 @@ class InventoryService:
         quote_id: int,
         sn_list: str = "",
         shipped_date: str | None = None,
-    ) -> None:
+        *,
+        allocations: list[dict] | None = None,
+        remark: str = "",
+    ) -> dict:
         shipped_date = shipped_date or date.today().isoformat()
         with transaction(self.db_path) as conn:
             LedgerPostingService.require_enabled(conn, shipped_date)
@@ -273,19 +297,101 @@ class InventoryService:
                 raise InvalidTransitionError(
                     f"当前状态“{quote['status']}”不允许出库"
                 )
-            batch = get_active_entity(conn, "batches", quote["batch_id"])
-            if not batch or batch["remaining"] < quote["quote_quantity"]:
-                raise InsufficientStockError("库存不足，无法出库")
-            if not decrement_batch_remaining(
-                conn, quote["batch_id"], quote["quote_quantity"]
-            ):
-                raise InsufficientStockError("库存不足，无法出库")
-
             quantity = quote["quote_quantity"]
+            anchor_batch = get_active_entity(conn, "batches", quote["batch_id"])
+            if not anchor_batch:
+                raise NotFoundError("报价关联批次不存在或已删除")
+            if allocations is None:
+                allocations = [{
+                    "batch_id": quote["batch_id"],
+                    "quantity": quantity,
+                    "sn_list": sn_list,
+                }]
+            if not allocations:
+                raise ValidationError("必须至少选择一个出库批次")
+
+            normalized: list[dict] = []
+            seen_batches: set[int] = set()
+            request_sns: set[str] = set()
+            warning_sns: list[str] = []
+            existing_sns = shipped_sns(conn)
+            for item in allocations:
+                try:
+                    batch_id = int(item["batch_id"])
+                    allocated_quantity = int(item["quantity"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValidationError("出库批次和数量格式无效") from exc
+                if batch_id in seen_batches:
+                    raise ValidationError("同一批次不能重复分配")
+                if allocated_quantity <= 0:
+                    raise ValidationError("批次出库数量必须大于 0")
+                batch = get_active_entity(conn, "batches", batch_id)
+                if not batch:
+                    raise NotFoundError(f"批次#{batch_id}不存在或已删除")
+                if batch["product_id"] != anchor_batch["product_id"]:
+                    raise ValidationError("不能跨机型分配出库批次")
+                item_sns = normalize_sn_list(item.get("sn_list", ""))
+                if item_sns and len(item_sns) != allocated_quantity:
+                    raise ValidationError(
+                        f"批次#{batch_id}填写SN后，SN数量必须等于出库数量"
+                    )
+                if len(set(item_sns)) != len(item_sns):
+                    raise ValidationError(f"批次#{batch_id}存在重复SN")
+                duplicates = (set(item_sns) & request_sns) | (set(item_sns) & existing_sns)
+                if duplicates:
+                    raise ValidationError(f"SN已出库或重复：{sorted(duplicates)[0]}")
+                batch_sns = set(normalize_sn_list(batch.get("sn_list", "")))
+                complete_batch_sns = len(batch_sns) == batch["quantity"]
+                unknown = set(item_sns) - batch_sns
+                if complete_batch_sns and unknown:
+                    raise ValidationError(
+                        f"SN {sorted(unknown)[0]} 不属于完整SN批次#{batch_id}"
+                    )
+                if unknown:
+                    warning_sns.extend(sorted(unknown))
+                request_sns.update(item_sns)
+                seen_batches.add(batch_id)
+                normalized.append({
+                    "batch": batch,
+                    "batch_id": batch_id,
+                    "quantity": allocated_quantity,
+                    "sn_list": serialize_sn_list(item_sns),
+                })
+            if sum(item["quantity"] for item in normalized) != quantity:
+                raise ValidationError("各批次出库数量合计必须等于报价数量")
+            for item in normalized:
+                if not apply_inventory_delta(
+                    conn, batch_id=item["batch_id"], quantity_delta=-item["quantity"]
+                ):
+                    raise InsufficientStockError(
+                        f"批次#{item['batch_id']}库存不足，无法出库"
+                    )
+
             revenue_cents = quote["quote_price_cents"] * quantity
-            cost_cents = batch["purchase_price_cents"] * quantity
+            cost_cents = sum(
+                item["batch"]["purchase_price_cents"] * item["quantity"]
+                for item in normalized
+            )
             customer_id = quote["customer_id"]
-            set_quote_status(conn, quote_id, "已出库", sn_list=sn_list)
+            combined_sns = serialize_sn_list(
+                [sn for item in normalized for sn in normalize_sn_list(item["sn_list"])]
+            )
+            set_quote_status(conn, quote_id, "已出库", sn_list=combined_sns)
+            cost_lines: list[dict] = []
+            for item in normalized:
+                item_cost = item["batch"]["purchase_price_cents"] * item["quantity"]
+                cost_lines.extend([
+                    {
+                        "account_code": "COGS", "debit_cents": item_cost,
+                        "customer_id": customer_id, "quote_id": quote_id,
+                        "batch_id": item["batch_id"],
+                    },
+                    {
+                        "account_code": "INVENTORY", "credit_cents": item_cost,
+                        "customer_id": customer_id, "quote_id": quote_id,
+                        "batch_id": item["batch_id"],
+                    },
+                ])
             entry_id = LedgerPostingService.post(
                 conn,
                 entry_date=shipped_date,
@@ -306,31 +412,45 @@ class InventoryService:
                         "customer_id": customer_id,
                         "quote_id": quote_id,
                     },
-                    {
-                        "account_code": "COGS",
-                        "debit_cents": cost_cents,
-                        "customer_id": customer_id,
-                        "quote_id": quote_id,
-                        "batch_id": batch["id"],
-                    },
-                    {
-                        "account_code": "INVENTORY",
-                        "credit_cents": cost_cents,
-                        "customer_id": customer_id,
-                        "quote_id": quote_id,
-                        "batch_id": batch["id"],
-                    },
+                    *cost_lines,
                 ],
+                remark=remark,
             )
-            insert_shipment_snapshot(
+            unit_costs = {item["batch"]["purchase_price_cents"] for item in normalized}
+            snapshot_id = insert_shipment_snapshot(
                 conn,
                 quote_id=quote_id,
                 shipped_date=shipped_date,
                 quantity=quantity,
                 unit_sale_cents=quote["quote_price_cents"],
-                unit_cost_cents=batch["purchase_price_cents"],
+                unit_cost_cents=next(iter(unit_costs)) if len(unit_costs) == 1 else None,
+                cost_cents=cost_cents,
                 ledger_entry_id=entry_id,
             )
+            for item in normalized:
+                allocation_id = insert_shipment_allocation(
+                    conn,
+                    shipment_snapshot_id=snapshot_id,
+                    batch_id=item["batch_id"],
+                    quantity=item["quantity"],
+                    unit_cost_cents=item["batch"]["purchase_price_cents"],
+                    sn_list=item["sn_list"],
+                )
+                insert_inventory_movement(
+                    conn,
+                    movement_date=shipped_date,
+                    movement_type="sales_shipment",
+                    product_id=item["batch"]["product_id"],
+                    batch_id=item["batch_id"],
+                    quantity_delta=-item["quantity"],
+                    unit_cost_cents=item["batch"]["purchase_price_cents"],
+                    source_type="quote",
+                    source_id=quote_id,
+                    shipment_allocation_id=allocation_id,
+                    ledger_entry_id=entry_id,
+                    sn_list=item["sn_list"],
+                    idempotency_key=f"shipment-allocation:{allocation_id}",
+                )
             advance_applied = 0
             if customer_id is not None:
                 advance_applied = self._apply_customer_advances(
@@ -344,14 +464,28 @@ class InventoryService:
                 before=dict(quote),
                 after={
                     "status": "已出库",
-                    "sn_list": sn_list,
+                    "sn_list": combined_sns,
                     "shipped_date": shipped_date,
                     "revenue_cents": revenue_cents,
                     "cost_cents": cost_cents,
                     "advance_applied_cents": advance_applied,
+                    "allocations": [
+                        {
+                            "batch_id": item["batch_id"],
+                            "quantity": item["quantity"],
+                            "unit_cost_cents": item["batch"]["purchase_price_cents"],
+                            "sn_list": item["sn_list"],
+                        }
+                        for item in normalized
+                    ],
+                    "sn_compatibility_warnings": warning_sns,
                 },
             )
-            log_operation(conn, "出库", "quotes", quote_id, f"SN={sn_list}")
+            log_operation(
+                conn, "出库", "quotes", quote_id,
+                f"批次={len(normalized)}, 数量={quantity}, SN={combined_sns}"
+            )
+            return {"sn_compatibility_warnings": warning_sns}
 
     def delete_batch(self, batch_id: int, reason: str = "用户删除批次") -> None:
         with transaction(self.db_path) as conn:

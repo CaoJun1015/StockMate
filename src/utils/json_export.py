@@ -18,6 +18,8 @@ from src.models.finance_repository import (
     update_import_ledger_links,
 )
 from src.models.queries import export_backup_data
+from src.models.migrations import _migrate_v4_to_v5
+from src.models.schema import SCHEMA_VERSION
 from src.models.repositories import import_record, update_import_payment_links
 from src.utils.money import yuan_to_cents
 from src.version import APP_VERSION
@@ -31,7 +33,7 @@ def export_all_to_json(output_path=None, db_path=None):
     output_path = Path(output_path)
     document = {
         "version": f"v{APP_VERSION}",
-        "schema_version": 4,
+        "schema_version": SCHEMA_VERSION,
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "money_unit": "cents",
         "data": export_backup_data(db_path),
@@ -69,6 +71,8 @@ def import_from_json(json_path, db_path=None):
             "ledger_accounts",
             "finance_categories",
             "ledger_entries",
+            "shipment_snapshots",
+            "shipment_allocations",
             "sales_returns",
             "purchase_returns",
         )
@@ -229,7 +233,17 @@ def import_from_json(json_path, db_path=None):
                 row["ledger_entry_id"] = _remap(
                     row.get("ledger_entry_id"), maps["ledger_entries"]
                 )
-                import_record(conn, "shipment_snapshots", row)
+                new_id = import_record(conn, "shipment_snapshots", row)
+                maps["shipment_snapshots"][snapshot["id"]] = new_id
+
+            for allocation in payload.get("shipment_allocations", []):
+                row = dict(allocation)
+                row["shipment_snapshot_id"] = _remap(
+                    row.get("shipment_snapshot_id"), maps["shipment_snapshots"]
+                )
+                row["batch_id"] = _remap(row.get("batch_id"), maps["batches"])
+                new_id = import_record(conn, "shipment_allocations", row)
+                maps["shipment_allocations"][allocation["id"]] = new_id
 
             for allocation in payload.get("supplier_payment_allocations", []):
                 row = dict(allocation)
@@ -266,6 +280,40 @@ def import_from_json(json_path, db_path=None):
                 new_id = import_record(conn, "purchase_returns", row)
                 maps["purchase_returns"][record["id"]] = new_id
 
+            for movement in payload.get("inventory_movements", []):
+                row = dict(movement)
+                row["product_id"] = _remap(row.get("product_id"), maps["products"])
+                row["batch_id"] = _remap(row.get("batch_id"), maps["batches"])
+                row["shipment_allocation_id"] = _remap(
+                    row.get("shipment_allocation_id"), maps["shipment_allocations"]
+                )
+                row["ledger_entry_id"] = _remap(
+                    row.get("ledger_entry_id"), maps["ledger_entries"]
+                )
+                source_table = {
+                    "batch": "batches",
+                    "quote": "quotes",
+                    "sales_return": "sales_returns",
+                    "purchase_return": "purchase_returns",
+                }.get(row.get("source_type"), row.get("source_type"))
+                source_map = maps.get(source_table)
+                if source_map is not None and row.get("source_id") is not None:
+                    try:
+                        old_source_id = int(row["source_id"])
+                    except (TypeError, ValueError):
+                        old_source_id = None
+                    if old_source_id is not None:
+                        mapped_source = _remap(old_source_id, source_map)
+                        row["source_id"] = (
+                            str(mapped_source) if mapped_source is not None else None
+                        )
+                # Imported entity IDs differ, so the source-linked key must be local.
+                row["idempotency_key"] = (
+                    f"json-import:{datetime.now().strftime('%Y%m%d%H%M%S%f')}:"
+                    f"{movement.get('id')}"
+                )
+                import_record(conn, "inventory_movements", row)
+
             settings = payload.get("finance_settings", [])
             if settings:
                 setting = settings[0]
@@ -281,6 +329,9 @@ def import_from_json(json_path, db_path=None):
                 if entity_map is not None:
                     row["entity_id"] = _remap(row.get("entity_id"), entity_map)
                 import_record(conn, "audit_events", row)
+
+            if not payload.get("inventory_movements"):
+                _migrate_v4_to_v5(conn)
 
         return True, "导入成功", stats
     except FileNotFoundError:

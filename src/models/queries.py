@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 
 from src.models.connection import connect
+from src.models.inventory_repository import (
+    list_inventory_movements as _list_inventory_movements,
+    list_shipment_allocations as _list_shipment_allocations,
+)
 from src.utils.tax import calc_tax_adjusted_profit_cents
 
 
@@ -22,6 +26,8 @@ BACKUP_TABLES = (
     "ledger_entries",
     "ledger_lines",
     "shipment_snapshots",
+    "shipment_allocations",
+    "inventory_movements",
     "supplier_payment_allocations",
     "sales_returns",
     "purchase_returns",
@@ -46,6 +52,22 @@ def export_backup_data(db_path=None) -> dict[str, list[dict]]:
         conn.close()
 
 
+def list_inventory_movements(batch_id: int, db_path=None) -> list[dict]:
+    conn = connect(db_path, read_only=True)
+    try:
+        return _list_inventory_movements(conn, batch_id=batch_id)
+    finally:
+        conn.close()
+
+
+def list_shipment_allocations(quote_id: int, db_path=None) -> list[dict]:
+    conn = connect(db_path, read_only=True)
+    try:
+        return _list_shipment_allocations(conn, quote_id=quote_id)
+    finally:
+        conn.close()
+
+
 def list_products(keyword: str = "", db_path=None) -> list[dict]:
     conn = connect(db_path, read_only=True)
     try:
@@ -64,7 +86,8 @@ def list_products(keyword: str = "", db_path=None) -> list[dict]:
                 """
                 SELECT p.id,p.series,p.cpu,p.ram,p.storage,p.gpu,p.screen,p.note,
                        COALESCE((
-                           SELECT SUM(b.remaining) FROM batches b
+                           SELECT SUM(im.quantity_delta) FROM inventory_movements im
+                           JOIN batches b ON b.id=im.batch_id
                            WHERE b.product_id=p.id AND b.deleted_at IS NULL
                        ),0) AS total_remaining
                 FROM products p
@@ -86,7 +109,11 @@ def list_batches(product_id: int, db_path=None) -> list[dict]:
             for row in conn.execute(
                 """
                 SELECT b.id,b.product_id,b.purchase_price_cents,
-                       b.quantity,b.remaining,b.date,b.remark,
+                       b.quantity,b.remaining AS cached_remaining,
+                       COALESCE((SELECT SUM(im.quantity_delta)
+                                 FROM inventory_movements im
+                                 WHERE im.batch_id=b.id),0) AS remaining,
+                       b.date,b.remark,
                        CASE WHEN s.deleted_at IS NULL THEN b.supplier_id END AS supplier_id,
                        b.sn_list
                 FROM batches b
@@ -229,7 +256,10 @@ def get_batch_detail(batch_id: int, db_path=None) -> dict | None:
     try:
         row = conn.execute(
             "SELECT id,product_id,purchase_price_cents,quantity,"
-            "remaining,date,remark,supplier_id,sn_list "
+            "remaining AS cached_remaining,"
+            "COALESCE((SELECT SUM(quantity_delta) FROM inventory_movements "
+            "WHERE batch_id=batches.id),0) AS remaining,"
+            "date,remark,supplier_id,sn_list "
             "FROM batches WHERE id=? AND deleted_at IS NULL",
             (batch_id,),
         ).fetchone()
@@ -1011,13 +1041,19 @@ def get_monthly_business_data(
             dict(row)
             for row in conn.execute(
                 """
-                SELECT p.series,p.cpu,p.ram,p.storage,SUM(b.remaining) AS stock,
+                SELECT p.series,p.cpu,p.ram,p.storage,
+                       SUM((SELECT COALESCE(SUM(im.quantity_delta),0)
+                            FROM inventory_movements im WHERE im.batch_id=b.id)) AS stock,
                        MIN(b.date) AS oldest_batch_date,
-                       COALESCE(SUM(b.remaining*b.purchase_price_cents),0)
+                       COALESCE(SUM((SELECT COALESCE(SUM(im.quantity_delta),0)
+                                    FROM inventory_movements im WHERE im.batch_id=b.id)
+                                    *b.purchase_price_cents),0)
                            AS tied_capital_cents
                 FROM batches b
                 JOIN products p ON b.product_id=p.id
-                WHERE b.remaining>0 AND b.deleted_at IS NULL
+                WHERE (SELECT COALESCE(SUM(im.quantity_delta),0)
+                       FROM inventory_movements im WHERE im.batch_id=b.id)>0
+                  AND b.deleted_at IS NULL
                   AND p.deleted_at IS NULL
                   AND p.id NOT IN (
                       SELECT DISTINCT b2.product_id
@@ -1052,38 +1088,18 @@ def collect_reconciliation_snapshot(db_path=None) -> dict:
             for row in conn.execute(
                 """
                 SELECT b.id,b.quantity,b.remaining,
-                       b.quantity-b.remaining AS deducted,
-                       COALESCE(SUM(
-                           CASE WHEN q.deleted_at IS NULL
-                                     AND q.status IN ('已出库','已收款')
-                                THEN q.quote_quantity ELSE 0 END
-                       ),0) AS shipped
+                       COALESCE(SUM(im.quantity_delta),0) AS movement_balance
                 FROM batches b
-                LEFT JOIN quotes q ON q.batch_id=b.id
+                LEFT JOIN inventory_movements im ON im.batch_id=b.id
                 WHERE b.deleted_at IS NULL
                 GROUP BY b.id
-                HAVING b.remaining<0 OR b.remaining>b.quantity
-                    OR shipped>b.quantity-b.remaining
+                HAVING b.remaining!=movement_balance OR b.remaining<0
                 """
             ).fetchall()
         ]
         stock_history = conn.execute(
             """
-            SELECT COUNT(*) AS batch_count,
-                   COALESCE(SUM((quantity-remaining)-shipped),0) AS units
-            FROM (
-                SELECT b.id,b.quantity,b.remaining,
-                       COALESCE(SUM(
-                           CASE WHEN q.deleted_at IS NULL
-                                     AND q.status IN ('已出库','已收款')
-                                THEN q.quote_quantity ELSE 0 END
-                       ),0) AS shipped
-                FROM batches b
-                LEFT JOIN quotes q ON q.batch_id=b.id
-                WHERE b.deleted_at IS NULL
-                GROUP BY b.id
-                HAVING b.quantity-b.remaining>shipped
-            )
+            SELECT 0 AS batch_count,0 AS units
             """
         ).fetchone()
         quote_allocation_issues = [
