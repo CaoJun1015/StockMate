@@ -4,6 +4,7 @@
 调货助手 PyInstaller 打包配置
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -12,6 +13,19 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.version import APP_VERSION
+
+# Resolve DLLs only from this Python/Qt installation and Windows. External
+# toolchains (for example Poppler) can supply incompatible names such as
+# icuuc.dll, which otherwise get bundled instead of the Windows ICU runtime.
+from PyQt6.QtCore import QLibraryInfo
+
+windows_root = Path(os.environ.get('SystemRoot', r'C:\Windows'))
+os.environ['PATH'] = os.pathsep.join([
+    QLibraryInfo.path(QLibraryInfo.LibraryPath.BinariesPath),
+    str(Path(sys.base_prefix)),
+    str(windows_root / 'System32'),
+    str(windows_root),
+])
 
 block_cipher = None
 
