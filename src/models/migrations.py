@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -481,6 +482,57 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    """Recover return allocations without changing stock or financial history."""
+    _execute_current_schema(conn)
+    for record in conn.execute("SELECT * FROM sales_returns ORDER BY id").fetchall():
+        if conn.execute("SELECT 1 FROM sales_return_allocations WHERE sales_return_id=?",
+                        (record["id"],)).fetchone():
+            continue
+        originals = {row["id"]: dict(row) for row in conn.execute(
+            "SELECT sa.* FROM shipment_allocations sa JOIN shipment_snapshots ss "
+            "ON ss.id=sa.shipment_snapshot_id WHERE ss.quote_id=?", (record["quote_id"],),
+        )}
+        event = conn.execute(
+            "SELECT after_json FROM audit_events WHERE entity_type='sales_returns' "
+            "AND entity_id=? AND action='create' ORDER BY id DESC LIMIT 1", (record["id"],),
+        ).fetchone()
+        try:
+            items = json.loads(event[0]).get("allocations", []) if event else []
+        except (ValueError, TypeError, AttributeError):
+            items = []
+        valid = bool(items) and all(
+            isinstance(item, dict) and item.get("shipment_allocation_id") in originals
+            and type(item.get("quantity")) is int and item["quantity"] > 0
+            for item in items
+        )
+        if not valid or sum(item["quantity"] for item in items) != record["quantity"]:
+            items = [dict(shipment_allocation_id=row["shipment_allocation_id"],
+                          quantity=row["quantity_delta"], sn_list=row["sn_list"])
+                     for row in conn.execute(
+                         "SELECT * FROM inventory_movements WHERE source_type='sales_return' "
+                         "AND source_id=? AND movement_type='sales_return'", (str(record["id"]),),
+                     ) if row["shipment_allocation_id"] in originals]
+        if sum(item["quantity"] for item in items) != record["quantity"]:
+            if len(originals) != 1:
+                # Missing cross-batch history cannot be guessed. Reconciliation
+                # reports the gap and further returns on this quote are blocked.
+                continue
+            items = [dict(shipment_allocation_id=next(iter(originals)),
+                          quantity=record["quantity"], sn_list="")]
+        remaining_restock = record["restock_quantity"]
+        for item in items:
+            restocked = min(remaining_restock, item["quantity"])
+            conn.execute(
+                "INSERT INTO sales_return_allocations "
+                "(sales_return_id,shipment_allocation_id,quantity,restock_quantity,sn_list) "
+                "VALUES (?,?,?,?,?)",
+                (record["id"], item["shipment_allocation_id"], item["quantity"],
+                 restocked, item.get("sn_list", "")),
+            )
+            remaining_restock -= restocked
+
+
 def _verify_v5_schema(conn: sqlite3.Connection) -> None:
     _verify_v4_schema(conn)
     for table in ("shipment_allocations", "inventory_movements"):
@@ -537,6 +589,8 @@ def _verify_database(
     backup: BackupInfo | None,
 ) -> None:
     _verify_v5_schema(conn)
+    if not _table_exists(conn, "sales_return_allocations"):
+        raise DatabaseMigrationError("schema v6 missing sales_return_allocations")
     check = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if check != "ok":
         raise DatabaseMigrationError(f"迁移后完整性检查失败: {check}", backup)
@@ -678,7 +732,7 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
             _execute_current_schema(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (?,?)",
-                (SCHEMA_VERSION, "fresh_schema_v5"),
+                (SCHEMA_VERSION, "fresh_schema_v6"),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _verify_database(conn, None)
@@ -736,7 +790,13 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
                     "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (5,?)",
                     ("inventory_subledger_allocations",),
                 )
-            conn.execute("PRAGMA user_version=5")
+            if version < 6:
+                _migrate_v5_to_v6(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(version,name) VALUES (6,?)",
+                    ("sales_return_allocations",),
+                )
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             after = _migration_snapshot(conn)
             changed = {
                 key: (value, after.get(key))

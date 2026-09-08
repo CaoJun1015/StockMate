@@ -467,7 +467,7 @@ class ReturnDialog(QDialog):
             layout.addRow("退货SN自动匹配：", self.auto_sn_edit)
             self.allocation_table = QTableWidget(len(allocations), 5)
             self.allocation_table.setHorizontalHeaderLabels(
-                ["原批次", "原出库", "已回库", "本次数量", "退货SN"]
+                ["原批次", "原出库", "已退货", "本次数量", "退货SN"]
             )
             self.allocation_table.horizontalHeader().setStretchLastSection(True)
             for row, allocation in enumerate(allocations):

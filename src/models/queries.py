@@ -30,6 +30,7 @@ BACKUP_TABLES = (
     "inventory_movements",
     "supplier_payment_allocations",
     "sales_returns",
+    "sales_return_allocations",
     "purchase_returns",
     "audit_events",
 )

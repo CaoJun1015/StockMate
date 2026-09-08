@@ -82,8 +82,8 @@ def test_fresh_schema_v4_contains_balanced_ledger(tmp_path):
     assert migrate_database(path) is None
     conn = connect(path, read_only=True)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
-        assert SCHEMA_VERSION == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert SCHEMA_VERSION == 6
         tables = {
             row[0]
             for row in conn.execute(
@@ -389,7 +389,7 @@ def test_v4_json_and_finance_excel_round_trip(tmp_path):
     _sale(source, quantity=1)
     export_all_to_json(export, source)
     document = json.loads(export.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 5
+    assert document["schema_version"] == 6
     assert "ledger_entries" in document["data"]
     migrate_database(target)
     ok, _, _ = import_from_json(export, target)

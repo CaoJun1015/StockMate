@@ -88,6 +88,9 @@ IMPORT_COLUMNS = {
     "supplier_payment_allocations": (
         "payment_id", "batch_id", "amount_cents", "created_at",
     ),
+    "sales_return_allocations": (
+        "sales_return_id", "shipment_allocation_id", "quantity", "restock_quantity", "sn_list",
+    ),
     "sales_returns": (
         "quote_id", "return_date", "quantity", "revenue_cents", "cost_cents",
         "restock_quantity", "cash_refund_cents", "account_id",

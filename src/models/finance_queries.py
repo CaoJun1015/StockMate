@@ -735,6 +735,17 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
             ),0)
             """
         ).fetchall()]
+        movement_issues.extend(dict(row) for row in conn.execute(
+            """SELECT sr.quote_id AS id,NULL AS remaining,NULL AS movement_balance
+               FROM sales_returns sr LEFT JOIN sales_return_allocations ra
+                 ON ra.sales_return_id=sr.id
+               GROUP BY sr.id HAVING sr.quantity!=COALESCE(SUM(ra.quantity),0)
+                 OR sr.restock_quantity!=COALESCE(SUM(ra.restock_quantity),0)
+               UNION ALL
+               SELECT sa.batch_id,NULL,NULL FROM shipment_allocations sa
+               JOIN sales_return_allocations ra ON ra.shipment_allocation_id=sa.id
+               GROUP BY sa.id HAVING SUM(ra.quantity)>sa.quantity"""
+        ).fetchall())
         sn_issues = [
             {"id": None, "sn_list": sn}
             for sn in duplicate_active_shipped_sns(conn)

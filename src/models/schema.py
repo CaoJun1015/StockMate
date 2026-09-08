@@ -1,6 +1,6 @@
-"""Current (schema v4) SQLite schema."""
+"""Current (schema v6) SQLite schema."""
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 CURRENT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -282,6 +282,18 @@ CREATE TABLE IF NOT EXISTS sales_returns (
     FOREIGN KEY (account_id) REFERENCES ledger_accounts(id),
     FOREIGN KEY (ledger_entry_id) REFERENCES ledger_entries(id)
 );
+
+CREATE TABLE IF NOT EXISTS sales_return_allocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sales_return_id INTEGER NOT NULL REFERENCES sales_returns(id),
+    shipment_allocation_id INTEGER NOT NULL REFERENCES shipment_allocations(id),
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    restock_quantity INTEGER NOT NULL CHECK (restock_quantity >= 0 AND restock_quantity <= quantity),
+    sn_list TEXT,
+    UNIQUE(sales_return_id, shipment_allocation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_return_alloc_shipment
+    ON sales_return_allocations(shipment_allocation_id);
 
 CREATE TABLE IF NOT EXISTS purchase_returns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

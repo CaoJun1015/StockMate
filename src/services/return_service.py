@@ -11,6 +11,9 @@ from src.models.inventory_repository import (
     list_shipment_allocations,
     normalize_sn_list,
     returned_quantity_for_allocation,
+    returned_sns_for_allocation,
+    insert_sales_return_allocation,
+    allocated_return_quantity_for_quote,
 )
 from src.models.finance_repository import (
     add_supplier_payment_allocation,
@@ -133,9 +136,13 @@ class ReturnService:
                     "quantity": quantity,
                     "sn_list": "",
                 }]
+            allocated_returns = allocated_return_quantity_for_quote(conn, quote_id)
+            if allocated_returns != returned:
+                raise DataConflictError("历史退货缺少完整批次分配，请先核对退货记录")
             by_id = {row["id"]: row for row in shipment_allocations}
             selected: list[dict] = []
             seen: set[int] = set()
+            request_sns: set[str] = set()
             for item in restock_allocations:
                 try:
                     allocation_id = int(item["shipment_allocation_id"])
@@ -153,6 +160,11 @@ class ReturnService:
                 item_sns = normalize_sn_list(item.get("sn_list", ""))
                 if item_sns and len(item_sns) != item_quantity:
                     raise ValidationError("退货SN数量必须等于对应批次退货数量")
+                if len(set(item_sns)) != len(item_sns) or request_sns.intersection(item_sns):
+                    raise ValidationError("退货包含重复SN")
+                if returned_sns_for_allocation(conn, allocation_id).intersection(item_sns):
+                    raise ValidationError("SN已在该出库分配中退货")
+                request_sns.update(item_sns)
                 original_sns = set(normalize_sn_list(original.get("sn_list", "")))
                 if item_sns and original_sns and not set(item_sns).issubset(original_sns):
                     raise ValidationError("退货SN不属于所选原出库批次")
@@ -258,6 +270,11 @@ class ReturnService:
                 ledger_entry_id=entry_id,
                 reason=reason,
             )
+            for item in selected:
+                insert_sales_return_allocation(
+                    conn, return_id, item["id"], item["return_quantity"],
+                    item["return_quantity"] if restock else 0, item["return_sn_list"],
+                )
             if restock:
                 for item in selected:
                     insert_inventory_movement(

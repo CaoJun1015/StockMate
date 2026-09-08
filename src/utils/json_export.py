@@ -18,7 +18,7 @@ from src.models.finance_repository import (
     update_import_ledger_links,
 )
 from src.models.queries import export_backup_data
-from src.models.migrations import _migrate_v4_to_v5
+from src.models.migrations import _migrate_v4_to_v5, _migrate_v5_to_v6
 from src.models.schema import SCHEMA_VERSION
 from src.models.repositories import import_record, update_import_payment_links
 from src.utils.money import yuan_to_cents
@@ -280,6 +280,14 @@ def import_from_json(json_path, db_path=None):
                 new_id = import_record(conn, "purchase_returns", row)
                 maps["purchase_returns"][record["id"]] = new_id
 
+            for allocation in payload.get("sales_return_allocations", []):
+                row = dict(allocation)
+                row["sales_return_id"] = _remap(row.get("sales_return_id"), maps["sales_returns"])
+                row["shipment_allocation_id"] = _remap(
+                    row.get("shipment_allocation_id"), maps["shipment_allocations"]
+                )
+                import_record(conn, "sales_return_allocations", row)
+
             for movement in payload.get("inventory_movements", []):
                 row = dict(movement)
                 row["product_id"] = _remap(row.get("product_id"), maps["products"])
@@ -328,10 +336,19 @@ def import_from_json(json_path, db_path=None):
                 entity_map = maps.get(row.get("entity_type"))
                 if entity_map is not None:
                     row["entity_id"] = _remap(row.get("entity_id"), entity_map)
+                if row.get("entity_type") == "sales_returns" and row.get("after_json"):
+                    detail = json.loads(row["after_json"])
+                    for item in detail.get("allocations", []):
+                        item["shipment_allocation_id"] = _remap(
+                            item.get("shipment_allocation_id"), maps["shipment_allocations"]
+                        )
+                        item["batch_id"] = _remap(item.get("batch_id"), maps["batches"])
+                    row["after_json"] = json.dumps(detail, ensure_ascii=False)
                 import_record(conn, "audit_events", row)
 
             if not payload.get("inventory_movements"):
                 _migrate_v4_to_v5(conn)
+            _migrate_v5_to_v6(conn)
 
         return True, "导入成功", stats
     except FileNotFoundError:
