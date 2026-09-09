@@ -18,6 +18,9 @@ def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 IMPORT_COLUMNS = {
+    "operation_logs": ("operation", "table_name", "record_id", "description", "created_at"),
+    "price_snapshots": ("import_date", "item_count", "created_at"),
+    "price_snapshot_items": ("snapshot_id", "series", "cpu", "ram", "storage", "gpu", "note", "norm_key"),
     "products": (
         "series", "cpu", "ram", "storage", "gpu", "screen", "note",
         "created_at", "deleted_at", "deleted_reason",
@@ -112,7 +115,7 @@ def import_record(
     columns = IMPORT_COLUMNS.get(table)
     if columns is None:
         raise ValueError(f"不支持导入表: {table}")
-    selected = [column for column in columns if column in record]
+    selected = [column for column in ("id", *columns) if column in record]
     placeholders = ",".join("?" for _ in selected)
     names = ",".join(f'"{column}"' for column in selected)
     cursor = conn.execute(
@@ -651,3 +654,25 @@ def sync_quote_payment_state(conn: sqlite3.Connection, quote_id: int) -> None:
         (paid, status, quote_id),
     )
 
+
+
+def list_product_batch_ids(conn: sqlite3.Connection, product_id: int) -> list[int]:
+    """Include soft-deleted batches: financial history still references them."""
+    return [row[0] for row in conn.execute(
+        "SELECT id FROM batches WHERE product_id=?", (product_id,)
+    )]
+
+
+def require_empty_import_target(conn: sqlite3.Connection) -> None:
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for table in tables - {"sqlite_sequence", "schema_migrations", "finance_settings"}:
+        if table == "ledger_accounts":
+            exists = conn.execute("SELECT 1 FROM ledger_accounts WHERE is_system=0 LIMIT 1").fetchone()
+        elif table == "finance_categories":
+            exists = conn.execute("SELECT 1 FROM finance_categories WHERE is_system=0 LIMIT 1").fetchone()
+        else:
+            exists = conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone()
+        if exists:
+            raise ValueError("目标库非空；不支持合并导入，请使用完整备份恢复")
+    if "finance_settings" in tables and conn.execute("SELECT 1 FROM finance_settings WHERE enabled_at IS NOT NULL").fetchone():
+        raise ValueError("目标库已启用财务；请使用完整备份恢复")

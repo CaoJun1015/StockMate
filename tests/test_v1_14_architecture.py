@@ -11,8 +11,8 @@ from src.models.connection import (
     DatabaseRestoreError,
     connect,
     create_backup,
-    restore_database,
 )
+from src.services.database_service import restore_database
 from src.models.migrations import migrate_database
 from src.models.queries import get_customer, get_supplier
 from src.services.exceptions import InvalidTransitionError

@@ -10,12 +10,13 @@ from src.models.repositories import (
     insert_product,
     list_active_batch_quotes,
     list_active_product_batches,
+    list_product_batch_ids,
     log_operation,
     soft_delete,
     update_product,
 )
+from src.services.inventory_service import InventoryService
 from src.services.exceptions import (
-    InvalidTransitionError,
     NotFoundError,
     ValidationError,
 )
@@ -105,16 +106,8 @@ class ProductService:
             if not product:
                 raise NotFoundError("机型不存在或已删除")
             batches = list_active_product_batches(conn, product_id)
-            for batch in batches:
-                blocking = [
-                    quote
-                    for quote in list_active_batch_quotes(conn, batch["id"])
-                    if quote["status"] not in ("待确认", "已取消")
-                ]
-                if blocking:
-                    raise InvalidTransitionError(
-                        f"机型存在已报价、已出库或已收款记录，不能删除（报价 {blocking[0]['id']}）"
-                    )
+            for batch_id in list_product_batch_ids(conn, product_id):
+                InventoryService.require_batch_deletable(conn, batch_id)
 
             for batch in batches:
                 for quote in list_active_batch_quotes(conn, batch["id"]):

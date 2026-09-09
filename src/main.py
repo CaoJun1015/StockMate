@@ -23,8 +23,11 @@ from PyQt6.QtGui import QAction, QClipboard, QColor
 # 确保能找到 src 包
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from src.services.database_service import initialize_database
+from src.services.database_service import (
+    initialize_database, prepare_database_restore, apply_database_restore,
+)
 from src.ui.style import APP_STYLE
+from src.ui.display_labels import OBJECT_LABELS
 from src.ui.dialogs import (
     ShipmentDialog, PaymentDialog, PaymentEditDialog, StatementDialog,
     ProductEditDialog, BatchDialog, CustomerDialog, QuoteEditDialog,
@@ -43,7 +46,6 @@ from src.models.connection import (
     create_backup,
     get_backup_dir,
     get_database_path,
-    restore_database,
 )
 from src.services.reconciliation_service import ReconciliationService
 from src.version import APP_DISPLAY_NAME
@@ -91,7 +93,7 @@ class MainWindow(QMainWindow):
         self.export_json_btn = QPushButton("JSON备份")
         self.export_json_btn.setObjectName("ghostBtn")
         self.export_json_btn.clicked.connect(self.on_export_json)
-        self.import_json_btn = QPushButton("JSON导入")
+        self.import_json_btn = QPushButton("JSON 备份恢复")
         self.import_json_btn.setObjectName("ghostBtn")
         self.import_json_btn.clicked.connect(self.on_import_json)
         self.log_btn = QPushButton("操作日志")
@@ -215,7 +217,7 @@ class MainWindow(QMainWindow):
         backup_action.triggered.connect(self.on_create_database_backup)
         data_menu.addAction(backup_action)
 
-        restore_action = QAction("从 SQLite 备份恢复…", self)
+        restore_action = QAction("SQLite 备份恢复…", self)
         restore_action.triggered.connect(self.on_restore_database)
         data_menu.addAction(restore_action)
 
@@ -285,57 +287,38 @@ class MainWindow(QMainWindow):
         )
         if not file_path:
             return
-        reply = QMessageBox.question(
-            self,
-            "确认恢复数据库",
-            (
-                f"将从以下备份恢复：\n{file_path}\n\n"
-                "恢复前会自动备份当前数据库。恢复成功后程序将退出，"
-                "需要重新启动才能继续使用。\n\n确定继续？"
-            ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+        self._restore_backup(file_path, "sqlite")
+
+    def _restore_backup(self, file_path, backup_format):
+        # Disable all business controls throughout preflight, confirmation and apply.
+        central = self.centralWidget()
+        central.setEnabled(False)
+        self.menuBar().setEnabled(False)
         try:
-            result = restore_database(file_path)
+            with prepare_database_restore(file_path, backup_format=backup_format) as prepared:
+                counts = prepared.report.metrics.get("table_counts", {})
+                summary = "、".join(f"{OBJECT_LABELS.get(name, name)}: {count}" for name, count in counts.items())
+                reply = QMessageBox.question(
+                    self, "确认完整替换恢复",
+                    f"备份已通过升级、完整性与业务对账。\n{file_path}\n{summary}\n\n"
+                    "将完整替换当前数据库，不会合并记录。\n"
+                    "恢复前自动创建安全备份，成功后退出程序。确定继续？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                result = apply_database_restore(prepared)
         except DatabaseRestoreError as exc:
-            safety_path = (
-                str(exc.safety_backup.path) if exc.safety_backup else "未生成"
-            )
-            QMessageBox.critical(
-                self,
-                "恢复失败",
-                f"{exc}\n\n恢复前安全备份：{safety_path}",
-            )
+            safety = str(exc.safety_backup.path) if exc.safety_backup else "未生成（替换前预检失败时无需备份）"
+            QMessageBox.critical(self, "恢复失败", f"{exc}\n\n安全备份：{safety}")
             return
-
-        safety_path = (
-            str(result.safety_backup.path) if result.safety_backup else "原数据库不存在"
-        )
-        QMessageBox.information(
-            self,
-            "恢复成功",
-            (
-                f"数据库已从备份恢复。\n\n"
-                f"恢复源：{result.restored_from}\n"
-                f"恢复前安全备份：{safety_path}\n\n"
-                "程序现在将退出，请重新启动调货助手。"
-            ),
-        )
+        finally:
+            central.setEnabled(True)
+            self.menuBar().setEnabled(True)
+        safety = str(result.safety_backup.path) if result.safety_backup else "原数据库不存在"
+        QMessageBox.information(self, "恢复成功", f"已完整恢复备份。\n安全备份：{safety}\n程序将退出，请重新启动。")
         QApplication.instance().quit()
-
-    def on_confirm_quote(self):
-        self.record_tab.on_confirm_quote()
-
-    def on_ship_quote(self):
-        self.record_tab.on_ship_quote()
-
-    def on_receive_payment(self):
-        self.record_tab.on_receive_payment()
-
-    def on_cancel_quote(self):
-        self.record_tab.on_cancel_quote()
 
     def on_statement(self):
         dlg = StatementDialog(self)
@@ -367,12 +350,6 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------
     def refresh_records(self):
         self.record_tab.refresh_records()
-
-    def on_edit_quote(self):
-        self.record_tab.on_edit_quote()
-
-    def on_delete_quote(self):
-        self.record_tab.on_delete_quote()
 
     # -------------------------------------------------------
     # Skill 3: 智能跟单提醒（委托到 RecordTab）
@@ -528,9 +505,6 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------
     # 群发图片（委托到 RecordTab）
     # -------------------------------------------------------
-    def on_export_records_excel(self):
-        self.record_tab.on_export_records_excel()
-
     def on_export_excel(self):
         self.record_tab.on_export_excel()
 
@@ -548,60 +522,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", f"导出时发生错误:\n{str(e)}")
 
     def on_import_json(self):
-        """从 JSON 文件导入数据"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择 JSON 备份文件", "",
-            "JSON 文件 (*.json);;所有文件 (*.*)"
+            self, "选择 JSON 备份（完整替换恢复）", "", "JSON 文件 (*.json)"
         )
-        
-        if not file_path:
-            return
-        
-        # 文件大小校验（最大 50 MB）
-        file_size = os.path.getsize(file_path)
-        if file_size > 50 * 1024 * 1024:
-            QMessageBox.warning(self, "文件过大",
-                f"文件大小 {file_size / (1024*1024):.1f} MB 超过限制（最大 50 MB）")
-            return
-        
-        from src.utils.json_export import validate_json_file, import_from_json
-        
-        valid, message, stats = validate_json_file(file_path)
-        if not valid:
-            QMessageBox.warning(self, "文件无效", message)
-            return
-        
-        reply = QMessageBox.question(
-            self, "确认导入",
-            f"即将导入以下数据:\n\n"
-            f"• 机型: {stats.get('products', 0)} 条\n"
-            f"• 批次: {stats.get('batches', 0)} 条\n"
-            f"• 客户: {stats.get('customers', 0)} 条\n"
-            f"• 报价: {stats.get('quotes', 0)} 条\n\n"
-            f"是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            success, message, import_stats = import_from_json(file_path)
-            
-            if success:
-                self.product_tab.refresh_product_list()
-                self.customer_tab.refresh_customer_list()
-                self.supplier_tab.refresh_supplier_list()
-                self.refresh_records()
-                
-                QMessageBox.information(
-                    self, "导入成功",
-                    f"数据导入完成！\n\n"
-                    f"• 机型: {import_stats.get('products', 0)} 条\n"
-                    f"• 批次: {import_stats.get('batches', 0)} 条\n"
-                    f"• 客户: {import_stats.get('customers', 0)} 条\n"
-                    f"• 报价: {import_stats.get('quotes', 0)} 条\n\n"
-                    f"注意: 如果导入的数据与现有数据重复，可能会产生重复记录。"
-                )
-            else:
-                QMessageBox.critical(self, "导入失败", message)
+        if file_path:
+            self._restore_backup(file_path, "json")
 
     def on_show_logs(self):
         """显示操作日志"""

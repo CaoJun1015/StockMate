@@ -33,6 +33,9 @@ BACKUP_TABLES = (
     "sales_return_allocations",
     "purchase_returns",
     "audit_events",
+    "operation_logs",
+    "price_snapshots",
+    "price_snapshot_items",
 )
 
 
@@ -1010,34 +1013,9 @@ def list_price_snapshots(db_path=None) -> list[dict]:
         conn.close()
 
 
-def get_monthly_business_data(
-    date_from: str,
-    date_to: str,
-    prev_from: str,
-    prev_to: str,
-    db_path=None,
-) -> dict[str, list[dict]]:
+def get_slow_movers(date_from: str, date_to: str, db_path=None) -> list[dict]:
     conn = connect(db_path, read_only=True)
     try:
-        sales_sql = """
-            SELECT q.quote_price_cents,q.quote_quantity,b.purchase_price_cents,
-                   q.tax_rate,q.purchase_tax_inclusive,q.quote_tax_inclusive,
-                   q.received_amount_cents,p.series,p.cpu,p.ram,p.storage
-            FROM quotes q
-            JOIN batches b ON q.batch_id=b.id
-            JOIN products p ON b.product_id=p.id
-            WHERE q.quote_date>=? AND q.quote_date<?
-              AND q.deleted_at IS NULL
-              AND q.status IN ('已报价','已出库','已收款')
-        """
-        current = [
-            dict(row)
-            for row in conn.execute(sales_sql, (date_from, date_to)).fetchall()
-        ]
-        previous = [
-            dict(row)
-            for row in conn.execute(sales_sql, (prev_from, prev_to)).fetchall()
-        ]
         slow_movers = [
             dict(row)
             for row in conn.execute(
@@ -1058,9 +1036,9 @@ def get_monthly_business_data(
                   AND p.deleted_at IS NULL
                   AND p.id NOT IN (
                       SELECT DISTINCT b2.product_id
-                      FROM quotes q2 JOIN batches b2 ON q2.batch_id=b2.id
-                      WHERE q2.quote_date>=? AND q2.quote_date<?
-                        AND q2.deleted_at IS NULL
+                      FROM shipment_snapshots ss JOIN quotes q2 ON q2.id=ss.quote_id
+                      JOIN batches b2 ON q2.batch_id=b2.id
+                      WHERE ss.shipped_date>=? AND ss.shipped_date<?
                   )
                 GROUP BY p.series,p.cpu,p.ram,p.storage
                 HAVING stock>0
@@ -1069,7 +1047,7 @@ def get_monthly_business_data(
                 (date_from, date_to),
             ).fetchall()
         ]
-        return {"current": current, "previous": previous, "slow_movers": slow_movers}
+        return slow_movers
     finally:
         conn.close()
 

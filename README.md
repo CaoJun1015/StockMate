@@ -31,7 +31,7 @@
 | 💳 经营记账 | 资金账户、日常收支、应收应付、预收预付、退货退款、利润与账务审计 |
 | 📊 客户对账单 | 按客户 + 日期范围生成对账单，导出 Excel |
 | 📝 报价记录 | 全流程状态追踪：待确认 → 已报价 → 已出库 → 已收款 |
-| 💾 数据安全 | 自动备份、库存与账务对账、SQLite 备份验证恢复、JSON 全量导入导出 |
+| 💾 数据安全 | 自动备份、库存与账务对账、SQLite 备份验证恢复、JSON 完整备份恢复与导出 |
 
 ### 智能技能（Skills）
 
@@ -42,7 +42,7 @@
 | 🧠 报价决策助手 | 基于历史报价数据自动推荐报价金额 |
 | 🔔 价格异动哨兵 | 导入价格表时自动对比上一版本，检测新增/下架机型 |
 | ⏰ 智能跟单提醒 | 扫描超期未成交订单，提醒跟进 |
-| 📈 月度经营报告 | 自动生成销售额/毛利/TOP5/滞销预警/回款率分析 |
+| 📈 月度经营报告 | 自动生成销售额/毛利/TOP5/滞销预警/客户净收款分析 |
 | 🔧 出库一条龙 | SN 批量扫描/校验/去重 + 出库确认单生成 |
 | 🩺 远程诊断助手 | 结构化故障排查决策树（蓝屏/开不了机/WiFi/风扇） |
 
@@ -75,7 +75,7 @@ python run.py
 ### 打包为 exe
 
 ```bash
-python build_exe.py
+python -m PyInstaller --noconfirm build.spec
 ```
 
 打包后的 exe 文件在 `dist/` 目录下。
@@ -87,14 +87,13 @@ python build_exe.py
 ```
 diaohuo-assistant/
 ├── run.py                  # 启动入口
-├── build_exe.py            # 打包脚本
 ├── build.spec              # PyInstaller 配置
 ├── requirements.txt        # 依赖清单
 │
 ├── src/
 │   ├── main.py             # PyQt6 主窗口组装
 │   ├── models/
-│   │   ├── schema.py       # schema v4
+│   │   ├── schema.py       # schema v6
 │   │   ├── migrations.py   # 事务化数据库迁移
 │   │   ├── repositories.py # 业务数据写入
 │   │   └── finance_queries.py # 财务只读查询
@@ -162,3 +161,5 @@ diaohuo-assistant/
 [MIT License](LICENSE) · [报告问题](https://github.com/CaoJun1015/diaohuo-assistant/issues)
 
 </div>
+
+当前架构收敛改动的业务口径、完整恢复步骤与验证命令见 [操作说明](docs/架构收敛与完整恢复说明.md)。

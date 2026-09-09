@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from src.models.connection import connect, restore_database
+from src.services.database_service import restore_database
+from src.models.connection import connect
 from src.models.migrations import DatabaseMigrationError, migrate_database
 from src.models.queries import (
     export_quotes,
@@ -107,7 +108,7 @@ def _seed_flow(path: Path):
         quote_quantity=2,
         quote_date="2026-08-04",
     )
-    InventoryService(path).ship_quote(quote, "SN001\nSN002")
+    InventoryService(path).ship_quote(quote, "SN001\nSN002", shipped_date="2026-08-04")
     return product, customer, supplier, batch, quote
 
 

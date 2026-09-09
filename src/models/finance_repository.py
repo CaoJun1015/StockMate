@@ -550,60 +550,12 @@ def supplier_batch_allocated_cents(
     )
 
 
-def find_import_account(
-    conn: sqlite3.Connection,
-    code: str | None,
-) -> int | None:
-    row = conn.execute(
-        "SELECT id FROM ledger_accounts WHERE code=?",
-        (code,),
-    ).fetchone()
-    return int(row["id"]) if row else None
-
-
-def update_import_account(
-    conn: sqlite3.Connection,
-    account_id: int,
-    record: dict[str, Any],
-) -> None:
-    conn.execute(
-        "UPDATE ledger_accounts SET name=?,is_active=?,deleted_at=? WHERE id=?",
-        (
-            record.get("name"),
-            record.get("is_active", 1),
-            record.get("deleted_at"),
-            account_id,
-        ),
-    )
-
-
-def find_import_category(
-    conn: sqlite3.Connection,
-    name: str | None,
-    kind: str | None,
-) -> int | None:
-    row = conn.execute(
-        "SELECT id FROM finance_categories WHERE name=? AND kind=?",
-        (name, kind),
-    ).fetchone()
-    return int(row["id"]) if row else None
-
-
-def update_import_category(
-    conn: sqlite3.Connection,
-    category_id: int,
-    record: dict[str, Any],
-) -> None:
-    conn.execute(
-        "UPDATE finance_categories SET affects_profit=?,is_active=?,deleted_at=? "
-        "WHERE id=?",
-        (
-            record.get("affects_profit", 1),
-            record.get("is_active", 1),
-            record.get("deleted_at"),
-            category_id,
-        ),
-    )
+def clear_import_defaults(conn: sqlite3.Connection, *, accounts: bool, categories: bool) -> None:
+    """Only called after the service has verified an empty staging database."""
+    if accounts:
+        conn.execute("DELETE FROM ledger_accounts")
+    if categories:
+        conn.execute("DELETE FROM finance_categories")
 
 
 def update_import_ledger_links(
@@ -624,10 +576,11 @@ def update_import_finance_settings(
     *,
     enabled_at: str | None,
     initialized_at: str | None,
+    created_at: str | None = None,
 ) -> None:
     conn.execute(
-        "UPDATE finance_settings SET enabled_at=?,initialized_at=? WHERE id=1",
-        (enabled_at, initialized_at),
+        "UPDATE finance_settings SET enabled_at=?,initialized_at=?,created_at=COALESCE(?,created_at) WHERE id=1",
+        (enabled_at, initialized_at, created_at),
     )
 
 

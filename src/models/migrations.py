@@ -829,3 +829,11 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
         raise DatabaseMigrationError(f"数据库迁移失败: {exc}", backup) from exc
     finally:
         conn.close()
+
+
+def rebuild_import_history(conn: sqlite3.Connection, source_version: int) -> None:
+    """Reconstruct only history absent from an older backup format."""
+    if source_version < 5:
+        _migrate_v4_to_v5(conn)
+    if source_version < 6:
+        _migrate_v5_to_v6(conn)

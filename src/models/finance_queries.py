@@ -837,3 +837,39 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
         }
     finally:
         conn.close()
+
+
+def get_monthly_activity(date_from: str, date_to: str, db_path=None) -> dict:
+    """Shipment counts and actual customer cash; inclusive business dates."""
+    conn = connect(db_path, read_only=True)
+    try:
+        enabled = conn.execute("SELECT enabled_at FROM finance_settings WHERE id=1").fetchone()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM shipment_snapshots WHERE shipped_date BETWEEN ? AND ?",
+            (date_from, date_to),
+        ).fetchone()[0]
+        quantities = {row["product_id"]: row["quantity"] for row in conn.execute(
+            """SELECT product_id,SUM(quantity) quantity FROM (
+                SELECT b.product_id,ss.quantity FROM shipment_snapshots ss
+                JOIN quotes q ON q.id=ss.quote_id JOIN batches b ON b.id=q.batch_id
+                WHERE ss.shipped_date BETWEEN ? AND ?
+                UNION ALL
+                SELECT b.product_id,-sr.quantity FROM sales_returns sr
+                JOIN quotes q ON q.id=sr.quote_id JOIN batches b ON b.id=q.batch_id
+                WHERE sr.return_date BETWEEN ? AND ?
+            ) GROUP BY product_id""", (date_from, date_to, date_from, date_to),
+        )}
+        cash = conn.execute(
+            """SELECT COALESCE(SUM(l.debit_cents-l.credit_cents),0)
+               FROM ledger_lines l JOIN ledger_entries e ON e.id=l.entry_id
+               JOIN ledger_accounts a ON a.id=l.account_id
+               WHERE a.is_system=0 AND a.account_type='asset'
+                 AND e.entry_date BETWEEN ? AND ?
+                 AND e.event_type IN ('customer_receipt','customer_receipt_reversal',
+                                      'sales_return','sales_return_reversal')""",
+            (date_from, date_to),
+        ).fetchone()[0]
+        return {"enabled_at": enabled[0] if enabled else None,
+                "order_count": count, "quantities": quantities, "cash_cents": cash}
+    finally:
+        conn.close()

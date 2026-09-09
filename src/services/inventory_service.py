@@ -487,25 +487,31 @@ class InventoryService:
             )
             return {"sn_compatibility_warnings": warning_sns}
 
+    @staticmethod
+    def require_batch_deletable(conn, batch_id: int) -> list[dict]:
+        """Shared deletion policy; caller owns the transaction."""
+        if get_finance_enabled_at(conn):
+            raise InvalidTransitionError(
+                "财务启用后不能删除批次，请使用采购退货"
+            )
+        quotes = list_active_batch_quotes(conn, batch_id)
+        blocking = [
+            quote
+            for quote in quotes
+            if quote["status"] not in ("待确认", "已取消")
+        ]
+        if blocking:
+            raise InvalidTransitionError(
+                f"批次存在已报价或已出库记录，不能删除（报价 {blocking[0]['id']}）"
+            )
+        return quotes
+
     def delete_batch(self, batch_id: int, reason: str = "用户删除批次") -> None:
         with transaction(self.db_path) as conn:
-            if get_finance_enabled_at(conn):
-                raise InvalidTransitionError(
-                    "财务启用后不能删除批次，请使用采购退货"
-                )
             batch = get_active_entity(conn, "batches", batch_id)
             if not batch:
                 raise NotFoundError("库存批次不存在或已删除")
-            quotes = list_active_batch_quotes(conn, batch_id)
-            blocking = [
-                quote
-                for quote in quotes
-                if quote["status"] not in ("待确认", "已取消")
-            ]
-            if blocking:
-                raise InvalidTransitionError(
-                    f"批次存在已报价或已出库记录，不能删除（报价 {blocking[0]['id']}）"
-                )
+            quotes = self.require_batch_deletable(conn, batch_id)
             for quote in quotes:
                 soft_delete(conn, "quotes", quote["id"], "所属批次已删除")
             if batch["supplier_id"]:
