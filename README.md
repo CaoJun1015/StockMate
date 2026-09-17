@@ -75,10 +75,14 @@ python run.py
 ### 打包为 exe
 
 ```bash
-python -m PyInstaller --noconfirm build.spec
+# 在 Python 3.11 的干净环境中安装固定构建清单
+python -m pip install -r requirements-release.lock
+
+# 完整回归、隔离 PyInstaller 打包、DLL 来源和 EXE 临时库启动检查
+python scripts/release_validate.py
 ```
 
-打包后的 exe 文件在 `dist/` 目录下。
+验证后的本地候选包和 JSON 报告位于 `release-candidates/`。报告会记录实际 EXE 名、提交、工作区状态、依赖版本、schema 和 SHA-256；脏工作区只标记为本地验证，不能作为正式发布候选。
 
 ---
 

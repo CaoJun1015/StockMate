@@ -1,0 +1,24 @@
+# Rebuild with Python 3.11.9 on Windows. Kept separate from the looser dev requirements.
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.1
+PyQt6_sip==13.12.0
+python-docx==1.2.0
+lxml==6.1.1
+Pillow==12.2.0
+openpyxl==3.1.5
+et_xmlfile==2.0.0
+
+# Test and package tooling used by scripts/release_validate.py.
+PyInstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+altgraph==0.17.5
+packaging==26.2
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+pytest==9.1.1
+pytest-qt==4.5.0
+colorama==0.4.6
+iniconfig==2.3.0
+pluggy==1.6.0
+Pygments==2.20.0
+typing_extensions==4.15.0
