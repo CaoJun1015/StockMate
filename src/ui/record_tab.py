@@ -35,7 +35,7 @@ from src.utils.monthly_report import get_monthly_report, format_report_text
 from src.utils.shipment_flow import parse_sn_input, validate_sn, validate_sn_list, generate_shipment_receipt
 from src.utils.money import format_yuan, yuan_to_cents
 from src.utils.tax import calc_tax_adjusted_profit_cents
-from src.ui.dialogs import ShipmentDialog, QuoteEditDialog
+from src.ui.dialogs import ShipmentDialog, SNLifecycleDialog, QuoteEditDialog
 from src.ui.finance_dialogs import PaymentDialog, ReturnDialog
 from src.ui.utils import refreshing_table
 
@@ -73,6 +73,9 @@ class RecordTab(QWidget):
         self.shipment_detail_btn = QPushButton("出库明细")
         self.shipment_detail_btn.setObjectName("ghostBtn")
         self.shipment_detail_btn.clicked.connect(self.on_shipment_detail)
+        self.sn_lifecycle_btn = QPushButton("SN 查询")
+        self.sn_lifecycle_btn.setObjectName("ghostBtn")
+        self.sn_lifecycle_btn.clicked.connect(self.on_sn_lifecycle)
         self.cancel_record_btn = QPushButton("取消订单")
         self.cancel_record_btn.setObjectName("ghostBtn")
         self.cancel_record_btn.clicked.connect(self.on_cancel_quote)
@@ -90,6 +93,7 @@ class RecordTab(QWidget):
         btn_row.addWidget(self.receive_btn)
         btn_row.addWidget(self.return_btn)
         btn_row.addWidget(self.shipment_detail_btn)
+        btn_row.addWidget(self.sn_lifecycle_btn)
         btn_row.addWidget(self.cancel_record_btn)
         btn_row.addWidget(self.edit_record_btn)
         btn_row.addWidget(self.del_record_btn)
@@ -533,6 +537,9 @@ class RecordTab(QWidget):
         close.clicked.connect(dialog.accept)
         layout.addWidget(close)
         dialog.exec()
+
+    def on_sn_lifecycle(self):
+        SNLifecycleDialog(self).exec()
 
     def on_cancel_quote(self):
         row = self.record_table.currentRow()

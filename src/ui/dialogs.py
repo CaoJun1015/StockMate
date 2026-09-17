@@ -20,6 +20,9 @@ from src.models.queries import (
     get_operation_logs,
     list_customers,
     list_suppliers,
+    get_batch_detail,
+    get_quote_detail,
+    get_sn_lifecycle,
 )
 from src.services.party_service import CustomerService, SupplierService
 from src.models.finance_queries import list_financial_accounts
@@ -247,6 +250,80 @@ class ShipmentDialog(QDialog):
             "remark": self.remark_edit.text().strip(),
             "shipped_date": self.shipped_date_edit.date().toString("yyyy-MM-dd"),
         }
+
+
+class SNLifecycleDialog(QDialog):
+    """A deliberately read-only view of evidence for one serial number."""
+    def __init__(self, parent=None, *, db_path=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.setWindowTitle("SN 全生命周期查询")
+        self.resize(900, 460)
+        layout = QVBoxLayout(self)
+        query_row = QHBoxLayout()
+        self.sn_edit = QLineEdit()
+        self.sn_edit.setPlaceholderText("输入完整 SN")
+        self.sn_edit.returnPressed.connect(self._query)
+        query_button = QPushButton("查询")
+        query_button.clicked.connect(self._query)
+        query_row.addWidget(self.sn_edit)
+        query_row.addWidget(query_button)
+        layout.addLayout(query_row)
+        self.status_label = QLabel("输入完整 SN 后查询；查询不会修改库存、账本或历史记录。")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.event_table = QTableWidget(0, 8)
+        self.event_table.setHorizontalHeaderLabels(
+            ["业务日期", "记录时间", "事件", "机型", "客户", "批次", "订单", "证据"]
+        )
+        self.event_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.event_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.event_table)
+        close = QPushButton("关闭")
+        close.clicked.connect(self.accept)
+        layout.addWidget(close)
+
+    def _show_batch(self, batch_id: int):
+        row = get_batch_detail(batch_id, self.db_path)
+        if row:
+            QMessageBox.information(self, f"批次#{batch_id}",
+                                    f"机型：{row.get('series', '')} {row.get('cpu', '')}\n"
+                                    f"剩余：{row.get('remaining', '')}\nSN：{row.get('sn_list', '')}")
+
+    def _show_quote(self, quote_id: int):
+        row = get_quote_detail(quote_id, self.db_path)
+        if row:
+            QMessageBox.information(self, f"订单#{quote_id}",
+                                    f"客户：{row.get('customer_name', '')}\n"
+                                    f"状态：{row.get('status', '')}\n"
+                                    f"数量：{row.get('quote_quantity', '')}")
+
+    def _query(self):
+        lifecycle = get_sn_lifecycle(self.sn_edit.text(), self.db_path)
+        evidence = "；".join(lifecycle["evidence"]) or "无冲突证据"
+        self.status_label.setText(
+            f"SN {lifecycle['sn'] or '—'}｜当前可确认状态：{lifecycle['status']}｜证据：{evidence}"
+        )
+        events = lifecycle["events"]
+        self.event_table.setRowCount(len(events))
+        for index, event in enumerate(events):
+            values = (
+                event["business_date"], event["record_time"] or "—", event["kind"],
+                f"{event['series']} {event['cpu']}".strip(), event["customer_name"] or "—",
+            )
+            for column, value in enumerate(values):
+                self.event_table.setItem(index, column, QTableWidgetItem(str(value)))
+            batch_button = QPushButton(f"批次#{event['batch_id']}")
+            batch_button.clicked.connect(lambda _, value=event["batch_id"]: self._show_batch(value))
+            self.event_table.setCellWidget(index, 5, batch_button)
+            if event["quote_id"] is not None:
+                quote_button = QPushButton(f"订单#{event['quote_id']}")
+                quote_button.clicked.connect(lambda _, value=event["quote_id"]: self._show_quote(value))
+                self.event_table.setCellWidget(index, 6, quote_button)
+            else:
+                self.event_table.setItem(index, 6, QTableWidgetItem("—"))
+            self.event_table.setItem(index, 7, QTableWidgetItem("已记录事件"))
+        self.event_table.resizeColumnsToContents()
 
 
 # ============================================================

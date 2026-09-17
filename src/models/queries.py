@@ -1304,3 +1304,112 @@ def find_sn_batch_matches(sn: str, db_path=None) -> list[dict]:
         return [dict(row) for row in rows if sn in normalize_sn_list(row["sn_list"])]
     finally:
         conn.close()
+
+
+def get_sn_lifecycle(sn: str, db_path=None) -> dict:
+    """Read the evidence-backed lifecycle of one exact SN without mutations."""
+    from src.models.inventory_repository import normalize_sn_list, duplicate_active_shipped_sns
+
+    serial = (sn or "").strip()
+    if not serial:
+        return {"sn": "", "events": [], "status": "未输入", "evidence": []}
+    conn = connect(db_path, read_only=True)
+    try:
+        evidence: list[str] = []
+        source_rows = conn.execute(
+            """
+            SELECT b.id,b.product_id,b.remaining,b.quantity,b.sn_list,p.series,p.cpu
+            FROM batches b JOIN products p ON p.id=b.product_id
+            WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL AND b.sn_list LIKE ?
+            ORDER BY b.id
+            """, (f"%{serial}%",)
+        ).fetchall()
+        sources = [dict(row) for row in source_rows if serial in normalize_sn_list(row["sn_list"])]
+        if len(sources) > 1:
+            evidence.append("SN在多个在库批次中出现：" + "、".join(f"批次#{row['id']}" for row in sources))
+        if serial in duplicate_active_shipped_sns(conn):
+            evidence.append("SN同时出现在多个未释放的出库分配中")
+
+        events: list[dict] = []
+        movement_rows = conn.execute(
+            """
+            SELECT im.id,im.movement_date,im.created_at,im.movement_type,im.batch_id,
+                   b.product_id,p.series,p.cpu,sa.id AS shipment_allocation_id,
+                   ss.quote_id,c.name AS customer_name,
+                   COALESCE((SELECT MAX(ol.id) FROM operation_logs ol
+                             WHERE ol.table_name=CASE WHEN im.movement_type='purchase_receipt'
+                                                       THEN 'batches' ELSE 'quotes' END
+                               AND ol.record_id=CASE WHEN im.movement_type='purchase_receipt'
+                                                    THEN im.batch_id ELSE ss.quote_id END), im.id) AS sequence,
+                   im.sn_list
+            FROM inventory_movements im
+            JOIN batches b ON b.id=im.batch_id
+            JOIN products p ON p.id=b.product_id
+            LEFT JOIN shipment_allocations sa ON sa.id=im.shipment_allocation_id
+            LEFT JOIN shipment_snapshots ss ON ss.id=sa.shipment_snapshot_id
+            LEFT JOIN quotes q ON q.id=ss.quote_id
+            LEFT JOIN customers c ON c.id=q.customer_id
+            WHERE im.movement_type IN ('purchase_receipt','sales_shipment')
+              AND im.sn_list LIKE ?
+            """, (f"%{serial}%",)
+        ).fetchall()
+        for row in movement_rows:
+            item = dict(row)
+            if serial not in normalize_sn_list(item["sn_list"]):
+                continue
+            kind = "入库" if item["movement_type"] == "purchase_receipt" else "出库"
+            events.append({
+                "kind": kind, "business_date": item["movement_date"],
+                "record_time": item["created_at"], "sequence": item["sequence"],
+                "event_id": item["id"], "batch_id": item["batch_id"],
+                "quote_id": item["quote_id"], "customer_name": item["customer_name"] or "",
+                "series": item["series"], "cpu": item["cpu"] or "", "restock": None,
+            })
+        return_rows = conn.execute(
+            """
+            SELECT ra.id,sr.id AS return_id,sr.return_date,sr.created_at,ra.restock_quantity,
+                   sa.batch_id,ss.quote_id,c.name AS customer_name,b.product_id,p.series,p.cpu,
+                   COALESCE((SELECT MAX(ol.id) FROM operation_logs ol
+                             WHERE ol.table_name='sales_returns' AND ol.record_id=sr.id), ra.id) AS sequence,
+                   ra.sn_list
+            FROM sales_return_allocations ra
+            JOIN sales_returns sr ON sr.id=ra.sales_return_id
+            JOIN shipment_allocations sa ON sa.id=ra.shipment_allocation_id
+            JOIN shipment_snapshots ss ON ss.id=sa.shipment_snapshot_id
+            JOIN batches b ON b.id=sa.batch_id
+            JOIN products p ON p.id=b.product_id
+            LEFT JOIN quotes q ON q.id=ss.quote_id
+            LEFT JOIN customers c ON c.id=q.customer_id
+            WHERE ra.sn_list LIKE ?
+            """, (f"%{serial}%",)
+        ).fetchall()
+        for row in return_rows:
+            item = dict(row)
+            if serial not in normalize_sn_list(item["sn_list"]):
+                continue
+            events.append({
+                "kind": "销售退货" if item["restock_quantity"] else "销售退货（不回库）",
+                "business_date": item["return_date"], "record_time": item["created_at"],
+                "sequence": item["sequence"], "event_id": item["return_id"],
+                "batch_id": item["batch_id"], "quote_id": item["quote_id"],
+                "customer_name": item["customer_name"] or "", "series": item["series"],
+                "cpu": item["cpu"] or "", "restock": bool(item["restock_quantity"]),
+            })
+        events.sort(key=lambda item: (
+            item["business_date"], item["record_time"] or "", item["sequence"], item["event_id"]
+        ))
+        if sources and not any(event["kind"] == "入库" for event in events):
+            evidence.append("批次记录包含该SN，但缺少可确认的入库事件")
+        if not events:
+            status = "未找到"
+        elif evidence:
+            status = "未知/异常"
+        elif events[-1]["kind"] == "入库" or events[-1].get("restock"):
+            status = "在库"
+        elif events[-1].get("restock") is False:
+            status = "退货未回库"
+        else:
+            status = "已出库"
+        return {"sn": serial, "events": events, "status": status, "evidence": evidence}
+    finally:
+        conn.close()
