@@ -48,6 +48,7 @@ from src.models.connection import (
     get_database_path,
 )
 from src.services.reconciliation_service import ReconciliationService
+from src.services.historical_repair_service import HistoricalRepairService
 from src.version import APP_DISPLAY_NAME
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
 from src.utils.excel_export import export_quotes_to_excel
@@ -212,6 +213,14 @@ class MainWindow(QMainWindow):
         export_reconcile_action.triggered.connect(self.on_export_reconciliation_report)
         data_menu.addAction(export_reconcile_action)
 
+        historical_repair_action = QAction("核对历史异常并修复…", self)
+        historical_repair_action.triggered.connect(self.on_repair_historical_anomalies)
+        data_menu.addAction(historical_repair_action)
+
+        export_historical_action = QAction("导出历史异常清单…", self)
+        export_historical_action.triggered.connect(self.on_export_historical_anomalies)
+        data_menu.addAction(export_historical_action)
+
         data_menu.addSeparator()
         backup_action = QAction("立即创建 SQLite 备份", self)
         backup_action.triggered.connect(self.on_create_database_backup)
@@ -260,6 +269,66 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", str(exc))
             return
         QMessageBox.information(self, "导出成功", f"对账报告已保存：\n{output_path}")
+
+    def _historical_repair_plan(self):
+        return HistoricalRepairService(get_database_path()).audit()
+
+    def on_export_historical_anomalies(self):
+        try:
+            plan = self._historical_repair_plan()
+        except Exception as exc:
+            QMessageBox.critical(self, "核对失败", str(exc))
+            return
+        default_path = get_backup_dir() / (
+            f"historical_anomalies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出历史异常清单", str(default_path), "文本文件 (*.txt);;所有文件 (*.*)"
+        )
+        if not file_path:
+            return
+        try:
+            output = HistoricalRepairService.export(plan, file_path)
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(self, "导出成功", f"历史异常清单已保存：\n{output}")
+
+    def on_repair_historical_anomalies(self):
+        try:
+            plan = self._historical_repair_plan()
+        except Exception as exc:
+            QMessageBox.critical(self, "核对失败", str(exc))
+            return
+        preview = plan.format_text()
+        if not plan.repairable:
+            QMessageBox.warning(self, "历史异常核对（只读）", preview + "\n\n没有证据充分的自动修复项，请导出后人工核对。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认历史修复",
+            preview + "\n\n仅会更新上述可确定的报价缓存字段；将先创建并验证安全备份。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = HistoricalRepairService(get_database_path()).apply(
+                plan, reason="用户确认：历史异常修复"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "历史修复失败", str(exc))
+            return
+        self.refresh_records()
+        self.finance_tab.refresh()
+        remaining = len(result.remaining_report.issues)
+        QMessageBox.information(
+            self,
+            "历史修复完成",
+            f"已修复 {len(result.applied)} 项；安全备份：{result.backup.path}\n"
+            f"SHA-256：{result.backup.sha256}\n未解决异常：{remaining} 项。",
+        )
 
     def on_create_database_backup(self):
         try:
