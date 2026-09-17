@@ -13,8 +13,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.models.schema import SCHEMA_VERSION
 
 
+def process_ids_for_executable(exe):
+    """Return visible PIDs for this exact candidate EXE, without matching other apps."""
+    script = (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "Get-Process | Where-Object { $_.Path -eq $env:STOCKMATE_VALIDATION_EXE } | "
+        "ForEach-Object { $_.Id }"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "STOCKMATE_VALIDATION_EXE": str(exe)},
+    )
+    return {int(line) for line in result.stdout.splitlines() if line.strip().isdigit()}
+
+
+def stop_created_processes(pids):
+    if not pids:
+        return
+    script = (
+        "$ids = $env:STOCKMATE_VALIDATION_PIDS -split ',' | "
+        "ForEach-Object { [int]$_ }; "
+        "Stop-Process -Id $ids -Force -ErrorAction Stop"
+    )
+    subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=True,
+        env={**os.environ, "STOCKMATE_VALIDATION_PIDS": ",".join(map(str, sorted(pids)))},
+    )
+
+
 def main():
     exe = Path(sys.argv[1]).resolve(strict=True)
+    existing_pids = process_ids_for_executable(exe)
     with tempfile.TemporaryDirectory(prefix="diaohuo-startup-") as folder:
         startup = subprocess.STARTUPINFO()
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -46,11 +80,7 @@ def main():
                 raise RuntimeError(f"EXE exited after initialization: {process.returncode}")
             print(f"EXE startup passed; schema={version}; integrity={integrity}", flush=True)
         finally:
-            if process.poll() is None:
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    capture_output=True, check=True,
-                )
+            stop_created_processes(process_ids_for_executable(exe) - existing_pids)
             process.wait(timeout=10)
 
 
