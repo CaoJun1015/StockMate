@@ -1278,3 +1278,29 @@ def collect_reconciliation_snapshots(db_path=None) -> tuple[dict, dict]:
         )
     finally:
         conn.close()
+
+
+def find_sn_batch_matches(sn: str, db_path=None) -> list[dict]:
+    """Return active batches that explicitly contain ``sn``.
+
+    SN lists are legacy comma-separated text, so SQLite cannot safely use a
+    substring match as evidence.  The small candidate set is filtered with
+    the same normalizer used by inventory writes.
+    """
+    from src.models.inventory_repository import normalize_sn_list
+
+    conn = connect(db_path, read_only=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT b.id,b.product_id,b.remaining,b.quantity,b.sn_list,p.series,p.cpu
+            FROM batches b JOIN products p ON p.id=b.product_id
+            WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL
+              AND b.sn_list LIKE ?
+            ORDER BY b.id
+            """,
+            (f"%{sn}%",),
+        ).fetchall()
+        return [dict(row) for row in rows if sn in normalize_sn_list(row["sn_list"])]
+    finally:
+        conn.close()

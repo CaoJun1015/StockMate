@@ -25,7 +25,8 @@ from src.services.party_service import CustomerService, SupplierService
 from src.models.finance_queries import list_financial_accounts
 from src.ui.display_labels import format_operation_object
 from src.utils.money import cents_to_yuan, format_yuan
-from src.utils.shipment_flow import parse_sn_input, validate_sn_list, check_sn_duplicates
+from src.utils.shipment_flow import parse_sn_input, validate_sn
+from src.models.queries import find_sn_batch_matches
 
 
 from src.ui.utils import _validate_date
@@ -50,10 +51,11 @@ def _parse_tax_rate(combo):
 # 出库对话框
 # ============================================================
 class ShipmentDialog(QDialog):
-    def __init__(self, parent=None, quote=None, batches=None):
+    def __init__(self, parent=None, quote=None, batches=None, *, db_path=None):
         super().__init__(parent)
         self.quote = quote
         self.batches = batches or []
+        self.db_path = db_path
         self.setWindowTitle("确认出库")
         self.setMinimumWidth(760)
         layout = QFormLayout(self)
@@ -84,11 +86,32 @@ class ShipmentDialog(QDialog):
             quantity_edit.setRange(0, max(int(batch.get("remaining", 0)), 0))
             sn_edit = QLineEdit()
             sn_edit.setPlaceholderText("逗号/空格分隔；不录可留空")
+            quantity_edit.valueChanged.connect(self._update_allocation_summary)
+            sn_edit.textChanged.connect(self._sync_quantity_from_sns)
             self.allocation_table.setCellWidget(row, 4, quantity_edit)
             self.allocation_table.setCellWidget(row, 5, sn_edit)
             self.allocation_rows.append((batch, quantity_edit, sn_edit))
         self.allocation_table.setMinimumHeight(min(280, 85 + len(self.batches) * 32))
         layout.addRow("批次分配:", self.allocation_table)
+
+        self.scan_edit = QLineEdit()
+        self.scan_edit.setPlaceholderText("扫码后按 Enter 加入；不会提交出库单")
+        self.scan_edit.returnPressed.connect(self._consume_scan_input)
+        layout.addRow("连续扫码:", self.scan_edit)
+
+        self.paste_edit = QTextEdit()
+        self.paste_edit.setPlaceholderText("可粘贴多行 SN，再点“加入扫码”")
+        self.paste_edit.setFixedHeight(58)
+        paste_row = QHBoxLayout()
+        paste_row.addWidget(self.paste_edit)
+        paste_button = QPushButton("加入扫码")
+        paste_button.setAutoDefault(False)
+        paste_button.clicked.connect(self._consume_paste_input)
+        paste_row.addWidget(paste_button)
+        layout.addRow("批量粘贴:", paste_row)
+        self.scan_summary = QLabel("尚未扫码；也可手工指定批次和数量")
+        self.scan_summary.setWordWrap(True)
+        layout.addRow("扫码提示:", self.scan_summary)
 
         self.remaining_label = QLabel(
             f"请手工分配，共需 {quote.get('quote_quantity', 1) or 1} 台"
@@ -104,9 +127,82 @@ class ShipmentDialog(QDialog):
         layout.addRow("备注:", self.remark_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setAutoDefault(False)
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
+
+    def _sync_quantity_from_sns(self):
+        for _, quantity_edit, sn_edit in self.allocation_rows:
+            count = len(parse_sn_input(sn_edit.text()))
+            if count != quantity_edit.value():
+                quantity_edit.setValue(min(count, quantity_edit.maximum()))
+        self._update_allocation_summary()
+
+    def _update_allocation_summary(self):
+        quantity = self.quote.get("quote_quantity", 1) or 1
+        assigned = sum(spin.value() for _, spin, _ in self.allocation_rows)
+        remaining = quantity - assigned
+        self.remaining_label.setText(
+            f"已分配 {assigned} / {quantity} 台；待分配 {max(remaining, 0)} 台"
+            if remaining >= 0 else f"已超分配 {-remaining} 台，请调整批次数量"
+        )
+
+    def _consume_paste_input(self):
+        raw = self.paste_edit.toPlainText()
+        self.paste_edit.clear()
+        self._consume_scans(raw)
+
+    def _consume_scan_input(self):
+        raw = self.scan_edit.text()
+        self.scan_edit.clear()
+        self._consume_scans(raw)
+
+    def _consume_scans(self, raw: str):
+        """Route only the newly scanned tokens; Enter never accepts the dialog."""
+        tokens = parse_sn_input(raw)
+        if not tokens:
+            return
+        assigned_sns = {
+            sn for _, _, edit in self.allocation_rows
+            for sn in parse_sn_input(edit.text())
+        }
+        messages = []
+        for sn in tokens:
+            valid, reason = validate_sn(sn)
+            if not valid:
+                messages.append(f"{sn}：{reason}")
+                continue
+            if sn in assigned_sns:
+                messages.append(f"{sn}：重复扫码，未重复加入")
+                continue
+            matches = find_sn_batch_matches(sn, self.db_path)
+            current = [
+                (batch, spin, edit) for batch, spin, edit in self.allocation_rows
+                if batch["id"] in {item["id"] for item in matches}
+            ]
+            if not matches:
+                messages.append(f"{sn}：未知 SN，请手工选择批次")
+                continue
+            if not current:
+                source = matches[0]
+                messages.append(
+                    f"{sn}：属于其他机型 {source['series']} {source.get('cpu') or ''}，未加入"
+                )
+                continue
+            if len(current) != 1:
+                messages.append(f"{sn}：来源有多个批次，请手工选择")
+                continue
+            batch, spin, edit = current[0]
+            if spin.value() >= spin.maximum():
+                messages.append(f"{sn}：批次#{batch['id']}库存不足，未加入")
+                continue
+            values = parse_sn_input(edit.text())
+            edit.setText(",".join([*values, sn]))
+            assigned_sns.add(sn)
+            messages.append(f"{sn}：已定位批次#{batch['id']}")
+        self.scan_summary.setText("；".join(messages[-8:]))
+        self._update_allocation_summary()
 
     def _validate_and_accept(self):
         quantity = self.quote.get("quote_quantity", 1) or 1
@@ -114,6 +210,7 @@ class ShipmentDialog(QDialog):
         if sum(item["quantity"] for item in allocations) != quantity:
             QMessageBox.warning(self, "提示", f"批次分配合计必须等于 {quantity} 台")
             return
+        all_sns = []
         for item in allocations:
             sn_list = parse_sn_input(item["sn_list"])
             if sn_list and len(sn_list) != item["quantity"]:
@@ -121,13 +218,15 @@ class ShipmentDialog(QDialog):
                     self, "提示", f"批次#{item['batch_id']}的SN数量必须等于出库数量"
                 )
                 return
-            sn_pattern = re.compile(r"^[A-Za-z0-9\-]{4,20}$")
             for sn in sn_list:
-                if not sn_pattern.match(sn):
-                    QMessageBox.warning(self, "SN格式错误",
-                        f"序列号格式不正确: {sn}\n"
-                        "SN应为4-20位字母/数字/连字符，不含特殊符号")
+                valid, reason = validate_sn(sn)
+                if not valid:
+                    QMessageBox.warning(self, "SN格式错误", f"序列号格式不正确: {sn}\n{reason}")
                     return
+            all_sns.extend(sn_list)
+        if len(set(all_sns)) != len(all_sns):
+            QMessageBox.warning(self, "提示", "同一 SN 不能分配到多个批次")
+            return
         self.accept()
 
     def _allocations(self):
