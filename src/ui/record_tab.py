@@ -38,6 +38,7 @@ from src.utils.tax import calc_tax_adjusted_profit_cents
 from src.ui.dialogs import ShipmentDialog, SNLifecycleDialog, QuoteEditDialog
 from src.ui.finance_dialogs import PaymentDialog, ReturnDialog
 from src.ui.utils import refreshing_table
+from src.ui.background_tasks import start_background_task
 
 
 class RecordTab(QWidget):
@@ -728,8 +729,7 @@ class RecordTab(QWidget):
                 QMessageBox.warning(self, "提示", "请至少选择一个机型")
                 return
             paths = generate_quote_image(selected)
-            msg = f"已生成 {len(paths)} 张图片:\n" + "\n".join(paths)
-            QMessageBox.information(self, "生成完成", msg)
+            QMessageBox.information(self, "生成完成", f"已生成 {len(paths)} 张图片:\n" + "\n".join(paths))
 
     # -------------------------------------------------------
     # 导出 Excel
@@ -746,8 +746,29 @@ class RecordTab(QWidget):
         if not quotes:
             QMessageBox.warning(self, "提示", "当前筛选条件下没有报价记录")
             return
-        output = export_quotes_to_excel(quotes)
+        owner = self.window()
+        self.export_records_btn.setEnabled(False)
+        self.export_records_btn.setText("正在导出…")
+        started = start_background_task(
+            owner, "quote-excel", lambda: export_quotes_to_excel(quotes),
+            lambda output: self._finish_quote_export(output),
+            lambda message: self._fail_quote_export(message),
+        )
+        if not started:
+            self.export_records_btn.setEnabled(True)
+            self.export_records_btn.setText("导出 Excel")
+            QMessageBox.information(self, "提示", "报价 Excel 正在导出，请等待完成")
+
+    def _finish_quote_export(self, output):
+        self.export_records_btn.setEnabled(True)
+        self.export_records_btn.setText("导出 Excel")
         QMessageBox.information(self, "导出成功", f"报价记录已导出:\n{output}")
+
+    def _fail_quote_export(self, message):
+        self.export_records_btn.setEnabled(True)
+        self.export_records_btn.setText("导出 Excel")
+        QMessageBox.warning(self, "导出失败", message)
+
 
     def on_export_excel(self):
         """从菜单/工具栏导出全部记录"""

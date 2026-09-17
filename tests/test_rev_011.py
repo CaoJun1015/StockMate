@@ -54,4 +54,5 @@ def test_pagination_keeps_full_filtered_result_for_totals_and_export(qapp, qtbot
     assert tab.record_table.rowCount() == 1
     tab.status_filter.setCurrentText("已出库")
     tab.on_export_records_excel()
+    qtbot.waitUntil(lambda: bool(captured), timeout=1_000)
     assert len(captured[0]) == 251

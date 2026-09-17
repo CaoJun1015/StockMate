@@ -3,10 +3,25 @@ Excel 导出模块：将报价记录导出为 .xlsx 格式
 """
 
 import os
+from pathlib import Path
+from uuid import uuid4
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from src.utils.money import cents_to_yuan
+
+
+def _save_workbook_atomically(workbook, output_path):
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.stem}.{uuid4().hex}{target.suffix}")
+    try:
+        workbook.save(temporary)
+        os.replace(temporary, target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return str(target)
 
 
 def export_quotes_to_excel(quotes, output_path=None):
@@ -139,9 +154,7 @@ def export_quotes_to_excel(quotes, output_path=None):
     # 冻结首行
     ws.freeze_panes = "A2"
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    wb.save(output_path)
-    return output_path
+    return _save_workbook_atomically(wb, output_path)
 
 
 def export_finance_to_excel(
@@ -335,6 +348,4 @@ def export_finance_to_excel(
             for row in profit
         ],
     )
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    wb.save(output_path)
-    return output_path
+    return _save_workbook_atomically(wb, output_path)

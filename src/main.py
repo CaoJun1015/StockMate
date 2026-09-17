@@ -40,6 +40,9 @@ from src.ui.customer_tab import CustomerTab
 from src.ui.supplier_tab import SupplierTab
 from src.ui.finance_tab import FinanceTab
 from src.ui.utils import _validate_date, _global_excepthook
+from src.ui.background_tasks import (
+    has_background_tasks, write_text_atomically,
+)
 from src.models.migrations import DatabaseMigrationError
 from src.models.connection import (
     DatabaseRestoreError,
@@ -262,9 +265,7 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         try:
-            output_path = Path(file_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(report.format_text(), encoding="utf-8")
+            output_path = write_text_atomically(file_path, report.format_text())
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", str(exc))
             return
@@ -579,16 +580,19 @@ class MainWindow(QMainWindow):
 
     def on_export_json(self):
         """导出全量数据为 JSON 格式"""
+        from src.utils.json_export import export_all_to_json
         try:
-            from src.utils.json_export import export_all_to_json
-
             output_path = export_all_to_json()
-            QMessageBox.information(
-                self, "导出成功",
-                f"数据已成功导出为 JSON 格式！\n\n文件位置: {output_path}\n\n可用于数据备份或迁移到其他电脑。"
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", f"导出时发生错误:\n{str(e)}")
+            QMessageBox.information(self, "导出成功", f"数据已成功导出为 JSON 格式！\n\n文件位置: {output_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"导出时发生错误:\n{exc}")
+
+    def closeEvent(self, event):
+        if has_background_tasks(self):
+            QMessageBox.information(self, "任务进行中", "读取或导出正在完成；为保护输出文件，请完成后再关闭窗口。")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def on_import_json(self):
         file_path, _ = QFileDialog.getOpenFileName(

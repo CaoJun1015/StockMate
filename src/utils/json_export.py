@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,8 +34,14 @@ def export_all_to_json(output_path=None, db_path=None):
         "money_unit": "cents",
         "data": export_backup_data(db_path),
     }
-    with output_path.open("w", encoding="utf-8") as stream:
-        json.dump(document, stream, ensure_ascii=False, indent=2)
+    temporary = output_path.with_name(f".{output_path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(document, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, output_path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     return str(output_path)
 
 

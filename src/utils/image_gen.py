@@ -3,6 +3,7 @@
 """
 
 import os
+from uuid import uuid4
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
@@ -68,6 +69,7 @@ def generate_quote_image(products, output_path=None, rows_per_page=20):
         start = end
 
     output_paths = []
+    temporary_paths = []
     for page_idx, page_products in enumerate(pages):
         page_height = margin * 2 + header_height + len(page_products) * row_height + footer_height
 
@@ -137,8 +139,26 @@ def generate_quote_image(products, output_path=None, rows_per_page=20):
             save_path = f"{base}_p{page_idx + 1}{ext}"
 
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        img.save(save_path, "PNG")
+        base, ext = os.path.splitext(save_path)
+        temporary = f"{base}.{uuid4().hex}.tmp{ext}"
+        try:
+            img.save(temporary, "PNG")
+        except Exception:
+            for old in temporary_paths:
+                if os.path.exists(old):
+                    os.remove(old)
+            raise
         output_paths.append(save_path)
+        temporary_paths.append(temporary)
+
+    try:
+        for temporary, output in zip(temporary_paths, output_paths):
+            os.replace(temporary, output)
+    except Exception:
+        for temporary in temporary_paths:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        raise
 
     return output_paths
 
