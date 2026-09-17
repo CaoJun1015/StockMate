@@ -1,5 +1,6 @@
 """报价记录 Tab"""
 from datetime import datetime, date as date_type
+from math import ceil
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
@@ -10,11 +11,10 @@ from PyQt6.QtWidgets import (
     QFrame, QHeaderView, QAbstractItemView, QCheckBox, QGroupBox,
     QApplication,
 )
-from PyQt6.QtCore import Qt, QDate
+from PyQt6.QtCore import Qt, QDate, QTimer
 from PyQt6.QtGui import QColor, QClipboard
 
 from src.models.queries import (
-    export_quotes,
     get_batch_detail,
     get_quote_detail,
     list_batches,
@@ -52,6 +52,15 @@ class RecordTab(QWidget):
         self.payment_service = PaymentService()
         self.return_service = ReturnService()
         self.product_service = ProductService()
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self._refresh_debounced_search)
+        self._last_filter_key = None
+        self._columns_sized = False
+        self._all_quotes = []
+        self._page = 0
+        self._page_size = 250
         self._build_ui()
 
     def _build_ui(self):
@@ -103,7 +112,7 @@ class RecordTab(QWidget):
 
         self.record_search = QLineEdit()
         self.record_search.setPlaceholderText("搜索机型/序列...")
-        self.record_search.textChanged.connect(self.refresh_records)
+        self.record_search.textChanged.connect(self._schedule_search_refresh)
 
         self.date_from = QDateEdit()
         self.date_from.setCalendarPopup(True)
@@ -132,6 +141,16 @@ class RecordTab(QWidget):
         filter_layout.addWidget(self.status_filter)
         filter_layout.addWidget(QLabel("搜索:"))
         filter_layout.addWidget(self.record_search)
+        self.previous_page_btn = QPushButton("上一页")
+        self.previous_page_btn.setObjectName("ghostBtn")
+        self.previous_page_btn.clicked.connect(lambda: self._change_page(-1))
+        self.page_label = QLabel()
+        self.next_page_btn = QPushButton("下一页")
+        self.next_page_btn.setObjectName("ghostBtn")
+        self.next_page_btn.clicked.connect(lambda: self._change_page(1))
+        filter_layout.addWidget(self.previous_page_btn)
+        filter_layout.addWidget(self.page_label)
+        filter_layout.addWidget(self.next_page_btn)
         filter_layout.addStretch()
         filter_layout.addWidget(self.export_records_btn)
 
@@ -162,15 +181,42 @@ class RecordTab(QWidget):
     # -------------------------------------------------------
     # 报价记录
     # -------------------------------------------------------
-    def refresh_records(self):
+    def _schedule_search_refresh(self):
+        self._search_timer.start()
+
+    def _refresh_debounced_search(self):
+        self.refresh_records(skip_if_unchanged=True)
+
+    def _change_page(self, offset):
+        pages = max(1, ceil(len(self._all_quotes) / self._page_size))
+        page = min(max(self._page + offset, 0), pages - 1)
+        if page != self._page:
+            self._page = page
+            self.refresh_records(quotes_override=self._all_quotes)
+
+    def refresh_records(self, *, skip_if_unchanged=False, quotes_override=None):
         keyword = self.record_search.text().strip()
         date_from = self.date_from.date().toString("yyyy-MM-dd")
         date_to = self.date_to.date().toString("yyyy-MM-dd")
-        quotes = search_quotes(keyword, date_from, date_to)
-
         status_filter = self.status_filter.currentText()
-        if status_filter != "全部状态":
-            quotes = [q for q in quotes if q.get("status", "待确认") == status_filter]
+        filter_key = (keyword, date_from, date_to, status_filter)
+        if skip_if_unchanged and filter_key == self._last_filter_key:
+            return
+        if quotes_override is None:
+            quotes = search_quotes(keyword, date_from, date_to)
+            if status_filter != "全部状态":
+                quotes = [q for q in quotes if q.get("status", "待确认") == status_filter]
+            self._last_filter_key = filter_key
+            self._all_quotes = quotes
+            self._page = 0
+        else:
+            quotes = quotes_override
+        pages = max(1, ceil(len(quotes) / self._page_size))
+        self._page = min(self._page, pages - 1)
+        visible_quotes = quotes[self._page * self._page_size:(self._page + 1) * self._page_size]
+        self.page_label.setText(f"第 {self._page + 1}/{pages} 页（共 {len(quotes)} 条）")
+        self.previous_page_btn.setEnabled(self._page > 0)
+        self.next_page_btn.setEnabled(self._page + 1 < pages)
 
         STATUS_COLORS = {
             "待确认": "#9E9E9E",
@@ -182,10 +228,10 @@ class RecordTab(QWidget):
         }
 
         with refreshing_table(self.record_table, key_column=0):
-            self.record_table.setRowCount(len(quotes))
+            self.record_table.setRowCount(len(visible_quotes))
             total_cost = 0
             total_sale = 0
-            for i, q in enumerate(quotes):
+            for i, q in enumerate(visible_quotes):
                 status = q.get("status", "待确认")
                 received = q.get("received_amount_cents", 0) or 0
                 sn_list = q.get("sn_list", "") or q.get("batch_sn_list", "") or ""
@@ -256,10 +302,12 @@ class RecordTab(QWidget):
                         except ValueError:
                             pass
 
-        self.record_table.resizeColumnsToContents()
-        self.record_table.setColumnWidth(12, 70)
-        self.record_table.setColumnWidth(13, 80)
-        self.record_table.setColumnWidth(14, 120)
+        if not self._columns_sized:
+            self.record_table.resizeColumnsToContents()
+            self.record_table.setColumnWidth(12, 70)
+            self.record_table.setColumnWidth(13, 80)
+            self.record_table.setColumnWidth(14, 120)
+            self._columns_sized = True
 
         # 税后利润统计
         tax_total_cost = 0
@@ -687,9 +735,14 @@ class RecordTab(QWidget):
     # 导出 Excel
     # -------------------------------------------------------
     def on_export_records_excel(self):
-        date_from = self.date_from.date().toString("yyyy-MM-dd")
-        date_to = self.date_to.date().toString("yyyy-MM-dd")
-        quotes = export_quotes(date_from, date_to)
+        filter_key = (
+            self.record_search.text().strip(),
+            self.date_from.date().toString("yyyy-MM-dd"),
+            self.date_to.date().toString("yyyy-MM-dd"), self.status_filter.currentText(),
+        )
+        if filter_key != self._last_filter_key:
+            self.refresh_records()
+        quotes = self._all_quotes
         if not quotes:
             QMessageBox.warning(self, "提示", "当前筛选条件下没有报价记录")
             return

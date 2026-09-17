@@ -10,6 +10,7 @@ from src.models.queries import (
     get_customer_reference_counts,
     list_customers,
 )
+from PyQt6.QtCore import QTimer
 from src.models.finance_queries import get_customer_actual_performance
 from src.services.exceptions import ServiceError
 from src.services.party_service import CustomerService
@@ -29,6 +30,10 @@ class CustomerTab(QWidget):
         self.customer_stats_label = None
         self.customer_history_table = None
         self.customer_service = CustomerService()
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self.refresh_customer_list)
         self._build_ui()
     
     def _build_ui(self):
@@ -48,7 +53,7 @@ class CustomerTab(QWidget):
         self.customer_search = QLineEdit()
         self.customer_search.setObjectName("globalSearch")
         self.customer_search.setPlaceholderText("搜索客户...")
-        self.customer_search.textChanged.connect(self.refresh_customer_list)
+        self.customer_search.textChanged.connect(lambda: self._search_timer.start())
         btn_row.addWidget(self.customer_search)
         layout.addLayout(btn_row)
 

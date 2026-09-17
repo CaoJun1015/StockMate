@@ -4,6 +4,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPushButton, QLabel,
     QLineEdit, QGroupBox, QMessageBox, QAbstractItemView,
 )
+from PyQt6.QtCore import QTimer
 
 from src.models.queries import (
     get_supplier,
@@ -29,6 +30,10 @@ class SupplierTab(QWidget):
         self.supplier_stats_label = None
         self.supplier_history_table = None
         self.supplier_service = SupplierService()
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self.refresh_supplier_list)
         self._build_ui()
 
     def _build_ui(self):
@@ -48,7 +53,7 @@ class SupplierTab(QWidget):
         self.supplier_search = QLineEdit()
         self.supplier_search.setObjectName("globalSearch")
         self.supplier_search.setPlaceholderText("搜索上游...")
-        self.supplier_search.textChanged.connect(self.refresh_supplier_list)
+        self.supplier_search.textChanged.connect(lambda: self._search_timer.start())
         btn_row.addWidget(self.supplier_search)
         layout.addLayout(btn_row)
 
