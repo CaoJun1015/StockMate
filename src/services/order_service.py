@@ -23,9 +23,7 @@ from src.services.exceptions import (
 
 VALID_TRANSITIONS = {
     "待确认": {"已报价", "已取消"},
-    "已报价": {"已出库", "已取消"},
-    "已出库": {"已收款", "已取消"},
-    "已收款": set(),
+    "已报价": {"已取消"},
     "已取消": set(),
 }
 
@@ -150,6 +148,10 @@ class OrderService:
             if not quote:
                 raise NotFoundError("报价记录不存在")
             old_status = quote["status"]
+            if new_status in ("已出库", "已收款"):
+                raise InvalidTransitionError(
+                    "出库和收款状态必须由完整业务事务产生，不能通过通用状态接口修改"
+                )
             if old_status in ("已出库", "已收款") and new_status == "已取消":
                 raise InvalidTransitionError(
                     "已出库订单不能直接取消，请使用销售退货"

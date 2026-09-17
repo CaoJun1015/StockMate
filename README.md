@@ -1,6 +1,6 @@
 <div align="center">
 
-# 📦 调货助手
+# 📦 货管家 · StockMate
 
 **面向 IT 硬件经销商的一站式桌面管理工具**
 

@@ -78,9 +78,11 @@ class PaymentDialog(QDialog):
         self.setMinimumWidth(420)
         layout = QFormLayout(self)
         if quote:
-            total = (quote.get("quote_price_cents") or 0) * (
-                quote.get("quote_quantity") or 1
-            )
+            total = quote.get("net_total_cents")
+            if total is None:
+                total = (quote.get("quote_price_cents") or 0) * (
+                    quote.get("quote_quantity") or 1
+                )
             received = quote.get("received_amount_cents") or 0
             layout.addRow(
                 QLabel(
@@ -482,7 +484,7 @@ class ReturnDialog(QDialog):
                 )
                 spin.setRange(0, available)
                 sn_edit = QLineEdit()
-                sn_edit.setPlaceholderText("可留空；逗号/空格分隔")
+                sn_edit.setPlaceholderText("回库时：唯一来源可留空，否则必须填写；逗号/空格分隔")
                 self.allocation_table.setCellWidget(row, 3, spin)
                 self.allocation_table.setCellWidget(row, 4, sn_edit)
                 self.allocation_rows.append((allocation, spin, sn_edit))

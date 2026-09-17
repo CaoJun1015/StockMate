@@ -1,6 +1,6 @@
-"""Current (schema v6) SQLite schema."""
+"""Current (schema v7) SQLite schema."""
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 CURRENT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -313,6 +313,16 @@ CREATE TABLE IF NOT EXISTS purchase_returns (
     FOREIGN KEY (ledger_entry_id) REFERENCES ledger_entries(id)
 );
 
+CREATE TABLE IF NOT EXISTS payment_refund_allocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payment_id INTEGER NOT NULL REFERENCES payments(id),
+    sales_return_id INTEGER REFERENCES sales_returns(id),
+    purchase_return_id INTEGER REFERENCES purchase_returns(id),
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CHECK ((sales_return_id IS NOT NULL) != (purchase_return_id IS NOT NULL))
+);
+
 CREATE TABLE IF NOT EXISTS operation_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation TEXT NOT NULL,
@@ -374,6 +384,12 @@ CREATE INDEX IF NOT EXISTS idx_supplier_alloc_batch
     ON supplier_payment_allocations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_sales_returns_quote ON sales_returns(quote_id);
 CREATE INDEX IF NOT EXISTS idx_purchase_returns_batch ON purchase_returns(batch_id);
+CREATE INDEX IF NOT EXISTS idx_payment_refund_payment
+    ON payment_refund_allocations(payment_id);
+CREATE INDEX IF NOT EXISTS idx_payment_refund_sales_return
+    ON payment_refund_allocations(sales_return_id);
+CREATE INDEX IF NOT EXISTS idx_payment_refund_purchase_return
+    ON payment_refund_allocations(purchase_return_id);
 CREATE INDEX IF NOT EXISTS idx_logs_time ON operation_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_snapshot_date ON price_snapshots(import_date);
 CREATE INDEX IF NOT EXISTS idx_snapshot_items ON price_snapshot_items(snapshot_id);

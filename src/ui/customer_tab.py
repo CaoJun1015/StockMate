@@ -7,16 +7,15 @@ from PyQt6.QtWidgets import (
 
 from src.models.queries import (
     get_customer,
-    get_customer_history,
     get_customer_reference_counts,
-    get_customer_stats,
     list_customers,
 )
+from src.models.finance_queries import get_customer_actual_performance
 from src.services.exceptions import ServiceError
 from src.services.party_service import CustomerService
 from src.ui.dialogs import CustomerDialog
+from src.ui.utils import refreshing_table
 from src.utils.money import format_yuan
-from src.utils.tax import calc_tax_adjusted_profit_cents
 
 
 class CustomerTab(QWidget):
@@ -65,17 +64,17 @@ class CustomerTab(QWidget):
         self.customer_table.cellClicked.connect(self.on_customer_cell_clicked)
         layout.addWidget(self.customer_table)
 
-        history_group = QGroupBox("购买历史")
+        history_group = QGroupBox("实际成交历史")
         history_layout = QVBoxLayout(history_group)
 
-        self.customer_stats_label = QLabel("请选择客户查看购买历史")
+        self.customer_stats_label = QLabel("请选择客户查看实际成交历史")
         self.customer_stats_label.setObjectName("summaryLabel")
         history_layout.addWidget(self.customer_stats_label)
 
         self.customer_history_table = QTableWidget()
         self.customer_history_table.setAlternatingRowColors(True)
         self.customer_history_table.setColumnCount(8)
-        self.customer_history_table.setHorizontalHeaderLabels(["日期", "机型", "CPU", "数量", "购入价", "报价", "毛利", "备注"])
+        self.customer_history_table.setHorizontalHeaderLabels(["业务日期", "机型", "CPU", "净数量", "实际成本", "实际销售", "实际毛利", "备注"])
         self.customer_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.customer_history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.customer_history_table.horizontalHeader().setStretchLastSection(True)
@@ -87,15 +86,16 @@ class CustomerTab(QWidget):
     def refresh_customer_list(self):
         keyword = self.customer_search.text().strip()
         customers = list_customers(keyword)
-        self.customer_table.setRowCount(len(customers))
-        for i, c in enumerate(customers):
-            self.customer_table.setItem(i, 0, QTableWidgetItem(str(c["id"])))
-            self.customer_table.setItem(i, 1, QTableWidgetItem(c["name"]))
-            self.customer_table.setItem(i, 2, QTableWidgetItem(c.get("wechat", "")))
-            self.customer_table.setItem(i, 3, QTableWidgetItem(c.get("qq", "")))
-            self.customer_table.setItem(i, 4, QTableWidgetItem(c.get("phone", "")))
-            self.customer_table.setItem(i, 5, QTableWidgetItem(c.get("note", "")))
-        self.customer_table.resizeColumnsToContents()
+        with refreshing_table(self.customer_table, key_column=0):
+            self.customer_table.setRowCount(len(customers))
+            for i, c in enumerate(customers):
+                self.customer_table.setItem(i, 0, QTableWidgetItem(str(c["id"])))
+                self.customer_table.setItem(i, 1, QTableWidgetItem(c["name"]))
+                self.customer_table.setItem(i, 2, QTableWidgetItem(c.get("wechat", "")))
+                self.customer_table.setItem(i, 3, QTableWidgetItem(c.get("qq", "")))
+                self.customer_table.setItem(i, 4, QTableWidgetItem(c.get("phone", "")))
+                self.customer_table.setItem(i, 5, QTableWidgetItem(c.get("note", "")))
+            self.customer_table.resizeColumnsToContents()
 
     def on_add_customer(self):
         dlg = CustomerDialog(self)
@@ -113,42 +113,39 @@ class CustomerTab(QWidget):
 
     def on_customer_cell_clicked(self, row, col):
         if row < 0:
-            self.customer_stats_label.setText("请选择客户查看购买历史")
+            self.customer_stats_label.setText("请选择客户查看实际成交历史")
             self.customer_history_table.setRowCount(0)
             return
         
         cid = int(self.customer_table.item(row, 0).text())
         customer_name = self.customer_table.item(row, 1).text()
         
-        quotes = get_customer_history(cid)
-        stats = get_customer_stats(cid)
+        performance = get_customer_actual_performance(cid)
+        quotes = performance["history"]
         
         self.customer_stats_label.setText(
-            f"客户: {customer_name} | 总成交: {stats['total_quotes']}单 | "
-            f"总金额: {format_yuan(stats['total_amount_cents'])} | "
-            f"总毛利: {format_yuan(stats['total_profit_cents'])}"
+            f"客户: {customer_name} | 实际出库: {performance['total_quotes']}单 | "
+            f"净销售: {format_yuan(performance['total_amount_cents'])} | "
+            f"实际毛利: {format_yuan(performance['total_profit_cents'])}"
+            + (" | 账本启用前历史不完整，未计入实际口径" if not performance["history_complete"] else "")
         )
         
-        self.customer_history_table.setRowCount(len(quotes))
-        for i, q in enumerate(quotes):
-            purchase_price = q.get("purchase_price_cents", 0) or 0
-            quote_price = q.get("quote_price_cents", 0) or 0
-            quantity = q.get("quote_quantity", 1) or 1
-            profit = calc_tax_adjusted_profit_cents(
-                purchase_price, quote_price, quantity,
-                q.get("tax_rate"), q.get("purchase_tax_inclusive", 0) or 0, q.get("quote_tax_inclusive", 0) or 0,
-            )
-            
-            self.customer_history_table.setItem(i, 0, QTableWidgetItem(q.get("quote_date", "")))
-            self.customer_history_table.setItem(i, 1, QTableWidgetItem(q.get("series", "")))
-            self.customer_history_table.setItem(i, 2, QTableWidgetItem(q.get("cpu", "")))
-            self.customer_history_table.setItem(i, 3, QTableWidgetItem(str(quantity)))
-            self.customer_history_table.setItem(i, 4, QTableWidgetItem(format_yuan(purchase_price)))
-            self.customer_history_table.setItem(i, 5, QTableWidgetItem(format_yuan(quote_price)))
-            self.customer_history_table.setItem(i, 6, QTableWidgetItem(format_yuan(profit)))
-            self.customer_history_table.setItem(i, 7, QTableWidgetItem(q.get("remark", "")))
-        
-        self.customer_history_table.resizeColumnsToContents()
+        with refreshing_table(self.customer_history_table):
+            self.customer_history_table.setRowCount(len(quotes))
+            for i, q in enumerate(quotes):
+                purchase_price = q.get("actual_cost_cents", 0) or 0
+                quote_price = q.get("actual_sales_cents", 0) or 0
+                quantity = q.get("actual_quantity", 0) or 0
+                profit = q.get("actual_profit_cents", 0) or 0
+                self.customer_history_table.setItem(i, 0, QTableWidgetItem(q.get("business_date", "")))
+                self.customer_history_table.setItem(i, 1, QTableWidgetItem(q.get("series", "")))
+                self.customer_history_table.setItem(i, 2, QTableWidgetItem(q.get("cpu", "")))
+                self.customer_history_table.setItem(i, 3, QTableWidgetItem(str(quantity)))
+                self.customer_history_table.setItem(i, 4, QTableWidgetItem(format_yuan(purchase_price)))
+                self.customer_history_table.setItem(i, 5, QTableWidgetItem(format_yuan(quote_price)))
+                self.customer_history_table.setItem(i, 6, QTableWidgetItem(format_yuan(profit)))
+                self.customer_history_table.setItem(i, 7, QTableWidgetItem(q.get("remark", "")))
+            self.customer_history_table.resizeColumnsToContents()
 
     def on_edit_customer_from_table(self):
         row = self.customer_table.currentRow()

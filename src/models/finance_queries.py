@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 from src.models.connection import connect
-from src.models.inventory_repository import duplicate_active_shipped_sns
+from src.models.inventory_repository import duplicate_active_shipped_sns, normalize_sn_list
 
 
 def get_finance_setup_state(db_path=None) -> dict:
@@ -16,9 +16,13 @@ def get_finance_setup_state(db_path=None) -> dict:
         ).fetchone()
         shipped = conn.execute(
             "SELECT COUNT(*) AS count,"
-            "COALESCE(SUM(quote_price_cents*quote_quantity-received_amount_cents),0) "
+            "COALESCE(SUM(quote_price_cents*quote_quantity-received_amount_cents-COALESCE(("
+            "SELECT SUM(sr.revenue_cents) FROM sales_returns sr WHERE sr.quote_id=quotes.id"
+            "),0)),0) "
             "AS cents FROM quotes WHERE deleted_at IS NULL AND status='已出库' "
-            "AND quote_price_cents*quote_quantity>received_amount_cents"
+            "AND quote_price_cents*quote_quantity-COALESCE(("
+            "SELECT SUM(sr.revenue_cents) FROM sales_returns sr WHERE sr.quote_id=quotes.id"
+            "),0)>received_amount_cents"
         ).fetchone()
         inventory = conn.execute(
             "SELECT COUNT(*) AS count,"
@@ -570,8 +574,67 @@ def get_profit_report(
         conn.close()
 
 
-def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
+def get_customer_actual_performance(customer_id: int, db_path=None) -> dict:
+    """All-time actual customer performance from posted ledger events."""
     conn = connect(db_path, read_only=True)
+    try:
+        setting = conn.execute(
+            "SELECT enabled_at FROM finance_settings WHERE id=1"
+        ).fetchone()
+        enabled_at = setting["enabled_at"] if setting else None
+        history = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT ss.quote_id AS id,ss.shipped_date AS business_date,q.remark,
+                       p.series,p.cpu,p.ram,p.storage,p.gpu,p.screen,p.note,
+                       ss.quantity-COALESCE((
+                           SELECT SUM(sr.quantity) FROM sales_returns sr
+                           WHERE sr.quote_id=ss.quote_id
+                       ),0) AS actual_quantity,
+                       COALESCE((
+                           SELECT SUM(l.credit_cents-l.debit_cents)
+                           FROM ledger_lines l JOIN ledger_accounts a ON a.id=l.account_id
+                           WHERE l.quote_id=ss.quote_id AND a.code='SALES'
+                       ),0) AS actual_sales_cents,
+                       COALESCE((
+                           SELECT SUM(l.debit_cents-l.credit_cents)
+                           FROM ledger_lines l JOIN ledger_accounts a ON a.id=l.account_id
+                           WHERE l.quote_id=ss.quote_id AND a.code='COGS'
+                       ),0) AS actual_cost_cents
+                FROM shipment_snapshots ss
+                JOIN quotes q ON q.id=ss.quote_id
+                JOIN batches b ON b.id=q.batch_id
+                JOIN products p ON p.id=b.product_id
+                WHERE q.customer_id=? AND q.deleted_at IS NULL
+                ORDER BY ss.shipped_date DESC,ss.id DESC
+                """,
+                (customer_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    for row in history:
+        row["actual_profit_cents"] = (
+            row["actual_sales_cents"] - row["actual_cost_cents"]
+        )
+    earliest = min((row["business_date"] for row in history), default=None)
+    complete = bool(enabled_at and (earliest is None or earliest >= enabled_at))
+    return {
+        "history": history,
+        "total_quotes": len(history),
+        "total_amount_cents": sum(row["actual_sales_cents"] for row in history),
+        "total_profit_cents": sum(row["actual_profit_cents"] for row in history),
+        "total_quantity": sum(row["actual_quantity"] for row in history),
+        "enabled_at": enabled_at,
+        "history_complete": complete,
+    }
+
+
+def collect_finance_reconciliation_snapshot(db_path=None, *, conn=None) -> dict:
+    owns_connection = conn is None
+    if owns_connection:
+        conn = connect(db_path, read_only=True)
     try:
         enabled = bool(
             conn.execute(
@@ -750,6 +813,27 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
             {"id": None, "sn_list": sn}
             for sn in duplicate_active_shipped_sns(conn)
         ]
+        sn_ownership = []
+        for row in conn.execute(
+            """
+            SELECT ra.id,ra.sales_return_id,ra.shipment_allocation_id,
+                   ra.restock_quantity,ra.sn_list AS return_sn_list,
+                   sa.sn_list AS shipment_sn_list
+            FROM sales_return_allocations ra
+            JOIN shipment_allocations sa ON sa.id=ra.shipment_allocation_id
+            WHERE ra.restock_quantity>0 AND TRIM(COALESCE(sa.sn_list,''))!=''
+            """
+        ).fetchall():
+            returned_sns = normalize_sn_list(row["return_sn_list"])
+            shipment_sns = set(normalize_sn_list(row["shipment_sn_list"]))
+            if (len(returned_sns) != row["restock_quantity"]
+                    or len(set(returned_sns)) != len(returned_sns)
+                    or not set(returned_sns).issubset(shipment_sns)):
+                sn_ownership.append({
+                    **dict(row),
+                    "confirmed_count": len(returned_sns),
+                    "difference": row["restock_quantity"] - len(returned_sns),
+                })
         shipment_issues = [
             dict(row)
             for row in conn.execute(
@@ -787,17 +871,30 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
             for row in conn.execute(
                 """
                 SELECT p.id,p.amount_cents,p.entry_kind,
-                       COALESCE(SUM(a.amount_cents),0) AS allocated_cents
+                       COALESCE((SELECT SUM(pra.amount_cents)
+                                 FROM payment_refund_allocations pra
+                                 WHERE pra.payment_id=p.id),0) AS refunded_cents,
+                       COALESCE((SELECT SUM(a.amount_cents) FROM payment_allocations a
+                                 WHERE a.payment_id=p.id),0) AS allocated_cents
                 FROM payments p
-                LEFT JOIN payment_allocations a ON a.payment_id=p.id
                 WHERE p.type='receivable'
-                GROUP BY p.id
-                HAVING
-                    (p.entry_kind='payment'
-                     AND (allocated_cents<0 OR allocated_cents>p.amount_cents))
-                    OR
-                    (p.entry_kind='reversal'
-                     AND (allocated_cents>0 OR allocated_cents< -p.amount_cents))
+                  AND (
+                    (p.entry_kind='payment' AND (
+                        COALESCE((SELECT SUM(a.amount_cents) FROM payment_allocations a
+                                  WHERE a.payment_id=p.id),0)<0
+                        OR COALESCE((SELECT SUM(a.amount_cents) FROM payment_allocations a
+                                    WHERE a.payment_id=p.id),0)>(p.amount_cents-COALESCE((
+                            SELECT SUM(pra.amount_cents) FROM payment_refund_allocations pra
+                            WHERE pra.payment_id=p.id
+                        ),0))
+                    ))
+                    OR (p.entry_kind='reversal' AND (
+                        COALESCE((SELECT SUM(a.amount_cents) FROM payment_allocations a
+                                  WHERE a.payment_id=p.id),0)>0
+                        OR COALESCE((SELECT SUM(a.amount_cents) FROM payment_allocations a
+                                    WHERE a.payment_id=p.id),0)<-p.amount_cents
+                    ))
+                  )
                 """
             ).fetchall()
         ]
@@ -806,17 +903,93 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
             for row in conn.execute(
                 """
                 SELECT p.id,p.amount_cents,p.entry_kind,
-                       COALESCE(SUM(a.amount_cents),0) AS allocated_cents
+                       COALESCE((SELECT SUM(pra.amount_cents)
+                                 FROM payment_refund_allocations pra
+                                 WHERE pra.payment_id=p.id),0) AS refunded_cents,
+                       COALESCE((SELECT SUM(a.amount_cents) FROM supplier_payment_allocations a
+                                 WHERE a.payment_id=p.id),0) AS allocated_cents
                 FROM payments p
-                LEFT JOIN supplier_payment_allocations a ON a.payment_id=p.id
                 WHERE p.type='payable'
-                GROUP BY p.id
-                HAVING
-                    (p.entry_kind='payment'
-                     AND (allocated_cents<0 OR allocated_cents>p.amount_cents))
-                    OR
-                    (p.entry_kind='reversal'
-                     AND (allocated_cents>0 OR allocated_cents< -p.amount_cents))
+                  AND (
+                    (p.entry_kind='payment' AND (
+                        COALESCE((SELECT SUM(a.amount_cents) FROM supplier_payment_allocations a
+                                  WHERE a.payment_id=p.id),0)<0
+                        OR COALESCE((SELECT SUM(a.amount_cents) FROM supplier_payment_allocations a
+                                    WHERE a.payment_id=p.id),0)>(p.amount_cents-COALESCE((
+                            SELECT SUM(pra.amount_cents) FROM payment_refund_allocations pra
+                            WHERE pra.payment_id=p.id
+                        ),0))
+                    ))
+                    OR (p.entry_kind='reversal' AND (
+                        COALESCE((SELECT SUM(a.amount_cents) FROM supplier_payment_allocations a
+                                  WHERE a.payment_id=p.id),0)>0
+                        OR COALESCE((SELECT SUM(a.amount_cents) FROM supplier_payment_allocations a
+                                    WHERE a.payment_id=p.id),0)<-p.amount_cents
+                    ))
+                  )
+                """
+            ).fetchall()
+        ]
+        refund_sources = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT sr.id,sr.cash_refund_cents,
+                       COALESCE(SUM(pra.amount_cents),0) AS attributed_cents,
+                       'customer' AS owner_type,q.customer_id AS owner_id
+                FROM sales_returns sr
+                JOIN quotes q ON q.id=sr.quote_id
+                LEFT JOIN payment_refund_allocations pra
+                  ON pra.sales_return_id=sr.id
+                WHERE sr.cash_refund_cents>0
+                GROUP BY sr.id
+                HAVING attributed_cents!=sr.cash_refund_cents
+                UNION ALL
+                SELECT pr.id,pr.cash_refund_cents,
+                       COALESCE(SUM(pra.amount_cents),0) AS attributed_cents,
+                       'supplier' AS owner_type,pr.supplier_id AS owner_id
+                FROM purchase_returns pr
+                LEFT JOIN payment_refund_allocations pra
+                  ON pra.purchase_return_id=pr.id
+                WHERE pr.cash_refund_cents>0
+                GROUP BY pr.id
+                HAVING attributed_cents!=pr.cash_refund_cents
+                """
+            ).fetchall()
+        ]
+        quote_statuses = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT q.id,q.status,q.received_amount_cents,
+                       q.quote_price_cents*q.quote_quantity-COALESCE((
+                           SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                           WHERE sr.quote_id=q.id
+                       ),0) AS net_cents,
+                       ss.id AS shipment_snapshot_id,
+                       ss.quantity AS shipped_quantity,
+                       COALESCE((SELECT SUM(sr.quantity) FROM sales_returns sr
+                                 WHERE sr.quote_id=q.id),0) AS returned_quantity,
+                       EXISTS(
+                           SELECT 1 FROM ledger_entries e
+                           WHERE e.source_type='quote' AND e.source_id=CAST(q.id AS TEXT)
+                             AND e.event_type='sales_shipment'
+                       ) AS shipment_ledger
+                FROM quotes q LEFT JOIN shipment_snapshots ss ON ss.quote_id=q.id
+                WHERE q.deleted_at IS NULL AND (
+                    (q.status IN ('已出库','已收款','已全退')
+                     AND (ss.id IS NULL OR shipment_ledger=0))
+                    OR (q.status='已收款' AND q.received_amount_cents!=(
+                        q.quote_price_cents*q.quote_quantity-COALESCE((
+                            SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                            WHERE sr.quote_id=q.id
+                        ),0)
+                    ))
+                    OR (q.status='已全退' AND (
+                        ss.id IS NULL OR returned_quantity<ss.quantity
+                    ))
+                    OR (q.status IN ('待确认','已报价') AND ss.id IS NOT NULL)
+                )
                 """
             ).fetchall()
         ]
@@ -831,12 +1004,16 @@ def collect_finance_reconciliation_snapshot(db_path=None) -> dict:
             "sales_returns": sales_return_issues,
             "customer_allocations": customer_allocations,
             "supplier_allocations": supplier_allocations,
+            "refund_sources": refund_sources,
             "shipment_allocations": allocation_issues,
             "inventory_movements": movement_issues,
             "inventory_sns": sn_issues,
+            "sn_ownership": sn_ownership,
+            "quote_statuses": quote_statuses,
         }
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def get_monthly_activity(date_from: str, date_to: str, db_path=None) -> dict:

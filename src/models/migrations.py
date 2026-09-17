@@ -551,6 +551,17 @@ def _verify_v5_schema(conn: sqlite3.Connection) -> None:
         raise DatabaseMigrationError("库存流水回建后不守恒: " + detail)
 
 
+def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    """Track which payment supplied each cash refund; legacy rows stay unresolved."""
+    _execute_current_schema(conn)
+
+
+def _verify_v6_schema(conn: sqlite3.Connection) -> None:
+    _verify_v5_schema(conn)
+    if not _table_exists(conn, "sales_return_allocations"):
+        raise DatabaseMigrationError("schema v6 missing sales_return_allocations")
+
+
 def _migration_snapshot(conn: sqlite3.Connection) -> dict[str, int]:
     snapshot = {
         f"count:{table}": int(
@@ -588,9 +599,9 @@ def _verify_database(
     conn: sqlite3.Connection,
     backup: BackupInfo | None,
 ) -> None:
-    _verify_v5_schema(conn)
-    if not _table_exists(conn, "sales_return_allocations"):
-        raise DatabaseMigrationError("schema v6 missing sales_return_allocations")
+    _verify_v6_schema(conn)
+    if not _table_exists(conn, "payment_refund_allocations"):
+        raise DatabaseMigrationError("schema v7 missing payment_refund_allocations")
     check = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if check != "ok":
         raise DatabaseMigrationError(f"迁移后完整性检查失败: {check}", backup)
@@ -732,7 +743,7 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
             _execute_current_schema(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations(version, name) VALUES (?,?)",
-                (SCHEMA_VERSION, "fresh_schema_v6"),
+                (SCHEMA_VERSION, "fresh_schema_v7"),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _verify_database(conn, None)
@@ -796,6 +807,12 @@ def migrate_database(db_path: str | Path) -> BackupInfo | None:
                     "INSERT OR REPLACE INTO schema_migrations(version,name) VALUES (6,?)",
                     ("sales_return_allocations",),
                 )
+            if version < 7:
+                _migrate_v6_to_v7(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(version,name) VALUES (7,?)",
+                    ("payment_refund_allocations",),
+                )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             after = _migration_snapshot(conn)
             changed = {
@@ -837,3 +854,5 @@ def rebuild_import_history(conn: sqlite3.Connection, source_version: int) -> Non
         _migrate_v4_to_v5(conn)
     if source_version < 6:
         _migrate_v5_to_v6(conn)
+    if source_version < 7:
+        _migrate_v6_to_v7(conn)

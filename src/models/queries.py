@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 
 from src.models.connection import connect
+from src.models.finance_queries import (
+    collect_finance_reconciliation_snapshot,
+    get_customer_actual_performance,
+)
 from src.models.inventory_repository import (
     list_inventory_movements as _list_inventory_movements,
     list_shipment_allocations as _list_shipment_allocations,
 )
-from src.utils.tax import calc_tax_adjusted_profit_cents
 
 
 BACKUP_TABLES = (
@@ -32,6 +35,7 @@ BACKUP_TABLES = (
     "sales_returns",
     "sales_return_allocations",
     "purchase_returns",
+    "payment_refund_allocations",
     "audit_events",
     "operation_logs",
     "price_snapshots",
@@ -387,6 +391,13 @@ def search_quotes(
                        q.quote_date,q.remark,q.paid,q.status,
                        q.received_amount_cents,q.sn_list,q.tax_rate,
                        q.purchase_tax_inclusive,q.quote_tax_inclusive,
+                       COALESCE((SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                                 WHERE sr.quote_id=q.id),0) AS returned_revenue_cents,
+                       COALESCE((SELECT SUM(sr.quantity) FROM sales_returns sr
+                                 WHERE sr.quote_id=q.id),0) AS returned_quantity,
+                       q.quote_price_cents*q.quote_quantity-COALESCE((
+                           SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                           WHERE sr.quote_id=q.id),0) AS net_total_cents,
                        p.series,p.cpu,p.ram,p.storage,p.gpu,p.screen,p.note,
                        b.purchase_price_cents,b.remark AS batch_remark,
                        b.id AS batch_id,b.sn_list AS batch_sn_list,
@@ -443,6 +454,13 @@ def get_customer_statement(
                 f"""
                 SELECT q.id,q.quote_date,q.quote_price_cents,q.quote_quantity,q.status,
                        q.paid,q.received_amount_cents,p.series,p.cpu,p.ram,p.storage,p.gpu,
+                       COALESCE((SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                                 WHERE sr.quote_id=q.id),0) AS returned_revenue_cents,
+                       COALESCE((SELECT SUM(sr.quantity) FROM sales_returns sr
+                                 WHERE sr.quote_id=q.id),0) AS returned_quantity,
+                       q.quote_price_cents*q.quote_quantity-COALESCE((
+                           SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                           WHERE sr.quote_id=q.id),0) AS net_total_cents,
                        b.purchase_price_cents,b.remark AS batch_remark,q.remark,
                        s.name AS supplier_name
                 FROM quotes q
@@ -460,63 +478,17 @@ def get_customer_statement(
 
 
 def get_customer_history(customer_id: int, db_path=None) -> list[dict]:
-    conn = connect(db_path, read_only=True)
-    try:
-        return [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT q.id,q.quote_price_cents,q.quote_quantity,q.quote_date,q.remark,q.paid,
-                       p.series,p.cpu,p.ram,p.storage,p.gpu,p.screen,p.note,
-                       b.purchase_price_cents,q.tax_rate,q.purchase_tax_inclusive,
-                       q.quote_tax_inclusive
-                FROM quotes q
-                JOIN batches b ON q.batch_id=b.id
-                JOIN products p ON b.product_id=p.id
-                WHERE q.customer_id=? AND q.deleted_at IS NULL
-                ORDER BY q.quote_date DESC,q.id DESC
-                """,
-                (customer_id,),
-            ).fetchall()
-        ]
-    finally:
-        conn.close()
+    return get_customer_actual_performance(customer_id, db_path)["history"]
 
 
 def get_customer_stats(customer_id: int, db_path=None) -> dict:
-    conn = connect(db_path, read_only=True)
-    try:
-        rows = conn.execute(
-            """
-            SELECT q.quote_price_cents,q.quote_quantity,b.purchase_price_cents,q.tax_rate,
-                   q.purchase_tax_inclusive,q.quote_tax_inclusive
-            FROM quotes q
-            JOIN batches b ON q.batch_id=b.id
-            WHERE q.customer_id=? AND q.deleted_at IS NULL AND q.status!='已取消'
-            """,
-            (customer_id,),
-        ).fetchall()
-    finally:
-        conn.close()
-    total_amount_cents = 0
-    total_profit_cents = 0
-    for row in rows:
-        quantity = row["quote_quantity"] or 1
-        quote_price_cents = row["quote_price_cents"] or 0
-        purchase_price_cents = row["purchase_price_cents"] or 0
-        total_amount_cents += quote_price_cents * quantity
-        total_profit_cents += calc_tax_adjusted_profit_cents(
-            purchase_price_cents,
-            quote_price_cents,
-            quantity,
-            row["tax_rate"],
-            bool(row["purchase_tax_inclusive"]),
-            bool(row["quote_tax_inclusive"]),
-        )
+    performance = get_customer_actual_performance(customer_id, db_path)
     return {
-        "total_quotes": len(rows),
-        "total_amount_cents": total_amount_cents,
-        "total_profit_cents": total_profit_cents,
+        key: performance[key]
+        for key in (
+            "total_quotes", "total_amount_cents", "total_profit_cents", "total_quantity",
+            "enabled_at", "history_complete",
+        )
     }
 
 
@@ -1052,9 +1024,11 @@ def get_slow_movers(date_from: str, date_to: str, db_path=None) -> list[dict]:
         conn.close()
 
 
-def collect_reconciliation_snapshot(db_path=None) -> dict:
+def collect_reconciliation_snapshot(db_path=None, *, conn=None) -> dict:
     """Collect read-only consistency facts; policy lives in ReconciliationService."""
-    conn = connect(db_path, read_only=True)
+    owns_connection = conn is None
+    if owns_connection:
+        conn = connect(db_path, read_only=True)
     try:
         integrity_rows = [
             row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()
@@ -1099,6 +1073,9 @@ def collect_reconciliation_snapshot(db_path=None) -> dict:
             for row in conn.execute(
                 """
                 SELECT p.id,p.amount_cents,p.entry_kind,
+                       COALESCE((SELECT SUM(pra.amount_cents)
+                                 FROM payment_refund_allocations pra
+                                 WHERE pra.payment_id=p.id),0) AS refunded_cents,
                        CASE WHEN p.entry_kind='reversal'
                             THEN -p.amount_cents ELSE p.amount_cents END AS expected_cents,
                        COALESCE(SUM(a.amount_cents),0) AS allocated_cents
@@ -1108,7 +1085,8 @@ def collect_reconciliation_snapshot(db_path=None) -> dict:
                 GROUP BY p.id
                 HAVING
                     (expected_cents>=0
-                     AND (allocated_cents<0 OR allocated_cents>expected_cents))
+                     AND (allocated_cents<0 OR allocated_cents>
+                          expected_cents-refunded_cents))
                     OR
                     (expected_cents<0
                      AND (allocated_cents>0 OR allocated_cents<expected_cents))
@@ -1203,11 +1181,46 @@ def collect_reconciliation_snapshot(db_path=None) -> dict:
             dict(row)
             for row in conn.execute(
                 """
-                SELECT id,quote_price_cents*quote_quantity AS total_cents,
-                       received_amount_cents
-                FROM quotes
-                WHERE received_amount_cents<0
-                   OR received_amount_cents>quote_price_cents*quote_quantity
+                SELECT q.id,q.quote_price_cents*q.quote_quantity AS total_cents,
+                       COALESCE((SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                                 WHERE sr.quote_id=q.id),0) AS returned_cents,
+                       q.quote_price_cents*q.quote_quantity-COALESCE((
+                           SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                           WHERE sr.quote_id=q.id
+                       ),0) AS net_cents,q.received_amount_cents
+                FROM quotes q
+                WHERE q.received_amount_cents<0
+                   OR q.received_amount_cents>(q.quote_price_cents*q.quote_quantity-COALESCE((
+                       SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                       WHERE sr.quote_id=q.id
+                   ),0))
+                """
+            ).fetchall()
+        ]
+        net_allocation_issues = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT q.id,q.quote_price_cents*q.quote_quantity AS total_cents,
+                       COALESCE((SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                                 WHERE sr.quote_id=q.id),0) AS returned_cents,
+                       q.quote_price_cents*q.quote_quantity-COALESCE((
+                           SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                           WHERE sr.quote_id=q.id
+                       ),0) AS net_cents,
+                       q.received_amount_cents,
+                       COALESCE((SELECT SUM(pa.amount_cents) FROM payment_allocations pa
+                                 WHERE pa.quote_id=q.id),0) AS allocated_cents
+                FROM quotes q
+                WHERE COALESCE((SELECT SUM(pa.amount_cents) FROM payment_allocations pa
+                                WHERE pa.quote_id=q.id),0)<0
+                   OR COALESCE((SELECT SUM(pa.amount_cents) FROM payment_allocations pa
+                               WHERE pa.quote_id=q.id),0)>(
+                       q.quote_price_cents*q.quote_quantity-COALESCE((
+                           SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                           WHERE sr.quote_id=q.id
+                       ),0)
+                   )
                 """
             ).fetchall()
         ]
@@ -1243,11 +1256,25 @@ def collect_reconciliation_snapshot(db_path=None) -> dict:
             "supplier_balances": supplier_balance_issues,
             "amounts": amount_issues,
             "receivables": receivable_issues,
+            "net_allocations": net_allocation_issues,
             "payment_owners": owner_issues,
             "historical_stock_batches": stock_history["batch_count"],
             "historical_stock_units": stock_history["units"],
             "table_counts": table_counts,
         }
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
+
+def collect_reconciliation_snapshots(db_path=None) -> tuple[dict, dict]:
+    """Read both reconciliation domains from the same SQLite snapshot."""
+    conn = connect(db_path, read_only=True)
+    try:
+        conn.execute("BEGIN")
+        return (
+            collect_reconciliation_snapshot(conn=conn),
+            collect_finance_reconciliation_snapshot(conn=conn),
+        )
+    finally:
+        conn.close()

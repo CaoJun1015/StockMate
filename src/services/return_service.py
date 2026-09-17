@@ -19,6 +19,7 @@ from src.models.finance_repository import (
     add_supplier_payment_allocation,
     get_shipment_snapshot,
     insert_purchase_return,
+    insert_payment_refund_allocation,
     insert_sales_return,
     list_customer_allocations_for_release,
     list_supplier_allocations_for_release,
@@ -33,6 +34,7 @@ from src.models.repositories import (
     audit,
     get_active_entity,
     log_operation,
+    sync_quote_payment_state,
 )
 from src.services.exceptions import (
     DataConflictError,
@@ -57,27 +59,33 @@ class ReturnService:
         conn,
         quote_id: int,
         amount_cents: int,
-    ) -> None:
+    ) -> list[dict[str, int]]:
         remaining = amount_cents
+        released_sources: list[dict[str, int]] = []
         rows = list_customer_allocations_for_release(conn, quote_id)
         for row in rows:
             released = min(remaining, row["allocated_cents"])
             if released:
                 add_allocation(conn, row["payment_id"], quote_id, -released)
+                released_sources.append(
+                    {"payment_id": row["payment_id"], "amount_cents": released}
+                )
                 remaining -= released
             if remaining == 0:
                 break
         if remaining:
             raise DataConflictError("客户收款分配不足，无法完成退货冲销")
         add_quote_received_amount(conn, quote_id, -amount_cents)
+        return released_sources
 
     @staticmethod
     def _unallocate_supplier_payments(
         conn,
         batch_id: int,
         amount_cents: int,
-    ) -> None:
+    ) -> list[dict[str, int]]:
         remaining = amount_cents
+        released_sources: list[dict[str, int]] = []
         rows = list_supplier_allocations_for_release(conn, batch_id)
         for row in rows:
             released = min(remaining, row["allocated_cents"])
@@ -85,9 +93,39 @@ class ReturnService:
                 add_supplier_payment_allocation(
                     conn, row["payment_id"], batch_id, -released
                 )
+                released_sources.append(
+                    {"payment_id": row["payment_id"], "amount_cents": released}
+                )
                 remaining -= released
             if remaining == 0:
                 break
+        return released_sources
+
+    @staticmethod
+    def _allocate_refund_sources(
+        conn,
+        sources: list[dict[str, int]],
+        amount_cents: int,
+        *,
+        sales_return_id: int | None = None,
+        purchase_return_id: int | None = None,
+    ) -> None:
+        remaining = amount_cents
+        for source in sources:
+            applied = min(remaining, source["amount_cents"])
+            if applied:
+                insert_payment_refund_allocation(
+                    conn,
+                    source["payment_id"],
+                    applied,
+                    sales_return_id=sales_return_id,
+                    purchase_return_id=purchase_return_id,
+                )
+                remaining -= applied
+            if remaining == 0:
+                break
+        if remaining:
+            raise DataConflictError("现金退款缺少可解释的原付款来源")
 
     def return_sale(
         self,
@@ -158,14 +196,26 @@ class ReturnService:
                 if already_restocked + item_quantity > original["quantity"]:
                     raise ValidationError("退回原批次的数量超过该批次净出库数量")
                 item_sns = normalize_sn_list(item.get("sn_list", ""))
+                original_sn_list = normalize_sn_list(original.get("sn_list", ""))
+                original_sns = set(original_sn_list)
+                already_returned_sns = returned_sns_for_allocation(conn, allocation_id)
+                if restock and original_sns and not item_sns:
+                    available_sns = [
+                        sn for sn in original_sn_list if sn not in already_returned_sns
+                    ]
+                    if len(available_sns) == item_quantity:
+                        item_sns = available_sns
+                    else:
+                        raise ValidationError(
+                            "原出库含多个可退SN时，回库必须明确选择本次退回的SN"
+                        )
                 if item_sns and len(item_sns) != item_quantity:
                     raise ValidationError("退货SN数量必须等于对应批次退货数量")
                 if len(set(item_sns)) != len(item_sns) or request_sns.intersection(item_sns):
                     raise ValidationError("退货包含重复SN")
-                if returned_sns_for_allocation(conn, allocation_id).intersection(item_sns):
+                if already_returned_sns.intersection(item_sns):
                     raise ValidationError("SN已在该出库分配中退货")
                 request_sns.update(item_sns)
-                original_sns = set(normalize_sn_list(original.get("sn_list", "")))
                 if item_sns and original_sns and not set(item_sns).issubset(original_sns):
                     raise ValidationError("退货SN不属于所选原出库批次")
                 selected.append({**original, "return_quantity": item_quantity,
@@ -189,8 +239,9 @@ class ReturnService:
             excess_allocated = max(
                 quote["received_amount_cents"] - received_after_limit, 0
             )
+            released_sources: list[dict[str, int]] = []
             if excess_allocated:
-                self._unallocate_customer_receipts(
+                released_sources = self._unallocate_customer_receipts(
                     conn, quote_id, excess_allocated
                 )
 
@@ -275,6 +326,13 @@ class ReturnService:
                     conn, return_id, item["id"], item["return_quantity"],
                     item["return_quantity"] if restock else 0, item["return_sn_list"],
                 )
+            self._allocate_refund_sources(
+                conn,
+                released_sources,
+                cash_refund_cents,
+                sales_return_id=return_id,
+            )
+            sync_quote_payment_state(conn, quote_id)
             if restock:
                 for item in selected:
                     insert_inventory_movement(
@@ -359,7 +417,9 @@ class ReturnService:
                 conn, batch_id=batch_id, quantity_delta=-quantity
             ):
                 raise InsufficientStockError("采购退货数量超过当前可用库存")
-            self._unallocate_supplier_payments(conn, batch_id, amount_cents)
+            released_sources = self._unallocate_supplier_payments(
+                conn, batch_id, amount_cents
+            )
             adjust_supplier_balance(
                 conn, batch["supplier_id"], -amount_cents + cash_refund_cents
             )
@@ -416,6 +476,12 @@ class ReturnService:
                 account_id=refund_account_id,
                 ledger_entry_id=entry_id,
                 reason=reason,
+            )
+            self._allocate_refund_sources(
+                conn,
+                released_sources,
+                cash_refund_cents,
+                purchase_return_id=return_id,
             )
             insert_inventory_movement(
                 conn,

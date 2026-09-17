@@ -10,6 +10,7 @@ from src.models.queries import list_products
 from src.services.exceptions import ServiceError
 from src.services.product_service import ProductService
 from src.ui.dialogs import ProductEditDialog
+from src.ui.utils import NumericTableWidgetItem, refreshing_table
 
 
 class ProductTab(QWidget):
@@ -67,21 +68,22 @@ class ProductTab(QWidget):
     def refresh_product_list(self, keyword=None):
         products = list_products(keyword or "")
 
-        self.product_table.setRowCount(len(products))
-        for i, p in enumerate(products):
-            self.product_table.setItem(i, 0, QTableWidgetItem(str(p["id"])))
-            self.product_table.setItem(i, 1, QTableWidgetItem(p.get("series", "")))
-            self.product_table.setItem(i, 2, QTableWidgetItem(p.get("cpu", "")))
-            self.product_table.setItem(i, 3, QTableWidgetItem(p.get("ram", "")))
-            self.product_table.setItem(i, 4, QTableWidgetItem(p.get("storage", "")))
-            self.product_table.setItem(i, 5, QTableWidgetItem(p.get("gpu", "")))
-            self.product_table.setItem(i, 6, QTableWidgetItem(p.get("screen", "")))
-            self.product_table.setItem(i, 7, QTableWidgetItem(p.get("note", "")))
-            remaining = p.get("total_remaining", 0)
-            self.product_table.setItem(i, 8, QTableWidgetItem(str(remaining)))
+        with refreshing_table(self.product_table, key_column=0):
+            self.product_table.setRowCount(len(products))
+            for i, p in enumerate(products):
+                self.product_table.setItem(i, 0, QTableWidgetItem(str(p["id"])))
+                self.product_table.setItem(i, 1, QTableWidgetItem(p.get("series", "")))
+                self.product_table.setItem(i, 2, QTableWidgetItem(p.get("cpu", "")))
+                self.product_table.setItem(i, 3, QTableWidgetItem(p.get("ram", "")))
+                self.product_table.setItem(i, 4, QTableWidgetItem(p.get("storage", "")))
+                self.product_table.setItem(i, 5, QTableWidgetItem(p.get("gpu", "")))
+                self.product_table.setItem(i, 6, QTableWidgetItem(p.get("screen", "")))
+                self.product_table.setItem(i, 7, QTableWidgetItem(p.get("note", "")))
+                remaining = p.get("total_remaining", 0)
+                self.product_table.setItem(i, 8, NumericTableWidgetItem(remaining, remaining))
 
-        self.product_table.resizeColumnsToContents()
-        self.product_table.setColumnWidth(1, 180)
+            self.product_table.resizeColumnsToContents()
+            self.product_table.setColumnWidth(1, 180)
         self.main.status_label.setText(f"共 {len(products)} 条机型")
 
     def on_search(self, text):

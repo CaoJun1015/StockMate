@@ -217,8 +217,8 @@ class TestUIInstantiation:
 
     def test_window_title(self):
         """窗口标题应正确"""
-        assert "调货助手" in self.window.windowTitle(), \
-            f"窗口标题应包含 '调货助手'，实际为 '{self.window.windowTitle()}'"
+        assert "StockMate" in self.window.windowTitle(), \
+            f"窗口标题应包含 'StockMate'，实际为 '{self.window.windowTitle()}'"
 
 
 class TestDialogInstantiation:

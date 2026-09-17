@@ -37,6 +37,7 @@ from src.utils.money import format_yuan, yuan_to_cents
 from src.utils.tax import calc_tax_adjusted_profit_cents
 from src.ui.dialogs import ShipmentDialog, QuoteEditDialog
 from src.ui.finance_dialogs import PaymentDialog, ReturnDialog
+from src.ui.utils import refreshing_table
 
 
 class RecordTab(QWidget):
@@ -111,7 +112,7 @@ class RecordTab(QWidget):
         self.date_to.dateChanged.connect(self.refresh_records)
 
         self.status_filter = QComboBox()
-        self.status_filter.addItems(["全部状态", "待确认", "已报价", "已出库", "已收款", "已取消"])
+        self.status_filter.addItems(["全部状态", "待确认", "已报价", "已出库", "已收款", "已全退", "已取消"])
         self.status_filter.currentTextChanged.connect(self.refresh_records)
 
         self.export_records_btn = QPushButton("导出 Excel")
@@ -172,83 +173,85 @@ class RecordTab(QWidget):
             "已报价": "#1976D2",
             "已出库": "#F57C00",
             "已收款": "#388E3C",
+            "已全退": "#7B1FA2",
             "已取消": "#BDBDBD",
         }
 
-        self.record_table.setSortingEnabled(False)
-        self.record_table.setRowCount(len(quotes))
-        total_cost = 0
-        total_sale = 0
-        for i, q in enumerate(quotes):
-            status = q.get("status", "待确认")
-            received = q.get("received_amount_cents", 0) or 0
-            sn_list = q.get("sn_list", "") or q.get("batch_sn_list", "") or ""
-            quote_price = q.get("quote_price_cents", 0) or 0
-            quote_quantity = q.get("quote_quantity", 1) or 1
-            total_amount = quote_price * quote_quantity
+        with refreshing_table(self.record_table, key_column=0):
+            self.record_table.setRowCount(len(quotes))
+            total_cost = 0
+            total_sale = 0
+            for i, q in enumerate(quotes):
+                status = q.get("status", "待确认")
+                received = q.get("received_amount_cents", 0) or 0
+                sn_list = q.get("sn_list", "") or q.get("batch_sn_list", "") or ""
+                quote_price = q.get("quote_price_cents", 0) or 0
+                quote_quantity = q.get("quote_quantity", 1) or 1
+                total_amount = q.get("net_total_cents", quote_price * quote_quantity) or 0
 
-            self.record_table.setItem(i, 0, QTableWidgetItem(str(q.get("id", ""))))
-            self.record_table.setItem(i, 1, QTableWidgetItem(q.get("quote_date", "")))
-            self.record_table.setItem(i, 2, QTableWidgetItem(q.get("customer_name", "")))
-            self.record_table.setItem(i, 3, QTableWidgetItem(q.get("series", "")))
-            self.record_table.setItem(i, 4, QTableWidgetItem(q.get("cpu", "")))
-            self.record_table.setItem(i, 5, QTableWidgetItem(q.get("ram", "")))
-            self.record_table.setItem(i, 6, QTableWidgetItem(q.get("storage", "")))
-            self.record_table.setItem(i, 7, QTableWidgetItem(q.get("gpu", "")))
-            self.record_table.setItem(i, 8, QTableWidgetItem(q.get("supplier_name", "") or ""))
-            self.record_table.setItem(
-                i,
-                9,
-                QTableWidgetItem(
-                    format_yuan(q.get("purchase_price_cents", 0))
-                    if q.get("purchase_price_cents")
-                    else ""
-                ),
-            )
-            self.record_table.setItem(i, 10, QTableWidgetItem(str(quote_quantity)))
-            self.record_table.setItem(
-                i, 11, QTableWidgetItem(format_yuan(quote_price) if quote_price else "")
-            )
+                self.record_table.setItem(i, 0, QTableWidgetItem(str(q.get("id", ""))))
+                self.record_table.setItem(i, 1, QTableWidgetItem(q.get("quote_date", "")))
+                self.record_table.setItem(i, 2, QTableWidgetItem(q.get("customer_name", "")))
+                self.record_table.setItem(i, 3, QTableWidgetItem(q.get("series", "")))
+                self.record_table.setItem(i, 4, QTableWidgetItem(q.get("cpu", "")))
+                self.record_table.setItem(i, 5, QTableWidgetItem(q.get("ram", "")))
+                self.record_table.setItem(i, 6, QTableWidgetItem(q.get("storage", "")))
+                self.record_table.setItem(i, 7, QTableWidgetItem(q.get("gpu", "")))
+                self.record_table.setItem(i, 8, QTableWidgetItem(q.get("supplier_name", "") or ""))
+                self.record_table.setItem(
+                    i,
+                    9,
+                    QTableWidgetItem(
+                        format_yuan(q.get("purchase_price_cents", 0))
+                        if q.get("purchase_price_cents")
+                        else ""
+                    ),
+                )
+                self.record_table.setItem(i, 10, QTableWidgetItem(str(quote_quantity)))
+                self.record_table.setItem(
+                    i, 11, QTableWidgetItem(format_yuan(quote_price) if quote_price else "")
+                )
 
-            status_item = QTableWidgetItem(status)
-            color = STATUS_COLORS.get(status, "#333")
-            status_item.setForeground(Qt.GlobalColor.white)
-            status_item.setBackground(QColor(color))
-            self.record_table.setItem(i, 12, status_item)
+                status_item = QTableWidgetItem(status)
+                color = STATUS_COLORS.get(status, "#333")
+                status_item.setForeground(Qt.GlobalColor.white)
+                status_item.setBackground(QColor(color))
+                self.record_table.setItem(i, 12, status_item)
 
-            received_text = format_yuan(received)
-            received_item = QTableWidgetItem(received_text)
-            if received >= total_amount and total_amount > 0:
-                received_item.setForeground(QColor("#388E3C"))
-            self.record_table.setItem(i, 13, received_item)
+                received_text = format_yuan(received)
+                received_item = QTableWidgetItem(received_text)
+                if received >= total_amount and total_amount > 0:
+                    received_item.setForeground(QColor("#388E3C"))
+                self.record_table.setItem(i, 13, received_item)
 
-            self.record_table.setItem(i, 14, QTableWidgetItem(sn_list))
+                self.record_table.setItem(i, 14, QTableWidgetItem(sn_list))
 
-            batch_remark = q.get("batch_remark", "") or ""
-            quote_remark = q.get("remark", "") or ""
-            merged_remark = " | ".join(filter(None, [batch_remark, quote_remark]))
-            self.record_table.setItem(i, 15, QTableWidgetItem(merged_remark))
-            self.record_table.setItem(i, 16, QTableWidgetItem(q.get("paid", "否")))
+                batch_remark = q.get("batch_remark", "") or ""
+                quote_remark = q.get("remark", "") or ""
+                merged_remark = " | ".join(filter(None, [batch_remark, quote_remark]))
+                self.record_table.setItem(i, 15, QTableWidgetItem(merged_remark))
+                self.record_table.setItem(i, 16, QTableWidgetItem(q.get("paid", "否")))
 
-            total_cost += (q.get("purchase_price_cents", 0) or 0) * quote_quantity
-            total_sale += quote_price * quote_quantity
+                total_cost += (q.get("purchase_price_cents", 0) or 0) * max(
+                    quote_quantity - (q.get("returned_quantity", 0) or 0), 0
+                )
+                total_sale += total_amount
 
-            # 收款提醒：已出库超过7天未收满的订单，整行红色高亮
-            if status == "已出库" and received < total_amount and total_amount > 0:
-                from datetime import date, datetime
-                quote_date = q.get("quote_date", "")
-                if quote_date:
-                    try:
-                        quote_dt = datetime.strptime(quote_date, "%Y-%m-%d").date()
-                        if (date.today() - quote_dt).days > 7:
-                            for col in range(self.record_table.columnCount()):
-                                item = self.record_table.item(i, col)
-                                if item:
-                                    item.setForeground(QColor("#D32F2F"))
-                    except ValueError:
-                        pass
+                # 收款提醒：已出库超过7天未收满的订单，整行红色高亮
+                if status == "已出库" and received < total_amount and total_amount > 0:
+                    from datetime import date, datetime
+                    quote_date = q.get("quote_date", "")
+                    if quote_date:
+                        try:
+                            quote_dt = datetime.strptime(quote_date, "%Y-%m-%d").date()
+                            if (date.today() - quote_dt).days > 7:
+                                for col in range(self.record_table.columnCount()):
+                                    item = self.record_table.item(i, col)
+                                    if item:
+                                        item.setForeground(QColor("#D32F2F"))
+                        except ValueError:
+                            pass
 
-        self.record_table.setSortingEnabled(True)
         self.record_table.resizeColumnsToContents()
         self.record_table.setColumnWidth(12, 70)
         self.record_table.setColumnWidth(13, 80)
@@ -265,10 +268,11 @@ class RecordTab(QWidget):
             tax_rate = q.get("tax_rate")
             purchase_tax_inclusive = q.get("purchase_tax_inclusive", 0) or 0
             quote_tax_inclusive = q.get("quote_tax_inclusive", 0) or 0
-            tax_total_cost += purchase_price * quantity
-            tax_total_sale += quote_price * quantity
+            net_quantity = max(quantity - (q.get("returned_quantity", 0) or 0), 0)
+            tax_total_cost += purchase_price * net_quantity
+            tax_total_sale += q.get("net_total_cents", quote_price * quantity) or 0
             total_tax_profit += calc_tax_adjusted_profit_cents(
-                purchase_price, quote_price, quantity, tax_rate,
+                purchase_price, quote_price, net_quantity, tax_rate,
                 purchase_tax_inclusive, quote_tax_inclusive,
             )
         profit = total_tax_profit

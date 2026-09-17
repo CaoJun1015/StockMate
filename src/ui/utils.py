@@ -3,7 +3,58 @@ import os
 import sys
 import re
 import traceback
+from contextlib import contextmanager
 from datetime import datetime
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QTableWidgetItem
+
+
+class NumericTableWidgetItem(QTableWidgetItem):
+    """Keep formatted text while sorting by its integer value."""
+
+    def __init__(self, text, value):
+        super().__init__(str(text))
+        self.sort_value = value
+
+    def __lt__(self, other):
+        if isinstance(other, NumericTableWidgetItem):
+            return self.sort_value < other.sort_value
+        return super().__lt__(other)
+
+
+@contextmanager
+def refreshing_table(table, key_column=None):
+    """Fill a sorted table atomically and restore its sort and valid selection."""
+    header = table.horizontalHeader()
+    sorting = table.isSortingEnabled()
+    sort_shown = header.isSortIndicatorShown()
+    sort_column = header.sortIndicatorSection()
+    sort_order = header.sortIndicatorOrder()
+    selected_key = None
+    if key_column is not None and table.currentRow() >= 0:
+        item = table.item(table.currentRow(), key_column)
+        if item:
+            selected_key = item.data(Qt.ItemDataRole.UserRole)
+            if selected_key is None:
+                selected_key = item.text()
+    blocked = table.blockSignals(True)
+    table.setSortingEnabled(False)
+    try:
+        yield
+    finally:
+        table.setSortingEnabled(sorting)
+        if sorting and sort_shown:
+            table.sortItems(sort_column, sort_order)
+        table.blockSignals(blocked)
+        if selected_key is not None:
+            for row in range(table.rowCount()):
+                item = table.item(row, key_column)
+                value = item.data(Qt.ItemDataRole.UserRole) if item else None
+                if value is None and item:
+                    value = item.text()
+                if value == selected_key:
+                    table.selectRow(row)
+                    break
 
 
 def _validate_date(date_str):

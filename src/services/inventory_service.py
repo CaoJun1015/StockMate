@@ -19,6 +19,8 @@ from src.models.finance_repository import (
     get_finance_enabled_at,
     insert_shipment_snapshot,
     list_active_unreversed_payments,
+    list_unattributed_cash_refunds,
+    payment_refunded_cents,
     supplier_payment_allocated_cents,
 )
 from src.models.repositories import (
@@ -36,6 +38,7 @@ from src.models.repositories import (
     sync_quote_payment_state,
 )
 from src.services.exceptions import (
+    DataConflictError,
     InsufficientStockError,
     InvalidTransitionError,
     NotFoundError,
@@ -56,6 +59,16 @@ class InventoryService:
         amount_cents: int,
     ) -> int:
         remaining = amount_cents
+        unresolved = list_unattributed_cash_refunds(
+            conn,
+            owner_field="supplier_id",
+            owner_id=supplier_id,
+            pay_type="payable",
+        )
+        if unresolved:
+            raise DataConflictError(
+                f"供应商退款来源无法确定：采购退货#{unresolved[0]['id']}"
+            )
         payments = list_active_unreversed_payments(
             conn,
             owner_field="supplier_id",
@@ -64,7 +77,11 @@ class InventoryService:
         )
         for payment in payments:
             allocated = supplier_payment_allocated_cents(conn, payment["id"])
-            available = payment["amount_cents"] - allocated
+            available = (
+                payment["amount_cents"]
+                - allocated
+                - payment_refunded_cents(conn, payment["id"])
+            )
             applied = min(remaining, max(available, 0))
             if applied:
                 add_supplier_payment_allocation(
@@ -83,6 +100,16 @@ class InventoryService:
         amount_cents: int,
     ) -> int:
         remaining = amount_cents
+        unresolved = list_unattributed_cash_refunds(
+            conn,
+            owner_field="customer_id",
+            owner_id=customer_id,
+            pay_type="receivable",
+        )
+        if unresolved:
+            raise DataConflictError(
+                f"客户退款来源无法确定：销售退货#{unresolved[0]['id']}"
+            )
         payments = list_active_unreversed_payments(
             conn,
             owner_field="customer_id",
@@ -91,7 +118,11 @@ class InventoryService:
         )
         for payment in payments:
             allocated = customer_payment_allocated_cents(conn, payment["id"])
-            available = payment["amount_cents"] - allocated
+            available = (
+                payment["amount_cents"]
+                - allocated
+                - payment_refunded_cents(conn, payment["id"])
+            )
             applied = min(remaining, max(available, 0))
             if applied:
                 add_allocation(conn, payment["id"], quote_id, applied)

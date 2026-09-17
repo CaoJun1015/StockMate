@@ -165,9 +165,11 @@ class PaymentDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
 
         if quote:
-            total_cents = (quote.get("quote_price_cents", 0) or 0) * (
-                quote.get("quote_quantity", 1) or 1
-            )
+            total_cents = quote.get("net_total_cents")
+            if total_cents is None:
+                total_cents = (quote.get("quote_price_cents", 0) or 0) * (
+                    quote.get("quote_quantity", 1) or 1
+                )
             received_cents = quote.get("received_amount_cents", 0) or 0
             remaining_cents = total_cents - received_cents
             info = (
@@ -381,8 +383,9 @@ class StatementDialog(QDialog):
             quote_price = r.get("quote_price_cents", 0) or 0
             quantity = r.get("quote_quantity", 1) or 1
             received = r.get("received_amount_cents", 0) or 0
-            total_amount = quote_price * quantity
-            profit = (quote_price - purchase_price) * quantity
+            total_amount = r.get("net_total_cents", quote_price * quantity) or 0
+            net_quantity = max(quantity - (r.get("returned_quantity", 0) or 0), 0)
+            profit = (quote_price - purchase_price) * net_quantity
             pending = total_amount - received
 
             self.statement_table.setItem(i, 0, QTableWidgetItem(r.get("quote_date", "")))
@@ -400,7 +403,7 @@ class StatementDialog(QDialog):
             merged_remark = " | ".join(filter(None, [r.get("batch_remark", "") or "", r.get("remark", "") or ""]))
             self.statement_table.setItem(i, 10, QTableWidgetItem(merged_remark))
 
-            total_cost += purchase_price * quantity
+            total_cost += purchase_price * net_quantity
             total_sale += total_amount
             total_received += received
 
@@ -434,7 +437,7 @@ def export_statement_to_excel(records, customer_name):
     ws = wb.active
     ws.title = "对账单"
 
-    headers = ["日期", "机型", "CPU", "数量", "购入价", "报价", "毛利", "状态", "已收款", "待收款", "备注"]
+    headers = ["日期", "机型", "CPU", "数量", "购入价", "报价", "净金额", "毛利", "状态", "已收款", "待收款", "备注"]
     header_font = Font(bold=True, size=11, color="FFFFFF")
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
     header_alignment = Alignment(horizontal="center", vertical="center")
@@ -460,15 +463,16 @@ def export_statement_to_excel(records, customer_name):
         quote_price = r.get("quote_price_cents", 0) or 0
         quantity = r.get("quote_quantity", 1) or 1
         received = r.get("received_amount_cents", 0) or 0
-        total_amount = quote_price * quantity
-        profit = (quote_price - purchase_price) * quantity
+        total_amount = r.get("net_total_cents", quote_price * quantity) or 0
+        net_quantity = max(quantity - (r.get("returned_quantity", 0) or 0), 0)
+        profit = (quote_price - purchase_price) * net_quantity
         pending = total_amount - received
         merged_remark = " | ".join(filter(None, [r.get("batch_remark", "") or "", r.get("remark", "") or ""]))
 
         row_data = [
             r.get("quote_date", ""), r.get("series", ""), r.get("cpu", ""),
             quantity, cents_to_yuan(purchase_price), cents_to_yuan(quote_price),
-            cents_to_yuan(profit), r.get("status", ""),
+            cents_to_yuan(total_amount), cents_to_yuan(profit), r.get("status", ""),
             cents_to_yuan(received), cents_to_yuan(pending) if pending > 0 else "已结清",
             merged_remark,
         ]
@@ -480,23 +484,23 @@ def export_statement_to_excel(records, customer_name):
             if row_idx % 2 == 0:
                 cell.fill = alt_fill
 
-        total_cost += purchase_price * quantity
+        total_cost += purchase_price * net_quantity
         total_sale += total_amount
         total_received += received
 
     summary_row = len(records) + 2
     summary_data = [
         "合计", "", "", "",
-        round(total_cost, 2), round(total_sale, 2),
-        round(total_sale - total_cost, 2), "",
-        round(total_received, 2), round(total_sale - total_received, 2), "",
+        cents_to_yuan(total_cost), "", cents_to_yuan(total_sale),
+        cents_to_yuan(total_sale - total_cost), "",
+        cents_to_yuan(total_received), cents_to_yuan(total_sale - total_received), "",
     ]
     for col_idx, val in enumerate(summary_data, 1):
         cell = ws.cell(row=summary_row, column=col_idx, value=val)
         cell.font = Font(bold=True, size=10)
         cell.border = thin_border
 
-    col_widths = [12, 16, 14, 8, 10, 10, 10, 10, 10, 10, 20]
+    col_widths = [12, 16, 14, 8, 10, 10, 10, 10, 10, 10, 10, 20]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[chr(64 + i)].width = w
 
