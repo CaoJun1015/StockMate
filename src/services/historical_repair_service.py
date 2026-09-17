@@ -12,8 +12,9 @@ from src.models.connection import (
     file_sha256,
     transaction,
 )
+from src.models.finance_repository import get_historical_quote_cache
 from src.models.schema import SCHEMA_VERSION
-from src.models.repositories import audit, log_operation
+from src.models.repositories import audit, log_operation, update_quote_repair_cache
 from src.services.exceptions import DataConflictError, ValidationError
 from src.services.reconciliation_service import ReconciliationReport, ReconciliationService
 
@@ -101,28 +102,7 @@ class HistoricalRepairService:
 
     @staticmethod
     def _quote_cache(conn, quote_id: int) -> dict | None:
-        row = conn.execute(
-            """
-            SELECT q.id,q.received_amount_cents,q.status,q.paid,
-                   q.quote_price_cents*q.quote_quantity-COALESCE((
-                       SELECT SUM(sr.revenue_cents) FROM sales_returns sr
-                       WHERE sr.quote_id=q.id
-                   ),0) AS net_cents,
-                   COALESCE((SELECT SUM(pa.amount_cents) FROM payment_allocations pa
-                             WHERE pa.quote_id=q.id),0) AS allocated_cents,
-                   ss.quantity AS shipped_quantity,
-                   COALESCE((SELECT SUM(sr.quantity) FROM sales_returns sr
-                             WHERE sr.quote_id=q.id),0) AS returned_quantity,
-                   EXISTS(
-                       SELECT 1 FROM ledger_entries e
-                       WHERE e.source_type='quote' AND e.source_id=CAST(q.id AS TEXT)
-                         AND e.event_type='sales_shipment'
-                   ) AS shipment_ledger
-            FROM quotes q LEFT JOIN shipment_snapshots ss ON ss.quote_id=q.id
-            WHERE q.id=? AND q.deleted_at IS NULL
-            """,
-            (quote_id,),
-        ).fetchone()
+        row = get_historical_quote_cache(conn, quote_id)
         if not row or not row["shipped_quantity"] or not row["shipment_ledger"]:
             return None
         expected_received = int(row["allocated_cents"])
@@ -240,14 +220,12 @@ class HistoricalRepairService:
                     continue
                 if str(cache["current"]) != item.current_value:
                     raise DataConflictError(f"报价#{item.entity_id} 已被其他操作修改，请重新核对")
-                conn.execute(
-                    "UPDATE quotes SET received_amount_cents=?, paid=?, status=? WHERE id=?",
-                    (
-                        cache["proposed"]["received_amount_cents"],
-                        cache["proposed"]["paid"],
-                        cache["proposed"]["status"],
-                        item.entity_id,
-                    ),
+                update_quote_repair_cache(
+                    conn,
+                    item.entity_id,
+                    received_amount_cents=cache["proposed"]["received_amount_cents"],
+                    paid=cache["proposed"]["paid"],
+                    status=cache["proposed"]["status"],
                 )
                 audit(
                     conn,

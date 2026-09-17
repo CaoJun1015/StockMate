@@ -414,6 +414,21 @@ def add_quote_received_amount(
     )
 
 
+def update_quote_repair_cache(
+    conn: sqlite3.Connection,
+    quote_id: int,
+    *,
+    received_amount_cents: int,
+    paid: str,
+    status: str,
+) -> None:
+    """Repair-only cache update; immutable financial and inventory evidence remains intact."""
+    conn.execute(
+        "UPDATE quotes SET received_amount_cents=?, paid=?, status=? WHERE id=?",
+        (received_amount_cents, paid, status, quote_id),
+    )
+
+
 def payment_has_reversal(conn: sqlite3.Connection, payment_id: int) -> bool:
     return (
         conn.execute(

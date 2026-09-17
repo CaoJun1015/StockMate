@@ -697,6 +697,35 @@ def get_shipment_snapshot(
     )
 
 
+def get_historical_quote_cache(
+    conn: sqlite3.Connection,
+    quote_id: int,
+) -> dict[str, Any] | None:
+    """Return only the immutable evidence required to rebuild a quote cache."""
+    return _dict(conn.execute(
+        """
+        SELECT q.id,q.received_amount_cents,q.status,q.paid,
+               q.quote_price_cents*q.quote_quantity-COALESCE((
+                   SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                   WHERE sr.quote_id=q.id
+               ),0) AS net_cents,
+               COALESCE((SELECT SUM(pa.amount_cents) FROM payment_allocations pa
+                         WHERE pa.quote_id=q.id),0) AS allocated_cents,
+               ss.quantity AS shipped_quantity,
+               COALESCE((SELECT SUM(sr.quantity) FROM sales_returns sr
+                         WHERE sr.quote_id=q.id),0) AS returned_quantity,
+               EXISTS(
+                   SELECT 1 FROM ledger_entries e
+                   WHERE e.source_type='quote' AND e.source_id=CAST(q.id AS TEXT)
+                     AND e.event_type='sales_shipment'
+               ) AS shipment_ledger
+        FROM quotes q LEFT JOIN shipment_snapshots ss ON ss.quote_id=q.id
+        WHERE q.id=? AND q.deleted_at IS NULL
+        """,
+        (quote_id,),
+    ).fetchone())
+
+
 def add_supplier_payment_allocation(
     conn: sqlite3.Connection,
     payment_id: int,
