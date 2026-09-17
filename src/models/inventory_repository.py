@@ -130,6 +130,9 @@ def list_shipment_allocations(
                COALESCE((SELECT SUM(ra.quantity)
                          FROM sales_return_allocations ra
                          WHERE ra.shipment_allocation_id=sa.id),0) AS returned_quantity
+               ,COALESCE((SELECT group_concat(ra.sn_list, ',')
+                          FROM sales_return_allocations ra
+                          WHERE ra.shipment_allocation_id=sa.id), '') AS returned_sn_list
         FROM shipment_allocations sa
         JOIN shipment_snapshots ss ON ss.id=sa.shipment_snapshot_id
         JOIN batches b ON b.id=sa.batch_id

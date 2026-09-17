@@ -458,12 +458,30 @@ class RecordTab(QWidget):
         if not quote or quote.get("status") not in ("已出库", "已收款"):
             QMessageBox.warning(self, "提示", "只有已出库或已收款订单可以退货")
             return
+        allocations = list_shipment_allocations(quote_id)
+        net_returnable = sum(
+            item["quantity"] - item.get("returned_quantity", 0) for item in allocations
+        )
+        if net_returnable <= 0:
+            QMessageBox.warning(self, "提示", "该订单已全部退货，不能继续创建退货")
+            return
+        def preview_return(data):
+            return self.return_service.preview_sale_return(
+                quote_id,
+                quantity=data["quantity"],
+                restock=data["restock"],
+                refund_account_id=data["account_id"],
+                cash_refund_cents=yuan_to_cents(data["refund"]),
+                restock_allocations=data.get("restock_allocations"),
+            )
         dialog = ReturnDialog(
             "销售退货",
             self,
-            max_quantity=quote.get("quote_quantity", 1),
+            max_quantity=net_returnable,
             allow_restock=True,
-            allocations=list_shipment_allocations(quote_id),
+            allocations=allocations,
+            original_quantity=quote.get("quote_quantity", 1),
+            preview_callback=preview_return,
         )
         if not dialog.exec():
             return
