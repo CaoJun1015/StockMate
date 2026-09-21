@@ -104,7 +104,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name=f'调货助手 v{APP_VERSION}',
+    name=f'StockMate v{APP_VERSION}',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

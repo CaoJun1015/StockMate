@@ -29,6 +29,7 @@ from src.utils.image_gen import generate_single_quote_card, generate_quote_image
 
 from src.ui.dialogs import CustomerDialog, ProductEditDialog, _parse_tax_rate
 from src.ui.finance_dialogs import BatchDialog, ReturnDialog
+from src.ui.utils import NumericTableWidgetItem, refreshing_table
 
 
 class QuotePanel(QWidget):
@@ -181,19 +182,23 @@ class QuotePanel(QWidget):
         
         suppliers = {s["id"]: s["name"] for s in list_suppliers()}
         
-        self.batch_table.setRowCount(len(batches))
-        for i, b in enumerate(batches):
-            price_item = QTableWidgetItem(format_yuan(b["purchase_price_cents"]))
-            price_item.setData(Qt.ItemDataRole.UserRole, b["id"])
-            self.batch_table.setItem(i, 0, price_item)
-            self.batch_table.setItem(i, 1, QTableWidgetItem(str(b['quantity'])))
-            self.batch_table.setItem(i, 2, QTableWidgetItem(str(b['remaining'])))
-            self.batch_table.setItem(i, 3, QTableWidgetItem(b['date']))
-            supplier_name = suppliers.get(b.get('supplier_id'), '')
-            self.batch_table.setItem(i, 4, QTableWidgetItem(supplier_name))
-            self.batch_table.setItem(i, 5, QTableWidgetItem(b.get('remark', '')))
-            self.batch_table.setItem(i, 6, QTableWidgetItem(b.get('sn_list', '')))
-        self.batch_table.resizeColumnsToContents()
+        with refreshing_table(self.batch_table, key_column=0):
+            self.batch_table.setRowCount(len(batches))
+            for i, b in enumerate(batches):
+                price_item = NumericTableWidgetItem(
+                    format_yuan(b["purchase_price_cents"]),
+                    b["purchase_price_cents"],
+                )
+                price_item.setData(Qt.ItemDataRole.UserRole, b["id"])
+                self.batch_table.setItem(i, 0, price_item)
+                self.batch_table.setItem(i, 1, NumericTableWidgetItem(b['quantity'], b['quantity']))
+                self.batch_table.setItem(i, 2, NumericTableWidgetItem(b['remaining'], b['remaining']))
+                self.batch_table.setItem(i, 3, QTableWidgetItem(b['date']))
+                supplier_name = suppliers.get(b.get('supplier_id'), '')
+                self.batch_table.setItem(i, 4, QTableWidgetItem(supplier_name))
+                self.batch_table.setItem(i, 5, QTableWidgetItem(b.get('remark', '')))
+                self.batch_table.setItem(i, 6, QTableWidgetItem(b.get('sn_list', '')))
+            self.batch_table.resizeColumnsToContents()
 
         self.customer_combo.clear()
         customers = list_customers()

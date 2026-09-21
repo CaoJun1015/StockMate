@@ -1,6 +1,6 @@
 #!python
 """
-调货助手 - 快速启动入口
+货管家 · StockMate - 快速启动入口
 """
 
 import sys

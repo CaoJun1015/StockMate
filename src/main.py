@@ -40,6 +40,9 @@ from src.ui.customer_tab import CustomerTab
 from src.ui.supplier_tab import SupplierTab
 from src.ui.finance_tab import FinanceTab
 from src.ui.utils import _validate_date, _global_excepthook
+from src.ui.background_tasks import (
+    has_background_tasks, write_text_atomically,
+)
 from src.models.migrations import DatabaseMigrationError
 from src.models.connection import (
     DatabaseRestoreError,
@@ -48,6 +51,7 @@ from src.models.connection import (
     get_database_path,
 )
 from src.services.reconciliation_service import ReconciliationService
+from src.services.historical_repair_service import HistoricalRepairService
 from src.version import APP_DISPLAY_NAME
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
 from src.utils.excel_export import export_quotes_to_excel
@@ -212,6 +216,14 @@ class MainWindow(QMainWindow):
         export_reconcile_action.triggered.connect(self.on_export_reconciliation_report)
         data_menu.addAction(export_reconcile_action)
 
+        historical_repair_action = QAction("核对历史异常并修复…", self)
+        historical_repair_action.triggered.connect(self.on_repair_historical_anomalies)
+        data_menu.addAction(historical_repair_action)
+
+        export_historical_action = QAction("导出历史异常清单…", self)
+        export_historical_action.triggered.connect(self.on_export_historical_anomalies)
+        data_menu.addAction(export_historical_action)
+
         data_menu.addSeparator()
         backup_action = QAction("立即创建 SQLite 备份", self)
         backup_action.triggered.connect(self.on_create_database_backup)
@@ -253,13 +265,71 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         try:
-            output_path = Path(file_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(report.format_text(), encoding="utf-8")
+            output_path = write_text_atomically(file_path, report.format_text())
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", str(exc))
             return
         QMessageBox.information(self, "导出成功", f"对账报告已保存：\n{output_path}")
+
+    def _historical_repair_plan(self):
+        return HistoricalRepairService(get_database_path()).audit()
+
+    def on_export_historical_anomalies(self):
+        try:
+            plan = self._historical_repair_plan()
+        except Exception as exc:
+            QMessageBox.critical(self, "核对失败", str(exc))
+            return
+        default_path = get_backup_dir() / (
+            f"historical_anomalies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出历史异常清单", str(default_path), "文本文件 (*.txt);;所有文件 (*.*)"
+        )
+        if not file_path:
+            return
+        try:
+            output = HistoricalRepairService.export(plan, file_path)
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(self, "导出成功", f"历史异常清单已保存：\n{output}")
+
+    def on_repair_historical_anomalies(self):
+        try:
+            plan = self._historical_repair_plan()
+        except Exception as exc:
+            QMessageBox.critical(self, "核对失败", str(exc))
+            return
+        preview = plan.format_text()
+        if not plan.repairable:
+            QMessageBox.warning(self, "历史异常核对（只读）", preview + "\n\n没有证据充分的自动修复项，请导出后人工核对。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认历史修复",
+            preview + "\n\n仅会更新上述可确定的报价缓存字段；将先创建并验证安全备份。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = HistoricalRepairService(get_database_path()).apply(
+                plan, reason="用户确认：历史异常修复"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "历史修复失败", str(exc))
+            return
+        self.refresh_records()
+        self.finance_tab.refresh()
+        remaining = len(result.remaining_report.issues)
+        QMessageBox.information(
+            self,
+            "历史修复完成",
+            f"已修复 {len(result.applied)} 项；安全备份：{result.backup.path}\n"
+            f"SHA-256：{result.backup.sha256}\n未解决异常：{remaining} 项。",
+        )
 
     def on_create_database_backup(self):
         try:
@@ -510,16 +580,19 @@ class MainWindow(QMainWindow):
 
     def on_export_json(self):
         """导出全量数据为 JSON 格式"""
+        from src.utils.json_export import export_all_to_json
         try:
-            from src.utils.json_export import export_all_to_json
-
             output_path = export_all_to_json()
-            QMessageBox.information(
-                self, "导出成功",
-                f"数据已成功导出为 JSON 格式！\n\n文件位置: {output_path}\n\n可用于数据备份或迁移到其他电脑。"
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", f"导出时发生错误:\n{str(e)}")
+            QMessageBox.information(self, "导出成功", f"数据已成功导出为 JSON 格式！\n\n文件位置: {output_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"导出时发生错误:\n{exc}")
+
+    def closeEvent(self, event):
+        if has_background_tasks(self):
+            QMessageBox.information(self, "任务进行中", "读取或导出正在完成；为保护输出文件，请完成后再关闭窗口。")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def on_import_json(self):
         file_path, _ = QFileDialog.getOpenFileName(

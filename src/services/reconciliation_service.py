@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from src.models.finance_queries import collect_finance_reconciliation_snapshot
-from src.models.queries import collect_reconciliation_snapshot
+from src.models.queries import collect_reconciliation_snapshots
 
 
 @dataclass(frozen=True)
@@ -15,6 +14,9 @@ class ReconciliationIssue:
     message: str
     entity_type: str | None = None
     entity_id: int | None = None
+    difference_cents: int | None = None
+    evidence: str = ""
+    recommendation: str = ""
 
 
 @dataclass(frozen=True)
@@ -44,10 +46,15 @@ class ReconciliationReport:
             lines.append("结果：库存、账务、外键和金额一致性检查全部通过。")
         else:
             lines.append(f"结果：发现 {len(self.issues)} 个需要处理的问题：")
-            lines.extend(
-                f"{index}. [{issue.code}] {issue.message}"
-                for index, issue in enumerate(self.issues, 1)
-            )
+            for index, issue in enumerate(self.issues, 1):
+                detail = f"{index}. [{issue.code}] {issue.message}"
+                if issue.difference_cents is not None:
+                    detail += f"；差异 {issue.difference_cents} 分"
+                if issue.evidence:
+                    detail += f"；证据：{issue.evidence}"
+                if issue.recommendation:
+                    detail += f"；建议：{issue.recommendation}"
+                lines.append(detail)
         return "\n".join(lines)
 
 
@@ -56,7 +63,7 @@ class ReconciliationService:
         self.db_path = db_path
 
     def run(self) -> ReconciliationReport:
-        snapshot = collect_reconciliation_snapshot(self.db_path)
+        snapshot, finance = collect_reconciliation_snapshots(self.db_path)
         issues: list[ReconciliationIssue] = []
 
         for result in snapshot["integrity"]:
@@ -137,12 +144,26 @@ class ReconciliationService:
             issues.append(
                 ReconciliationIssue(
                     "RECEIVABLE_RANGE",
-                    (
-                        f"报价 {row['id']} 总额 {row['total_cents']} 分，"
-                        f"已收 {row['received_amount_cents']} 分"
-                    ),
+                    f"报价 {row['id']} 净应收 {row['net_cents']} 分，"
+                    f"已收 {row['received_amount_cents']} 分",
                     "quotes",
                     row["id"],
+                    row["received_amount_cents"] - row["net_cents"],
+                    f"原额 {row['total_cents']} 分，退货 {row['returned_cents']} 分",
+                    "核对退货、收款分配和订单结清状态",
+                )
+            )
+        for row in snapshot["net_allocations"]:
+            issues.append(
+                ReconciliationIssue(
+                    "QUOTE_NET_ALLOCATION",
+                    f"报价 {row['id']} 的收款分配超过净应收上限",
+                    "quotes",
+                    row["id"],
+                    row["allocated_cents"] - row["net_cents"],
+                    f"原额 {row['total_cents']} 分，退货 {row['returned_cents']} 分，"
+                    f"分配 {row['allocated_cents']} 分",
+                    "核对退货释放的收款来源，再按净应收重建分配",
                 )
             )
         for row in snapshot["payment_owners"]:
@@ -155,7 +176,6 @@ class ReconciliationService:
                 )
             )
 
-        finance = collect_finance_reconciliation_snapshot(self.db_path)
         subledger_matches_batches = (
             finance["movement_inventory_cents"]
             == finance["inventory"]["business_cents"]
@@ -169,9 +189,12 @@ class ReconciliationService:
                 "sales_returns",
                 "customer_allocations",
                 "supplier_allocations",
+                "refund_sources",
                 "shipment_allocations",
                 "inventory_movements",
                 "inventory_sns",
+                "sn_ownership",
+                "quote_statuses",
             ):
                 finance[key] = []
             finance["inventory"] = {"business_cents": 0, "ledger_cents": 0}
@@ -210,6 +233,72 @@ class ReconciliationService:
                     "库存业务金额与账本库存金额不一致",
                 )
             )
+        for row in finance["refund_sources"]:
+            entity = "sales_returns" if row["owner_type"] == "customer" else "purchase_returns"
+            issues.append(
+                ReconciliationIssue(
+                    "REFUND_SOURCE",
+                    (
+                        f"{row['owner_type']}#{row['owner_id']} 的退货#{row['id']}"
+                        f"现金退款 {row['cash_refund_cents']} 分，"
+                        f"仅能解释 {row['attributed_cents']} 分"
+                    ),
+                    entity,
+                    row["id"],
+                    row["cash_refund_cents"] - row["attributed_cents"],
+                    f"退款来源已归因 {row['attributed_cents']} 分",
+                    "补充原付款来源后再允许自动抵扣",
+                )
+            )
+        for rows, code, label in (
+            (finance["customer_allocations"], "CUSTOMER_PAYMENT_NET", "客户收款"),
+            (finance["supplier_allocations"], "SUPPLIER_PAYMENT_NET", "供应商付款"),
+        ):
+            for row in rows:
+                limit = (
+                    -row["amount_cents"]
+                    if row["entry_kind"] == "reversal"
+                    else row["amount_cents"] - row["refunded_cents"]
+                )
+                issues.append(
+                    ReconciliationIssue(
+                        code,
+                        f"{label}#{row['id']} 的可分配净额不足",
+                        "payments",
+                        row["id"],
+                        row["allocated_cents"] - limit,
+                        f"付款 {row['amount_cents']} 分，退款 {row['refunded_cents']} 分，"
+                        f"实际分配 {row['allocated_cents']} 分",
+                        "核对退款来源和付款分配，避免已退款金额再次抵扣",
+                    )
+                )
+        for row in finance["quote_statuses"]:
+            issues.append(
+                ReconciliationIssue(
+                    "QUOTE_STATUS",
+                    f"报价#{row['id']} 状态“{row['status']}”缺少对应业务事实",
+                    "quotes",
+                    row["id"],
+                    None,
+                    f"出库快照={row['shipment_snapshot_id'] or '无'}，"
+                    f"出库账本={'有' if row['shipment_ledger'] else '无'}，"
+                    f"已收 {row['received_amount_cents']} / 净应收 {row['net_cents']} 分",
+                    "通过出库、收款或退货事务更正；迁移历史请先人工核对证据",
+                )
+            )
+        for row in finance["sn_ownership"]:
+            issues.append(
+                ReconciliationIssue(
+                    "RETURN_SN_OWNERSHIP",
+                    f"销售退货#{row['sales_return_id']} 的回库SN无法确认原出库归属",
+                    "sales_return_allocations",
+                    row["id"],
+                    row["difference"],
+                    f"原出库分配#{row['shipment_allocation_id']} SN={row['shipment_sn_list']}，"
+                    f"退货SN={row['return_sn_list'] or '未知'}",
+                    "核对实物SN；确认前不要把该设备作为可售SN处理",
+                )
+            )
         if not subledger_matches_batches:
             issues.append(
                 ReconciliationIssue(
@@ -220,8 +309,6 @@ class ReconciliationService:
         for key, code, entity in (
             ("shipment_snapshots", "SHIPMENT_SNAPSHOT", "quotes"),
             ("sales_returns", "RETURN_QUANTITY", "quotes"),
-            ("customer_allocations", "CUSTOMER_ADVANCE", "payments"),
-            ("supplier_allocations", "SUPPLIER_ADVANCE", "payments"),
             ("shipment_allocations", "SHIPMENT_ALLOCATION", "shipment_snapshots"),
             ("inventory_movements", "INVENTORY_MOVEMENT", "batches"),
             ("inventory_sns", "INVENTORY_SN", "shipment_allocations"),

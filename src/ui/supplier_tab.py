@@ -4,6 +4,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPushButton, QLabel,
     QLineEdit, QGroupBox, QMessageBox, QAbstractItemView,
 )
+from PyQt6.QtCore import QTimer
 
 from src.models.queries import (
     get_supplier,
@@ -14,6 +15,7 @@ from src.models.queries import (
 from src.services.exceptions import ServiceError
 from src.services.party_service import SupplierService
 from src.ui.dialogs import CustomerDialog
+from src.ui.utils import refreshing_table
 from src.utils.money import format_yuan
 
 
@@ -28,6 +30,10 @@ class SupplierTab(QWidget):
         self.supplier_stats_label = None
         self.supplier_history_table = None
         self.supplier_service = SupplierService()
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self.refresh_supplier_list)
         self._build_ui()
 
     def _build_ui(self):
@@ -47,7 +53,7 @@ class SupplierTab(QWidget):
         self.supplier_search = QLineEdit()
         self.supplier_search.setObjectName("globalSearch")
         self.supplier_search.setPlaceholderText("搜索上游...")
-        self.supplier_search.textChanged.connect(self.refresh_supplier_list)
+        self.supplier_search.textChanged.connect(lambda: self._search_timer.start())
         btn_row.addWidget(self.supplier_search)
         layout.addLayout(btn_row)
 
@@ -93,19 +99,20 @@ class SupplierTab(QWidget):
         rows = get_supplier_purchase_history(sid)
 
         total_amount = 0
-        self.supplier_history_table.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            price = r.get("purchase_price_cents", 0) or 0
-            quantity = r.get("quantity", 0) or 0
-            total_amount += price * quantity
-            self.supplier_history_table.setItem(i, 0, QTableWidgetItem(r.get("date") or ""))
-            self.supplier_history_table.setItem(i, 1, QTableWidgetItem(r.get("series") or ""))
-            self.supplier_history_table.setItem(i, 2, QTableWidgetItem(r.get("cpu") or ""))
-            self.supplier_history_table.setItem(i, 3, QTableWidgetItem(str(quantity)))
-            self.supplier_history_table.setItem(i, 4, QTableWidgetItem(format_yuan(price)))
-            self.supplier_history_table.setItem(i, 5, QTableWidgetItem(format_yuan(price * quantity)))
-            self.supplier_history_table.setItem(i, 6, QTableWidgetItem(r.get("remark") or ""))
-        self.supplier_history_table.resizeColumnsToContents()
+        with refreshing_table(self.supplier_history_table):
+            self.supplier_history_table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                price = r.get("purchase_price_cents", 0) or 0
+                quantity = r.get("quantity", 0) or 0
+                total_amount += price * quantity
+                self.supplier_history_table.setItem(i, 0, QTableWidgetItem(r.get("date") or ""))
+                self.supplier_history_table.setItem(i, 1, QTableWidgetItem(r.get("series") or ""))
+                self.supplier_history_table.setItem(i, 2, QTableWidgetItem(r.get("cpu") or ""))
+                self.supplier_history_table.setItem(i, 3, QTableWidgetItem(str(quantity)))
+                self.supplier_history_table.setItem(i, 4, QTableWidgetItem(format_yuan(price)))
+                self.supplier_history_table.setItem(i, 5, QTableWidgetItem(format_yuan(price * quantity)))
+                self.supplier_history_table.setItem(i, 6, QTableWidgetItem(r.get("remark") or ""))
+            self.supplier_history_table.resizeColumnsToContents()
 
         self.supplier_stats_label.setText(
             f"上游: {supplier_name} | 总批次数: {len(rows)} | "
@@ -115,15 +122,16 @@ class SupplierTab(QWidget):
     def refresh_supplier_list(self):
         keyword = self.supplier_search.text().strip()
         suppliers = list_suppliers(keyword)
-        self.supplier_table.setRowCount(len(suppliers))
-        for i, s in enumerate(suppliers):
-            self.supplier_table.setItem(i, 0, QTableWidgetItem(str(s["id"])))
-            self.supplier_table.setItem(i, 1, QTableWidgetItem(s["name"]))
-            self.supplier_table.setItem(i, 2, QTableWidgetItem(s.get("wechat", "")))
-            self.supplier_table.setItem(i, 3, QTableWidgetItem(s.get("qq", "")))
-            self.supplier_table.setItem(i, 4, QTableWidgetItem(s.get("phone", "")))
-            self.supplier_table.setItem(i, 5, QTableWidgetItem(s.get("note", "")))
-        self.supplier_table.resizeColumnsToContents()
+        with refreshing_table(self.supplier_table, key_column=0):
+            self.supplier_table.setRowCount(len(suppliers))
+            for i, s in enumerate(suppliers):
+                self.supplier_table.setItem(i, 0, QTableWidgetItem(str(s["id"])))
+                self.supplier_table.setItem(i, 1, QTableWidgetItem(s["name"]))
+                self.supplier_table.setItem(i, 2, QTableWidgetItem(s.get("wechat", "")))
+                self.supplier_table.setItem(i, 3, QTableWidgetItem(s.get("qq", "")))
+                self.supplier_table.setItem(i, 4, QTableWidgetItem(s.get("phone", "")))
+                self.supplier_table.setItem(i, 5, QTableWidgetItem(s.get("note", "")))
+            self.supplier_table.resizeColumnsToContents()
 
     def on_add_supplier(self):
         dlg = CustomerDialog(self)

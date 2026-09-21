@@ -340,11 +340,15 @@ def list_open_customer_balances(conn: sqlite3.Connection) -> list[dict[str, Any]
         dict(row)
         for row in conn.execute(
             "SELECT customer_id,"
-            "SUM(quote_price_cents*quote_quantity-received_amount_cents) "
+            "SUM(quote_price_cents*quote_quantity-received_amount_cents-COALESCE(("
+            "SELECT SUM(sr.revenue_cents) FROM sales_returns sr WHERE sr.quote_id=quotes.id"
+            "),0)) "
             "AS open_cents FROM quotes "
             "WHERE deleted_at IS NULL AND status='已出库' "
             "AND customer_id IS NOT NULL "
-            "AND quote_price_cents*quote_quantity>received_amount_cents "
+            "AND quote_price_cents*quote_quantity-COALESCE(("
+            "SELECT SUM(sr.revenue_cents) FROM sales_returns sr WHERE sr.quote_id=quotes.id"
+            "),0)>received_amount_cents "
             "GROUP BY customer_id"
         ).fetchall()
     ]
@@ -370,10 +374,14 @@ def list_open_receivable_quotes(conn: sqlite3.Connection) -> list[dict[str, Any]
         dict(row)
         for row in conn.execute(
             "SELECT id,customer_id,"
-            "quote_price_cents*quote_quantity-received_amount_cents AS open_cents "
+            "quote_price_cents*quote_quantity-received_amount_cents-COALESCE(("
+            "SELECT SUM(sr.revenue_cents) FROM sales_returns sr WHERE sr.quote_id=quotes.id"
+            "),0) AS open_cents "
             "FROM quotes WHERE deleted_at IS NULL AND status='已出库' "
             "AND customer_id IS NOT NULL "
-            "AND quote_price_cents*quote_quantity>received_amount_cents "
+            "AND quote_price_cents*quote_quantity-COALESCE(("
+            "SELECT SUM(sr.revenue_cents) FROM sales_returns sr WHERE sr.quote_id=quotes.id"
+            "),0)>received_amount_cents "
             "ORDER BY quote_date,id"
         ).fetchall()
     ]
@@ -454,6 +462,70 @@ def supplier_payment_allocated_cents(
             (payment_id,),
         ).fetchone()[0]
     )
+
+
+def payment_refunded_cents(conn: sqlite3.Connection, payment_id: int) -> int:
+    return int(
+        conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) "
+            "FROM payment_refund_allocations WHERE payment_id=?",
+            (payment_id,),
+        ).fetchone()[0]
+    )
+
+
+def insert_payment_refund_allocation(
+    conn: sqlite3.Connection,
+    payment_id: int,
+    amount_cents: int,
+    *,
+    sales_return_id: int | None = None,
+    purchase_return_id: int | None = None,
+) -> int:
+    if (sales_return_id is None) == (purchase_return_id is None):
+        raise ValueError("退款来源必须且只能关联一张退货单")
+    cursor = conn.execute(
+        "INSERT INTO payment_refund_allocations "
+        "(payment_id,sales_return_id,purchase_return_id,amount_cents) "
+        "VALUES (?,?,?,?)",
+        (payment_id, sales_return_id, purchase_return_id, amount_cents),
+    )
+    return int(cursor.lastrowid)
+
+
+def list_unattributed_cash_refunds(
+    conn: sqlite3.Connection,
+    *,
+    owner_field: str,
+    owner_id: int,
+    pay_type: str,
+) -> list[dict[str, Any]]:
+    if owner_field == "customer_id" and pay_type == "receivable":
+        sql = """
+            SELECT sr.id,sr.cash_refund_cents,
+                   COALESCE(SUM(pra.amount_cents),0) AS attributed_cents
+            FROM sales_returns sr
+            JOIN quotes q ON q.id=sr.quote_id
+            LEFT JOIN payment_refund_allocations pra
+              ON pra.sales_return_id=sr.id
+            WHERE q.customer_id=? AND sr.cash_refund_cents>0
+            GROUP BY sr.id
+            HAVING attributed_cents!=sr.cash_refund_cents
+        """
+    elif owner_field == "supplier_id" and pay_type == "payable":
+        sql = """
+            SELECT pr.id,pr.cash_refund_cents,
+                   COALESCE(SUM(pra.amount_cents),0) AS attributed_cents
+            FROM purchase_returns pr
+            LEFT JOIN payment_refund_allocations pra
+              ON pra.purchase_return_id=pr.id
+            WHERE pr.supplier_id=? AND pr.cash_refund_cents>0
+            GROUP BY pr.id
+            HAVING attributed_cents!=pr.cash_refund_cents
+        """
+    else:
+        raise ValueError("invalid refund owner")
+    return [dict(row) for row in conn.execute(sql, (owner_id,)).fetchall()]
 
 
 def list_supplier_payable_batches(
@@ -623,6 +695,35 @@ def get_shipment_snapshot(
             (quote_id,),
         ).fetchone()
     )
+
+
+def get_historical_quote_cache(
+    conn: sqlite3.Connection,
+    quote_id: int,
+) -> dict[str, Any] | None:
+    """Return only the immutable evidence required to rebuild a quote cache."""
+    return _dict(conn.execute(
+        """
+        SELECT q.id,q.received_amount_cents,q.status,q.paid,
+               q.quote_price_cents*q.quote_quantity-COALESCE((
+                   SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                   WHERE sr.quote_id=q.id
+               ),0) AS net_cents,
+               COALESCE((SELECT SUM(pa.amount_cents) FROM payment_allocations pa
+                         WHERE pa.quote_id=q.id),0) AS allocated_cents,
+               ss.quantity AS shipped_quantity,
+               COALESCE((SELECT SUM(sr.quantity) FROM sales_returns sr
+                         WHERE sr.quote_id=q.id),0) AS returned_quantity,
+               EXISTS(
+                   SELECT 1 FROM ledger_entries e
+                   WHERE e.source_type='quote' AND e.source_id=CAST(q.id AS TEXT)
+                     AND e.event_type='sales_shipment'
+               ) AS shipment_ledger
+        FROM quotes q LEFT JOIN shipment_snapshots ss ON ss.quote_id=q.id
+        WHERE q.id=? AND q.deleted_at IS NULL
+        """,
+        (quote_id,),
+    ).fetchone())
 
 
 def add_supplier_payment_allocation(

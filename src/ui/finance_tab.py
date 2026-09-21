@@ -50,6 +50,7 @@ from src.ui.finance_dialogs import (
     TransferDialog,
 )
 from src.ui.display_labels import format_source_label
+from src.ui.utils import NumericTableWidgetItem, refreshing_table
 from src.utils.excel_export import export_finance_to_excel
 from src.utils.money import format_yuan, yuan_to_cents
 
@@ -337,17 +338,20 @@ class FinanceTab(QWidget):
 
     def _refresh_accounts(self):
         rows = list_financial_accounts(include_inactive=True, db_path=self.db_path)
-        self.accounts_table.setRowCount(len(rows))
-        for index, row in enumerate(rows):
-            item = QTableWidgetItem(row["name"])
-            item.setData(Qt.ItemDataRole.UserRole, row["id"])
-            self.accounts_table.setItem(index, 0, item)
-            self.accounts_table.setItem(
-                index, 1, QTableWidgetItem(format_yuan(row["balance_cents"]))
-            )
-            self.accounts_table.setItem(
-                index, 2, QTableWidgetItem("正常" if row["is_active"] else "已停用")
-            )
+        with refreshing_table(self.accounts_table, key_column=0):
+            self.accounts_table.setRowCount(len(rows))
+            for index, row in enumerate(rows):
+                item = QTableWidgetItem(row["name"])
+                item.setData(Qt.ItemDataRole.UserRole, row["id"])
+                self.accounts_table.setItem(index, 0, item)
+                self.accounts_table.setItem(
+                    index, 1, NumericTableWidgetItem(
+                        format_yuan(row["balance_cents"]), row["balance_cents"]
+                    )
+                )
+                self.accounts_table.setItem(
+                    index, 2, QTableWidgetItem("正常" if row["is_active"] else "已停用")
+                )
 
     def _refresh_daily(self):
         rows = list_operating_entries(
@@ -359,79 +363,85 @@ class FinanceTab(QWidget):
 
     def _refresh_counterparties(self):
         customers = list_counterparty_balances("customer", self.db_path)
-        self.receivable_table.setRowCount(len(customers))
-        for index, row in enumerate(customers):
-            balance = row["balance_cents"]
-            self.receivable_table.setItem(index, 0, QTableWidgetItem(row["name"]))
-            amount = QTableWidgetItem(format_yuan(abs(balance)))
-            amount.setForeground(QColor("#D32F2F" if balance > 0 else "#388E3C"))
-            self.receivable_table.setItem(index, 1, amount)
-            self.receivable_table.setItem(
-                index, 2, QTableWidgetItem("应收" if balance > 0 else "预收")
-            )
-            self.receivable_table.setItem(
-                index, 3, QTableWidgetItem(str(row.get("open_item_count") or 0))
-            )
-            oldest = row.get("oldest_open_date")
-            age = (
-                max((date.today() - date.fromisoformat(oldest)).days, 0)
-                if oldest
-                else None
-            )
-            self.receivable_table.setItem(
-                index, 4, QTableWidgetItem(f"{age} 天" if age is not None else "—")
-            )
-            self.receivable_table.setItem(
-                index,
-                5,
-                QTableWidgetItem(
-                    " | ".join(filter(None, [row["wechat"] or "", row["phone"] or ""]))
-                ),
-            )
-            button = QPushButton("收款")
-            button.clicked.connect(
-                lambda _, customer_id=row["id"], pending=balance: self._receive(
-                    customer_id, pending
+        with refreshing_table(self.receivable_table, key_column=0):
+            self.receivable_table.setRowCount(len(customers))
+            for index, row in enumerate(customers):
+                balance = row["balance_cents"]
+                self.receivable_table.setItem(index, 0, QTableWidgetItem(row["name"]))
+                amount = NumericTableWidgetItem(format_yuan(abs(balance)), abs(balance))
+                amount.setForeground(QColor("#D32F2F" if balance > 0 else "#388E3C"))
+                self.receivable_table.setItem(index, 1, amount)
+                self.receivable_table.setItem(
+                    index, 2, QTableWidgetItem("应收" if balance > 0 else "预收")
                 )
-            )
-            self.receivable_table.setCellWidget(index, 6, button)
+                self.receivable_table.setItem(
+                    index, 3, NumericTableWidgetItem(
+                        row.get("open_item_count") or 0, row.get("open_item_count") or 0
+                    )
+                )
+                oldest = row.get("oldest_open_date")
+                age = (
+                    max((date.today() - date.fromisoformat(oldest)).days, 0)
+                    if oldest
+                    else None
+                )
+                self.receivable_table.setItem(
+                    index, 4, NumericTableWidgetItem(
+                        f"{age} 天" if age is not None else "—", age if age is not None else -1
+                    )
+                )
+                self.receivable_table.setItem(
+                    index, 5, QTableWidgetItem(
+                        " | ".join(filter(None, [row["wechat"] or "", row["phone"] or ""]))
+                    )
+                )
+                button = QPushButton("收款")
+                button.clicked.connect(
+                    lambda _, customer_id=row["id"], pending=balance: self._receive(
+                        customer_id, pending
+                    )
+                )
+                self.receivable_table.setCellWidget(index, 6, button)
         suppliers = list_counterparty_balances("supplier", self.db_path)
-        self.payable_table.setRowCount(len(suppliers))
-        for index, row in enumerate(suppliers):
-            balance = row["balance_cents"]
-            self.payable_table.setItem(index, 0, QTableWidgetItem(row["name"]))
-            self.payable_table.setItem(
-                index, 1, QTableWidgetItem(format_yuan(abs(balance)))
-            )
-            self.payable_table.setItem(
-                index, 2, QTableWidgetItem("应付" if balance > 0 else "预付")
-            )
-            self.payable_table.setItem(
-                index, 3, QTableWidgetItem(str(row.get("open_item_count") or 0))
-            )
-            oldest = row.get("oldest_open_date")
-            age = (
-                max((date.today() - date.fromisoformat(oldest)).days, 0)
-                if oldest
-                else None
-            )
-            self.payable_table.setItem(
-                index, 4, QTableWidgetItem(f"{age} 天" if age is not None else "—")
-            )
-            self.payable_table.setItem(
-                index,
-                5,
-                QTableWidgetItem(
-                    " | ".join(filter(None, [row["wechat"] or "", row["phone"] or ""]))
-                ),
-            )
-            button = QPushButton("付款")
-            button.clicked.connect(
-                lambda _, supplier_id=row["id"], pending=balance: self._pay(
-                    supplier_id, pending
+        with refreshing_table(self.payable_table, key_column=0):
+            self.payable_table.setRowCount(len(suppliers))
+            for index, row in enumerate(suppliers):
+                balance = row["balance_cents"]
+                self.payable_table.setItem(index, 0, QTableWidgetItem(row["name"]))
+                self.payable_table.setItem(
+                    index, 1, NumericTableWidgetItem(format_yuan(abs(balance)), abs(balance))
                 )
-            )
-            self.payable_table.setCellWidget(index, 6, button)
+                self.payable_table.setItem(
+                    index, 2, QTableWidgetItem("应付" if balance > 0 else "预付")
+                )
+                self.payable_table.setItem(
+                    index, 3, NumericTableWidgetItem(
+                        row.get("open_item_count") or 0, row.get("open_item_count") or 0
+                    )
+                )
+                oldest = row.get("oldest_open_date")
+                age = (
+                    max((date.today() - date.fromisoformat(oldest)).days, 0)
+                    if oldest
+                    else None
+                )
+                self.payable_table.setItem(
+                    index, 4, NumericTableWidgetItem(
+                        f"{age} 天" if age is not None else "—", age if age is not None else -1
+                    )
+                )
+                self.payable_table.setItem(
+                    index, 5, QTableWidgetItem(
+                        " | ".join(filter(None, [row["wechat"] or "", row["phone"] or ""]))
+                    )
+                )
+                button = QPushButton("付款")
+                button.clicked.connect(
+                    lambda _, supplier_id=row["id"], pending=balance: self._pay(
+                        supplier_id, pending
+                    )
+                )
+                self.payable_table.setCellWidget(index, 6, button)
 
     def _refresh_profit(self):
         rows = get_profit_report(
@@ -440,29 +450,31 @@ class FinanceTab(QWidget):
             group_by=self.profit_group.currentData(),
             db_path=self.db_path,
         )
-        self.profit_table.setRowCount(len(rows))
         totals = {
             "sales_cents": 0,
             "cogs_cents": 0,
             "expense_cents": 0,
             "other_income_cents": 0,
         }
-        for index, row in enumerate(rows):
-            gross = row["sales_cents"] - row["cogs_cents"]
-            net = gross - row["expense_cents"] + row["other_income_cents"]
-            values = (
-                row["label"] or str(row["group_key"]),
-                format_yuan(row["sales_cents"]),
-                format_yuan(row["cogs_cents"]),
-                format_yuan(gross),
-                format_yuan(row["expense_cents"]),
-                format_yuan(row["other_income_cents"]),
-                format_yuan(net),
-            )
-            for column, value in enumerate(values):
-                self.profit_table.setItem(index, column, QTableWidgetItem(value))
-            for key in totals:
-                totals[key] += row[key]
+        with refreshing_table(self.profit_table, key_column=0):
+            self.profit_table.setRowCount(len(rows))
+            for index, row in enumerate(rows):
+                gross = row["sales_cents"] - row["cogs_cents"]
+                net = gross - row["expense_cents"] + row["other_income_cents"]
+                values = (
+                    (row["label"] or str(row["group_key"]), None),
+                    (format_yuan(row["sales_cents"]), row["sales_cents"]),
+                    (format_yuan(row["cogs_cents"]), row["cogs_cents"]),
+                    (format_yuan(gross), gross),
+                    (format_yuan(row["expense_cents"]), row["expense_cents"]),
+                    (format_yuan(row["other_income_cents"]), row["other_income_cents"]),
+                    (format_yuan(net), net),
+                )
+                for column, (value, sort_value) in enumerate(values):
+                    item = QTableWidgetItem(value) if sort_value is None else NumericTableWidgetItem(value, sort_value)
+                    self.profit_table.setItem(index, column, item)
+                for key in totals:
+                    totals[key] += row[key]
         gross = totals["sales_cents"] - totals["cogs_cents"]
         net = gross - totals["expense_cents"] + totals["other_income_cents"]
         self.profit_summary.setText(
@@ -483,32 +495,32 @@ class FinanceTab(QWidget):
         self._fill_entry_table(self.audit_table, rows, audit=True)
 
     def _fill_entry_table(self, table, rows, *, audit):
-        table.setRowCount(len(rows))
-        for index, row in enumerate(rows):
-            name = row.get("customer_name") or row.get("supplier_name") or ""
-            if audit:
-                values = (
-                    str(row["id"]),
-                    row["entry_date"],
-                    EVENT_LABELS.get(row["event_type"], row["event_type"]),
-                    format_source_label(row["source_type"], row.get("source_id")),
-                    name,
-                    format_yuan(row["debit_total_cents"]),
-                    row["status"],
-                    row.get("reason") or row.get("remark") or "",
-                )
-            else:
-                values = (
-                    str(row["id"]),
-                    row["entry_date"],
-                    EVENT_LABELS.get(row["event_type"], row["event_type"]),
-                    name,
-                    format_yuan(row["cash_change_cents"]),
-                    row["status"],
-                    row.get("remark") or "",
-                )
-            for column, value in enumerate(values):
-                table.setItem(index, column, QTableWidgetItem(str(value)))
+        with refreshing_table(table, key_column=0):
+            table.setRowCount(len(rows))
+            for index, row in enumerate(rows):
+                name = row.get("customer_name") or row.get("supplier_name") or ""
+                if audit:
+                    values = (
+                        str(row["id"]), row["entry_date"],
+                        EVENT_LABELS.get(row["event_type"], row["event_type"]),
+                        format_source_label(row["source_type"], row.get("source_id")),
+                        name, format_yuan(row["debit_total_cents"]), row["status"],
+                        row.get("reason") or row.get("remark") or "",
+                    )
+                    amount_column = 5
+                    amount_value = row["debit_total_cents"]
+                else:
+                    values = (
+                        str(row["id"]), row["entry_date"],
+                        EVENT_LABELS.get(row["event_type"], row["event_type"]),
+                        name, format_yuan(row["cash_change_cents"]), row["status"],
+                        row.get("remark") or "",
+                    )
+                    amount_column = 4
+                    amount_value = row["cash_change_cents"]
+                for column, value in enumerate(values):
+                    item = NumericTableWidgetItem(value, amount_value) if column == amount_column else QTableWidgetItem(str(value))
+                    table.setItem(index, column, item)
 
     def _setup_finance(self):
         dialog = FinanceSetupDialog(self, db_path=self.db_path)

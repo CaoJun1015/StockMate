@@ -3,10 +3,25 @@ Excel 导出模块：将报价记录导出为 .xlsx 格式
 """
 
 import os
+from pathlib import Path
+from uuid import uuid4
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from src.utils.money import cents_to_yuan
+
+
+def _save_workbook_atomically(workbook, output_path):
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.stem}.{uuid4().hex}{target.suffix}")
+    try:
+        workbook.save(temporary)
+        os.replace(temporary, target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return str(target)
 
 
 def export_quotes_to_excel(quotes, output_path=None):
@@ -30,7 +45,8 @@ def export_quotes_to_excel(quotes, output_path=None):
 
     # 表头
     headers = ["日期", "客户", "机型系列", "CPU", "内存", "硬盘", "显卡",
-               "上游", "购入价", "数量", "对外报价", "毛利", "状态", "已收款", "SN", "备注", "是否打款"]
+               "上游", "购入价", "数量", "对外报价", "净金额", "毛利", "状态",
+               "已收款", "待收款", "SN", "备注", "是否打款"]
     
     header_font = Font(bold=True, size=11, color="FFFFFF")
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
@@ -63,10 +79,13 @@ def export_quotes_to_excel(quotes, output_path=None):
         purchase_price = q.get("purchase_price_cents", 0) or 0
         quote_price = q.get("quote_price_cents", 0) or 0
         quantity = q.get("quote_quantity", 1) or 1
-        profit = (quote_price - purchase_price) * quantity
+        net_total = q.get("net_total_cents", quote_price * quantity) or 0
+        net_quantity = max(quantity - (q.get("returned_quantity", 0) or 0), 0)
+        profit = (quote_price - purchase_price) * net_quantity
+        received = q.get("received_amount_cents", 0) or 0
 
-        total_purchase += purchase_price * quantity
-        total_quote += quote_price * quantity
+        total_purchase += purchase_price * net_quantity
+        total_quote += net_total
 
         row_data = [
             q.get("quote_date", ""),
@@ -80,9 +99,11 @@ def export_quotes_to_excel(quotes, output_path=None):
             cents_to_yuan(purchase_price),
             quantity,
             cents_to_yuan(quote_price),
+            cents_to_yuan(net_total),
             cents_to_yuan(profit),
             q.get("status", "待确认"),
-            cents_to_yuan(q.get("received_amount_cents", 0) or 0),
+            cents_to_yuan(received),
+            cents_to_yuan(max(net_total - received, 0)) if net_total > received else "已结清",
             q.get("sn_list", "") or "",
             q.get("remark", ""),
             q.get("paid", "否"),
@@ -97,17 +118,17 @@ def export_quotes_to_excel(quotes, output_path=None):
                 cell.fill = alt_fill
 
         # 毛利列特殊着色
-        profit_cell = ws.cell(row=row_idx, column=12)
+        profit_cell = ws.cell(row=row_idx, column=13)
         if profit > 0:
             profit_cell.font = profit_font_good
         elif profit < 0:
             profit_cell.font = profit_font_bad
 
         # 状态列着色
-        status_cell = ws.cell(row=row_idx, column=13)
+        status_cell = ws.cell(row=row_idx, column=14)
         status_colors = {
             "待确认": "9E9E9E", "已报价": "1976D2", "已出库": "F57C00",
-            "已收款": "388E3C", "已取消": "BDBDBD",
+            "已收款": "388E3C", "已全退": "7B1FA2", "已取消": "BDBDBD",
         }
         status_val = q.get("status", "待确认")
         if status_val in status_colors:
@@ -118,23 +139,22 @@ def export_quotes_to_excel(quotes, output_path=None):
     summary_row = len(quotes) + 2
     ws.cell(row=summary_row, column=8, value="合计").font = Font(bold=True, size=10)
     ws.cell(row=summary_row, column=9, value=cents_to_yuan(total_purchase)).font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=11, value=cents_to_yuan(total_quote)).font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=12, value=cents_to_yuan(total_quote - total_purchase)).font = Font(bold=True, size=10, color="008000")
+    ws.cell(row=summary_row, column=11, value="").font = Font(bold=True, size=10)
+    ws.cell(row=summary_row, column=12, value=cents_to_yuan(total_quote)).font = Font(bold=True, size=10)
+    ws.cell(row=summary_row, column=13, value=cents_to_yuan(total_quote - total_purchase)).font = Font(bold=True, size=10, color="008000")
 
     for col_idx in range(1, len(headers) + 1):
         ws.cell(row=summary_row, column=col_idx).border = thin_border
 
     # 列宽
-    col_widths = [12, 12, 16, 14, 8, 8, 10, 10, 10, 8, 10, 10, 10, 10, 15, 20, 10]
+    col_widths = [12, 12, 16, 14, 8, 8, 10, 10, 10, 8, 10, 10, 10, 10, 10, 10, 15, 20, 10]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[chr(64 + i)].width = w
 
     # 冻结首行
     ws.freeze_panes = "A2"
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    wb.save(output_path)
-    return output_path
+    return _save_workbook_atomically(wb, output_path)
 
 
 def export_finance_to_excel(
@@ -328,6 +348,4 @@ def export_finance_to_excel(
             for row in profit
         ],
     )
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    wb.save(output_path)
-    return output_path
+    return _save_workbook_atomically(wb, output_path)

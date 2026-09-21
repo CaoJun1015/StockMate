@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPushButton,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -78,9 +79,11 @@ class PaymentDialog(QDialog):
         self.setMinimumWidth(420)
         layout = QFormLayout(self)
         if quote:
-            total = (quote.get("quote_price_cents") or 0) * (
-                quote.get("quote_quantity") or 1
-            )
+            total = quote.get("net_total_cents")
+            if total is None:
+                total = (quote.get("quote_price_cents") or 0) * (
+                    quote.get("quote_quantity") or 1
+                )
             received = quote.get("received_amount_cents") or 0
             layout.addRow(
                 QLabel(
@@ -433,12 +436,22 @@ class AdjustmentDialog(QDialog):
 
 class ReturnDialog(QDialog):
     def __init__(self, title: str, parent=None, *, max_quantity=1, db_path=None,
-                 allow_restock=False, allocations=None):
+                 allow_restock=False, allocations=None, original_quantity=None,
+                 preview_callback=None):
         super().__init__(parent)
         self.setWindowTitle(title)
+        self.preview_callback = preview_callback
         layout = QFormLayout(self)
+        total_allocated = sum(item.get("quantity", 0) for item in allocations or [])
+        already_returned = sum(item.get("returned_quantity", 0) for item in allocations or [])
+        net_returnable = max(total_allocated - already_returned, 0)
+        original_quantity = original_quantity if original_quantity is not None else total_allocated
+        self.return_summary = QLabel(
+            f"原出库 {original_quantity} 台｜累计已退 {already_returned} 台｜净可退 {net_returnable} 台"
+        )
+        layout.addRow(self.return_summary)
         self.quantity_spin = QSpinBox()
-        self.quantity_spin.setRange(1, max(1, max_quantity))
+        self.quantity_spin.setRange(1, max(1, min(max_quantity, net_returnable)))
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setCalendarPopup(True)
         self.restock_check = QCheckBox("退回库存")
@@ -465,28 +478,35 @@ class ReturnDialog(QDialog):
             self.auto_sn_edit.setPlaceholderText("输入退货SN可自动定位原出库批次；未知SN再手工选择")
             self.auto_sn_edit.editingFinished.connect(self._match_return_sns)
             layout.addRow("退货SN自动匹配：", self.auto_sn_edit)
-            self.allocation_table = QTableWidget(len(allocations), 5)
+            self.allocation_table = QTableWidget(len(allocations), 6)
             self.allocation_table.setHorizontalHeaderLabels(
-                ["原批次", "原出库", "已退货", "本次数量", "退货SN"]
+                ["原批次", "原出库", "已退货", "剩余可退", "本次数量", "退货SN"]
             )
             self.allocation_table.horizontalHeader().setStretchLastSection(True)
             for row, allocation in enumerate(allocations):
-                for col, value in enumerate((
-                    f"#{allocation['batch_id']}", allocation["quantity"],
-                    allocation.get("returned_quantity", 0),
-                )):
-                    self.allocation_table.setItem(row, col, QTableWidgetItem(str(value)))
-                spin = QSpinBox()
                 available = max(
                     allocation["quantity"] - allocation.get("returned_quantity", 0), 0
                 )
+                for col, value in enumerate((
+                    f"#{allocation['batch_id']}", allocation["quantity"],
+                    allocation.get("returned_quantity", 0), available,
+                )):
+                    self.allocation_table.setItem(row, col, QTableWidgetItem(str(value)))
+                spin = QSpinBox()
                 spin.setRange(0, available)
                 sn_edit = QLineEdit()
-                sn_edit.setPlaceholderText("可留空；逗号/空格分隔")
-                self.allocation_table.setCellWidget(row, 3, spin)
-                self.allocation_table.setCellWidget(row, 4, sn_edit)
+                sn_edit.setPlaceholderText("回库时：唯一来源可留空，否则必须填写；逗号/空格分隔")
+                self.allocation_table.setCellWidget(row, 4, spin)
+                self.allocation_table.setCellWidget(row, 5, sn_edit)
                 self.allocation_rows.append((allocation, spin, sn_edit))
             layout.addRow("原出库分配：", self.allocation_table)
+        self.preview_label = QLabel("预览不会写入数据库；提交时仍会重新校验。")
+        self.preview_label.setWordWrap(True)
+        preview_button = QPushButton("预览退货影响")
+        preview_button.setAutoDefault(False)
+        preview_button.clicked.connect(self._preview)
+        layout.addRow(preview_button)
+        layout.addRow("提交预览：", self.preview_label)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
@@ -512,6 +532,8 @@ class ReturnDialog(QDialog):
                 if sns and len(sns) != item["quantity"]:
                     QMessageBox.warning(self, "提示", "填写SN后数量必须与对应批次退货数量一致")
                     return
+        if not self._preview():
+            return
         _remember_account(self.account_combo)
         self.accept()
 
@@ -522,6 +544,11 @@ class ReturnDialog(QDialog):
         sns = [value.strip() for value in raw.split(",") if value.strip()]
         if not sns:
             return
+        # A new automatic match replaces every prior automatic choice.  Keeping
+        # an old row here could otherwise create a stale cross-batch return.
+        for _, spin, sn_edit in self.allocation_rows:
+            spin.setValue(0)
+            sn_edit.clear()
         matched: dict[int, list[str]] = {}
         unknown = []
         for sn in sns:
@@ -530,6 +557,8 @@ class ReturnDialog(QDialog):
                     allocation for allocation, _, _ in self.allocation_rows
                     if sn in [value.strip() for value in
                               (allocation.get("sn_list", "") or "").split(",")]
+                    and sn not in [value.strip() for value in
+                                  (allocation.get("returned_sn_list", "") or "").split(",")]
                 ),
                 None,
             )
@@ -547,6 +576,28 @@ class ReturnDialog(QDialog):
                 self, "SN未完全匹配",
                 "以下SN没有完整历史来源，请手工选择原批次：\n" + "、".join(unknown[:10]),
             )
+
+    def _preview(self) -> bool:
+        if self.preview_callback is None:
+            return True
+        try:
+            preview = self.preview_callback(self.get_data())
+        except Exception as exc:
+            self.preview_label.setText(f"无法预览：{exc}")
+            return False
+        batch_text = "；".join(
+            f"批次#{item['batch_id']} 回库 {item['return_quantity']} 台"
+            for item in preview["selected"]
+        ) if self.restock_check.isChecked() else "不回库"
+        self.preview_label.setText(
+            "预览（未写库）："
+            f"{batch_text}；成本冲回 {format_yuan(preview['cost_cents'])}；"
+            f"净应收 {format_yuan(preview['net_receivable_before_cents'])} → "
+            f"{format_yuan(preview['net_receivable_after_cents'])}；"
+            f"现金退款 {format_yuan(preview['cash_refund_cents'])}；"
+            f"保留往来余额 {format_yuan(preview['retained_balance_cents'])}"
+        )
+        return True
 
     def get_data(self):
         return {

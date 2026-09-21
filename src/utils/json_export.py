@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,8 +34,14 @@ def export_all_to_json(output_path=None, db_path=None):
         "money_unit": "cents",
         "data": export_backup_data(db_path),
     }
-    with output_path.open("w", encoding="utf-8") as stream:
-        json.dump(document, stream, ensure_ascii=False, indent=2)
+    temporary = output_path.with_name(f".{output_path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(document, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, output_path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     return str(output_path)
 
 
@@ -70,6 +77,8 @@ def read_json_backup(json_path):
             required -= {"shipment_allocations", "inventory_movements"}
         if version < 6:
             required -= {"sales_return_allocations"}
+        if version < 7:
+            required -= {"payment_refund_allocations"}
     missing = required - document["data"].keys()
     if missing:
         raise ValueError("备份缺少必要数据表：" + "、".join(sorted(missing)))
@@ -93,6 +102,7 @@ def populate_json_database(conn, document):
     map_tables = (
         *tables, "ledger_accounts", "finance_categories", "ledger_entries",
         "shipment_snapshots", "shipment_allocations", "sales_returns", "purchase_returns",
+        "payment_refund_allocations",
     )
     maps: dict[str, dict[int, int]] = {table: {} for table in map_tables}
 
@@ -281,6 +291,17 @@ def populate_json_database(conn, document):
         )
         new_id = import_record(conn, "purchase_returns", row)
         maps["purchase_returns"][record["id"]] = new_id
+
+    for allocation in payload.get("payment_refund_allocations", []):
+        row = dict(allocation)
+        row["payment_id"] = _remap(row.get("payment_id"), maps["payments"])
+        row["sales_return_id"] = _remap(
+            row.get("sales_return_id"), maps["sales_returns"]
+        )
+        row["purchase_return_id"] = _remap(
+            row.get("purchase_return_id"), maps["purchase_returns"]
+        )
+        import_record(conn, "payment_refund_allocations", row)
 
     for allocation in payload.get("sales_return_allocations", []):
         row = dict(allocation)

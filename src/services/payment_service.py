@@ -51,10 +51,7 @@ class PaymentService:
         remaining = amount_cents
         allocations: list[dict[str, int]] = []
         for quote in list_fifo_receivable_quotes(conn, customer_id):
-            pending = (
-                quote["quote_price_cents"] * quote["quote_quantity"]
-                - quote["received_amount_cents"]
-            )
+            pending = quote["net_total_cents"] - quote["received_amount_cents"]
             applied = min(remaining, pending)
             if applied:
                 add_allocation(conn, payment_id, quote["id"], applied)

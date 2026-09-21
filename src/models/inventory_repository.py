@@ -130,6 +130,9 @@ def list_shipment_allocations(
                COALESCE((SELECT SUM(ra.quantity)
                          FROM sales_return_allocations ra
                          WHERE ra.shipment_allocation_id=sa.id),0) AS returned_quantity
+               ,COALESCE((SELECT group_concat(ra.sn_list, ',')
+                          FROM sales_return_allocations ra
+                          WHERE ra.shipment_allocation_id=sa.id), '') AS returned_sn_list
         FROM shipment_allocations sa
         JOIN shipment_snapshots ss ON ss.id=sa.shipment_snapshot_id
         JOIN batches b ON b.id=sa.batch_id
@@ -179,12 +182,14 @@ def _active_shipped_sn_counts(conn) -> dict[str, int]:
     # is a separate allocation and must remain occupied.
     returned_by_allocation: dict[int, set[str]] = {}
     for row in conn.execute(
-        "SELECT shipment_allocation_id,sn_list FROM sales_return_allocations "
+        "SELECT shipment_allocation_id,restock_quantity,sn_list FROM sales_return_allocations "
         "WHERE restock_quantity>0"
     ):
-        returned_by_allocation.setdefault(row["shipment_allocation_id"], set()).update(
-            normalize_sn_list(row["sn_list"])
-        )
+        returned_sns = normalize_sn_list(row["sn_list"])
+        if len(returned_sns) == row["restock_quantity"]:
+            returned_by_allocation.setdefault(row["shipment_allocation_id"], set()).update(
+                returned_sns
+            )
     counts: dict[str, int] = {}
     for row in conn.execute("SELECT id,sn_list FROM shipment_allocations"):
         returned = returned_by_allocation.get(row["id"], set())

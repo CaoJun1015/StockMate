@@ -104,6 +104,10 @@ IMPORT_COLUMNS = {
         "cash_refund_cents", "account_id", "ledger_entry_id", "reason",
         "created_at",
     ),
+    "payment_refund_allocations": (
+        "payment_id", "sales_return_id", "purchase_return_id", "amount_cents",
+        "created_at",
+    ),
 }
 
 
@@ -384,12 +388,16 @@ def list_fifo_receivable_quotes(
     return [
         dict(row)
         for row in conn.execute(
-            "SELECT id, quote_price_cents, quote_quantity, received_amount_cents "
-            "FROM quotes WHERE customer_id=? AND deleted_at IS NULL "
-            "AND status='已出库' "
-            "AND status IN ('待确认','已报价','已出库') "
-            "AND quote_price_cents*quote_quantity>received_amount_cents "
-            "ORDER BY quote_date,id",
+            "SELECT q.id, q.quote_price_cents, q.quote_quantity, q.received_amount_cents, "
+            "q.quote_price_cents*q.quote_quantity-COALESCE(("
+            "SELECT SUM(sr.revenue_cents) FROM sales_returns sr WHERE sr.quote_id=q.id"
+            "),0) AS net_total_cents "
+            "FROM quotes q WHERE q.customer_id=? AND q.deleted_at IS NULL "
+            "AND q.status='已出库' "
+            "AND q.quote_price_cents*q.quote_quantity-COALESCE(("
+            "SELECT SUM(sr.revenue_cents) FROM sales_returns sr WHERE sr.quote_id=q.id"
+            "),0)>q.received_amount_cents "
+            "ORDER BY q.quote_date,q.id",
             (customer_id,),
         ).fetchall()
     ]
@@ -403,6 +411,21 @@ def add_quote_received_amount(
     conn.execute(
         "UPDATE quotes SET received_amount_cents=received_amount_cents+? WHERE id=?",
         (amount_cents, quote_id),
+    )
+
+
+def update_quote_repair_cache(
+    conn: sqlite3.Connection,
+    quote_id: int,
+    *,
+    received_amount_cents: int,
+    paid: str,
+    status: str,
+) -> None:
+    """Repair-only cache update; immutable financial and inventory evidence remains intact."""
+    conn.execute(
+        "UPDATE quotes SET received_amount_cents=?, paid=?, status=? WHERE id=?",
+        (received_amount_cents, paid, status, quote_id),
     )
 
 
@@ -636,19 +659,32 @@ def add_allocation(
 def sync_quote_payment_state(conn: sqlite3.Connection, quote_id: int) -> None:
     row = conn.execute(
         "SELECT quote_price_cents, quote_quantity, received_amount_cents, "
-        "status, sn_list FROM quotes WHERE id=?",
+        "status, sn_list, "
+        "COALESCE((SELECT SUM(sr.revenue_cents) FROM sales_returns sr "
+        "WHERE sr.quote_id=quotes.id),0) AS returned_revenue_cents, "
+        "COALESCE((SELECT SUM(sr.quantity) FROM sales_returns sr "
+        "WHERE sr.quote_id=quotes.id),0) AS returned_quantity, "
+        "COALESCE((SELECT ss.quantity FROM shipment_snapshots ss "
+        "WHERE ss.quote_id=quotes.id),0) AS shipped_quantity "
+        "FROM quotes WHERE id=?",
         (quote_id,),
     ).fetchone()
     if not row:
         return
-    total = row["quote_price_cents"] * row["quote_quantity"]
+    total = max(
+        row["quote_price_cents"] * row["quote_quantity"]
+        - row["returned_revenue_cents"],
+        0,
+    )
     received = row["received_amount_cents"]
-    paid = "是" if received >= total else "否"
+    paid = "是" if total > 0 and received >= total else "否"
     status = row["status"]
-    if received >= total:
+    if row["shipped_quantity"] and row["returned_quantity"] >= row["shipped_quantity"]:
+        status = "已全退"
+    elif total > 0 and received >= total:
         status = "已收款"
-    elif status == "已收款":
-        status = "已出库" if row["sn_list"] else "待确认"
+    elif status in ("已收款", "已全退"):
+        status = "已出库" if row["shipped_quantity"] else "待确认"
     conn.execute(
         "UPDATE quotes SET paid=?, status=? WHERE id=?",
         (paid, status, quote_id),
