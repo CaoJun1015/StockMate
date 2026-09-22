@@ -171,10 +171,14 @@ class RecordTab(QWidget):
         )
         self.record_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.record_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.record_table.itemSelectionChanged.connect(self._update_action_states)
         self.record_table.horizontalHeader().setStretchLastSection(True)
         self.record_table.setColumnHidden(0, True)
         layout.addWidget(self.record_table)
 
+        self.selection_label = QLabel("当前订单：未选择")
+        self.selection_label.setObjectName("summaryLabel")
+        layout.addWidget(self.selection_label)
         self.stats_label = QLabel()
         self.stats_label.setObjectName("summaryLabel")
         layout.addWidget(self.stats_label)
@@ -333,6 +337,61 @@ class RecordTab(QWidget):
             f"共 {len(quotes)} 条记录  |  总购入: {format_yuan(tax_total_cost)}  |  "
             f"总报价: {format_yuan(tax_total_sale)}  |  毛利: {format_yuan(profit)}"
         )
+        self._update_action_states()
+
+    def _update_action_states(self):
+        """Keep visible actions aligned with the selected order state."""
+        row = self.record_table.currentRow()
+        status = ""
+        quote_id = ""
+        customer = ""
+        series = ""
+        if row >= 0:
+            id_item = self.record_table.item(row, 0)
+            status_item = self.record_table.item(row, 12)
+            quote_id = id_item.text() if id_item else ""
+            status = status_item.text() if status_item else ""
+            customer_item = self.record_table.item(row, 2)
+            series_item = self.record_table.item(row, 3)
+            customer = customer_item.text() if customer_item else ""
+            series = series_item.text() if series_item else ""
+
+        if quote_id:
+            selected_quote = next(
+                (quote for quote in self._all_quotes if str(quote.get("id")) == quote_id),
+                None,
+            )
+            if selected_quote:
+                original_total = (
+                    selected_quote.get("quote_price_cents", 0) or 0
+                ) * (selected_quote.get("quote_quantity", 1) or 1)
+                returned_total = selected_quote.get("returned_revenue_cents", 0) or 0
+                net_total = selected_quote.get("net_total_cents", original_total) or 0
+                received = selected_quote.get("received_amount_cents", 0) or 0
+                self.selection_label.setText(
+                    f"当前订单：#{quote_id} | {customer or '未关联客户'} | "
+                    f"{series or '未选择'} | {status or '未选择'} | "
+                    f"原销售额 {format_yuan(original_total)} | "
+                    f"退货金额 {format_yuan(returned_total)} | "
+                    f"退货后净应收 {format_yuan(net_total)} | "
+                    f"已收金额 {format_yuan(received)}"
+                )
+            else:
+                self.selection_label.setText(
+                    f"当前订单：#{quote_id} | {customer or '未关联客户'} | "
+                    f"{series or '未选择'} | {status or '未选择'}"
+                )
+        else:
+            self.selection_label.setText("当前订单：未选择")
+        self.confirm_record_btn.setEnabled(status == "待确认")
+        self.ship_record_btn.setEnabled(status == "已报价")
+        self.receive_btn.setEnabled(status == "已出库")
+        self.return_btn.setEnabled(status in ("已出库", "已收款"))
+        self.shipment_detail_btn.setEnabled(status in ("已出库", "已收款", "已全退"))
+        self.sn_lifecycle_btn.setEnabled(status in ("已出库", "已收款", "已全退"))
+        self.cancel_record_btn.setEnabled(status in ("待确认", "已报价"))
+        self.edit_record_btn.setEnabled(status in ("待确认", "已报价"))
+        self.del_record_btn.setEnabled(status == "待确认")
 
     def on_edit_quote(self):
         row = self.record_table.currentRow()

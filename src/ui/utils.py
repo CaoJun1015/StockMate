@@ -1,12 +1,16 @@
 """工具函数"""
-import os
 import sys
 import re
 import traceback
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QTableWidgetItem
+
+from src.models.connection import get_data_dir
+from src.models.schema import SCHEMA_VERSION
+from src.version import APP_VERSION
 
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -71,22 +75,39 @@ def _validate_date(date_str):
         return False, f"无效日期: {date_str}"
 
 
-def _global_excepthook(exc_type, exc_value, exc_tb):
-    """全局异常钩子：将未捕获异常写入 crash.log 并显示错误对话框"""
-    from PyQt6.QtWidgets import QMessageBox
+def _write_crash_log(exc_type, exc_value, exc_tb) -> Path | None:
+    """Write a bounded crash log in the user data directory."""
     tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
     crash_msg = "".join(tb_lines)
     try:
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "data")
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, "crash.log")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n{'='*60}\n")
-            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] CRASH\n")
-            f.write(crash_msg)
+        log_path = get_data_dir() / "logs" / "crash.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if log_path.exists() and log_path.stat().st_size > 2 * 1024 * 1024:
+            rotated = log_path.with_name("crash.log.1")
+            if rotated.exists():
+                rotated.unlink()
+            log_path.replace(rotated)
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(f"\n{'=' * 60}\n")
+            stream.write(f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            stream.write(f"应用版本：{APP_VERSION}\n")
+            stream.write(f"schema 版本：{SCHEMA_VERSION}\n")
+            stream.write(f"异常类型：{exc_type.__name__}\n")
+            stream.write(f"异常消息：{exc_value}\n")
+            stream.write("完整堆栈：\n")
+            stream.write(crash_msg)
+        return log_path
     except Exception:
         print(crash_msg, file=sys.stderr)
+        return None
+
+
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    """Write an uncaught exception to user data and show an error dialog."""
+    from PyQt6.QtWidgets import QMessageBox
+    log_path = _write_crash_log(exc_type, exc_value, exc_tb)
+    log_hint = str(log_path) if log_path else "日志文件"
     QMessageBox.critical(
         None, "程序异常",
-        f"程序发生未处理的异常:\n\n{exc_value}\n\n详细信息已写入 crash.log"
+        f"程序发生未处理的异常：\n\n{exc_value}\n\n详细信息已写入 {log_hint}"
     )
