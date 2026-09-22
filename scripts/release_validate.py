@@ -130,6 +130,7 @@ def main() -> int:
         "requirements_lock_sha256": sha256(ROOT / "requirements-release.lock"),
         "validation": {},
     }
+    stage = "tests"
     try:
         run([sys.executable, "-m", "pytest", "-q"])
         report["validation"]["tests"] = "passed"
@@ -142,6 +143,7 @@ def main() -> int:
             marker = f"StockMate external DLL guard {uuid4().hex}".encode()
             (external / "icuuc.dll").write_bytes(marker)
             build_env = {**os.environ, "PATH": str(external) + os.pathsep + os.environ.get("PATH", "")}
+            stage = "build"
             run([
                 sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "build.spec",
                 "--distpath", str(dist_path), "--workpath", str(work / "work"),
@@ -150,9 +152,12 @@ def main() -> int:
             if contains_bytes(executable, marker):
                 raise RuntimeError("外部 DLL 工具目录的冲突文件混入了候选产物")
             report["validation"]["build"] = "passed"
+            stage = "dll-check"
             report["validation"]["dll_source"] = "passed (external icuuc.dll marker absent)"
+            stage = "packaged-startup"
             run([sys.executable, "scripts/validate_packaged_startup.py", str(executable)], env=build_env)
             report["validation"]["packaged_startup"] = "passed"
+            stage = "portable-output"
             write_portable_metadata(output, executable, report)
             shutil.rmtree(dist_path, ignore_errors=True)
             allowed = {
@@ -165,6 +170,7 @@ def main() -> int:
             if unexpected:
                 raise RuntimeError(f"便携目录包含禁止文件：{unexpected}")
     except Exception as exc:
+        report["validation"]["failed_stage"] = stage
         report["validation"]["failure"] = str(exc)
         report_path(output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"发布验证失败，报告：{report_path(output)}", file=sys.stderr)
