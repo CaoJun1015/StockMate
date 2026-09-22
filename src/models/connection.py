@@ -21,7 +21,13 @@ def get_app_path() -> Path:
 
 def get_data_dir() -> Path:
     override = os.environ.get("DIAOHUO_DATA_DIR")
-    return Path(override).expanduser().resolve() if override else get_app_path() / "data"
+    if override:
+        return Path(override).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return (base / "StockMate").resolve()
+    return get_app_path() / "data"
 
 
 def get_database_path() -> Path:

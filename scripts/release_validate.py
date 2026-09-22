@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -65,6 +66,46 @@ def report_path(output: Path) -> Path:
     return output / "release-validation.json"
 
 
+def write_portable_metadata(output: Path, executable: Path, report: dict) -> None:
+    """Write only portable release files beside the candidate executable."""
+    artifact = output / executable.name
+    shutil.copy2(executable, artifact)
+    report["artifact"] = {
+        "path": str(artifact),
+        "name": artifact.name,
+        "size_bytes": artifact.stat().st_size,
+        "sha256": sha256(artifact),
+    }
+    (output / "README-使用说明.txt").write_text(
+        "货管家 · StockMate\n\n"
+        "这是便携版程序。首次启动会在用户数据目录创建数据库。\n"
+        "请不要把客户数据、数据库备份或 crash.log 放入程序发布目录。\n\n"
+        f"应用版本：{APP_VERSION}\n"
+        f"数据库 schema：{SCHEMA_VERSION}\n",
+        encoding="utf-8",
+    )
+    (output / "version.json").write_text(
+        json.dumps(
+            {
+                "app_version": APP_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "source_commit": report["source_commit"],
+                "python": report["python"],
+                "build_time": report["build_time"],
+                "candidate_status": report["candidate_status"],
+                "artifact": artifact.name,
+                "sha256": report["artifact"]["sha256"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (output / "SHA256SUMS.txt").write_text(
+        f"{report['artifact']['sha256']}  {artifact.name}\n", encoding="utf-8"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="candidate directory (must not exist)")
@@ -83,6 +124,7 @@ def main() -> int:
         "workspace_status": status.splitlines(),
         "app_version": APP_VERSION,
         "schema_version": SCHEMA_VERSION,
+        "build_time": datetime.now().isoformat(timespec="seconds"),
         "python": sys.version,
         "dependencies": {package: version(package) for package in LOCKED_PACKAGES},
         "requirements_lock_sha256": sha256(ROOT / "requirements-release.lock"),
@@ -111,12 +153,17 @@ def main() -> int:
             report["validation"]["dll_source"] = "passed (external icuuc.dll marker absent)"
             run([sys.executable, "scripts/validate_packaged_startup.py", str(executable)], env=build_env)
             report["validation"]["packaged_startup"] = "passed"
-            report["artifact"] = {
-                "path": str(executable),
-                "name": executable.name,
-                "size_bytes": executable.stat().st_size,
-                "sha256": sha256(executable),
+            write_portable_metadata(output, executable, report)
+            shutil.rmtree(dist_path, ignore_errors=True)
+            allowed = {
+                executable.name,
+                "README-使用说明.txt",
+                "SHA256SUMS.txt",
+                "version.json",
             }
+            unexpected = [path.name for path in output.iterdir() if path.name not in allowed]
+            if unexpected:
+                raise RuntimeError(f"便携目录包含禁止文件：{unexpected}")
     except Exception as exc:
         report["validation"]["failure"] = str(exc)
         report_path(output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

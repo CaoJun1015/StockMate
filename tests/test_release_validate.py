@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.release_validate import contains_bytes, find_executable
+from scripts.release_validate import (
+    contains_bytes,
+    find_executable,
+    write_portable_metadata,
+)
 
 
 def test_release_validator_uses_the_built_exe_name_and_rejects_ambiguity(tmp_path):
@@ -15,3 +19,27 @@ def test_release_validator_uses_the_built_exe_name_and_rejects_ambiguity(tmp_pat
     (tmp_path / "other.exe").write_bytes(b"other")
     with pytest.raises(RuntimeError, match="恰好有一个"):
         find_executable(tmp_path)
+
+
+def test_portable_metadata_matches_the_copied_executable(tmp_path):
+    executable = tmp_path / "build" / "StockMate v1.17.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"portable-exe")
+    report = {
+        "source_commit": "abc123",
+        "python": "Python 3.11",
+        "build_time": "2026-09-22T10:00:00",
+        "candidate_status": "local-validation-only",
+    }
+
+    write_portable_metadata(tmp_path, executable, report)
+
+    artifact = tmp_path / executable.name
+    assert artifact.read_bytes() == executable.read_bytes()
+    assert report["artifact"]["sha256"]
+    assert f"{report['artifact']['sha256']}  {artifact.name}" in (
+        tmp_path / "SHA256SUMS.txt"
+    ).read_text(encoding="utf-8")
+    metadata = __import__("json").loads((tmp_path / "version.json").read_text(encoding="utf-8"))
+    assert metadata["candidate_status"] == "local-validation-only"
+    assert metadata["sha256"] == report["artifact"]["sha256"]
