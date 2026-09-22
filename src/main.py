@@ -5,6 +5,7 @@
 import sys
 import os
 import re
+import json
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -48,11 +49,14 @@ from src.models.connection import (
     DatabaseRestoreError,
     create_backup,
     get_backup_dir,
+    get_app_path,
+    get_data_dir,
     get_database_path,
 )
+from src.models.schema import SCHEMA_VERSION
 from src.services.reconciliation_service import ReconciliationService
 from src.services.historical_repair_service import HistoricalRepairService
-from src.version import APP_DISPLAY_NAME
+from src.version import APP_DISPLAY_NAME, APP_VERSION
 from src.utils.image_gen import generate_quote_image, generate_single_quote_card, WATERMARK_TEXT
 from src.utils.excel_export import export_quotes_to_excel
 from src.utils.follow_up import get_stale_quotes, format_reminder_text
@@ -80,7 +84,9 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(12, 12, 12, 12)
 
-        # 搜索 + 工具栏
+        # 搜索 + 工具栏。保留全部入口，但分成两行避免窄窗口挤压业务页。
+        toolbar = QVBoxLayout()
+        toolbar.setSpacing(6)
         top_bar = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("globalSearch")
@@ -119,7 +125,9 @@ class MainWindow(QMainWindow):
         self.shipment_flow_btn.setObjectName("ghostBtn")
         self.shipment_flow_btn.clicked.connect(self.on_shipment_flow)
 
-        top_bar.addWidget(QLabel("🔍"))
+        search_label = QLabel("🔍")
+        search_label.setToolTip("搜索机型、CPU 或关键字")
+        top_bar.addWidget(search_label)
         top_bar.addWidget(self.search_edit)
         top_bar.addStretch()
 
@@ -129,19 +137,36 @@ class MainWindow(QMainWindow):
             sep.setObjectName("toolbarSeparator")
             layout.addWidget(sep)
 
-        top_bar.addWidget(self.follow_up_btn)
-        top_bar.addWidget(self.report_btn)
-        top_bar.addWidget(self.diagnose_btn)
-        top_bar.addWidget(self.shipment_flow_btn)
         _add_sep(top_bar)
-        top_bar.addWidget(self.broadcast_btn)
-        top_bar.addWidget(self.export_btn)
-        top_bar.addWidget(self.statement_btn)
-        top_bar.addWidget(self.export_json_btn)
-        top_bar.addWidget(self.import_json_btn)
-        _add_sep(top_bar)
-        top_bar.addWidget(self.log_btn)
-        main_layout.addLayout(top_bar)
+        for button, tip in (
+            (self.follow_up_btn, "查看超期未成交或未收款订单"),
+            (self.report_btn, "查看月度销售、成本和毛利"),
+            (self.diagnose_btn, "按症状生成远程诊断步骤"),
+            (self.shipment_flow_btn, "连续扫描 SN 并生成出库确认单"),
+        ):
+            button.setToolTip(tip)
+            button.setStatusTip(tip)
+            top_bar.addWidget(button)
+        toolbar.addLayout(top_bar)
+
+        data_bar = QHBoxLayout()
+        for index, (button, tip) in enumerate((
+            (self.broadcast_btn, "批量生成报价图片"),
+            (self.export_btn, "导出报价记录 Excel"),
+            (self.statement_btn, "生成客户对账单"),
+            (self.export_json_btn, "导出完整 JSON 备份"),
+            (self.import_json_btn, "完整替换恢复 JSON 备份"),
+            (self.log_btn, "查看操作日志"),
+        )):
+            button.setToolTip(tip)
+            button.setStatusTip(tip)
+            data_bar.addWidget(button)
+            if index in (1, 4):
+                _add_sep(data_bar)
+        data_bar.insertSpacing(0, 4)
+        data_bar.addStretch()
+        toolbar.addLayout(data_bar)
+        main_layout.addLayout(toolbar)
 
         # Tab 页面
         self.tabs = QTabWidget()
@@ -193,6 +218,7 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel(f"就绪 | {self.backup_status}")
         self.status_bar.addWidget(self.status_label)
         self._build_data_safety_menu()
+        self._build_about_menu()
 
         # 加载数据
         self.product_tab.refresh_product_list()
@@ -232,6 +258,40 @@ class MainWindow(QMainWindow):
         restore_action = QAction("SQLite 备份恢复…", self)
         restore_action.triggered.connect(self.on_restore_database)
         data_menu.addAction(restore_action)
+
+    def _build_about_menu(self):
+        help_menu = self.menuBar().addMenu("帮助")
+        about_action = QAction("关于 StockMate", self)
+        about_action.triggered.connect(self.on_about)
+        help_menu.addAction(about_action)
+
+    def on_about(self):
+        metadata = {}
+        metadata_path = get_app_path() / "version.json"
+        try:
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            metadata = {}
+        if not getattr(sys, "frozen", False):
+            build_status = "开发版"
+        elif metadata.get("candidate_status") == "local-validation-only":
+            build_status = "本地验证版"
+        elif metadata:
+            build_status = "候选版"
+        else:
+            build_status = "未记录"
+        source_commit = metadata.get("source_commit", "未记录")
+        QMessageBox.information(
+            self,
+            "关于 StockMate",
+            f"应用名称：{APP_DISPLAY_NAME}\n"
+            f"应用版本：{APP_VERSION}\n"
+            f"schema 版本：{SCHEMA_VERSION}\n"
+            f"数据目录：{get_data_dir()}\n"
+            f"当前构建状态：{build_status}\n"
+            f"构建提交：{source_commit}",
+        )
 
     def on_reconcile_database(self):
         try:
