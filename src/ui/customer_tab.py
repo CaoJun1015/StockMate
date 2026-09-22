@@ -11,7 +11,10 @@ from src.models.queries import (
     list_customers,
 )
 from PyQt6.QtCore import QTimer
-from src.models.finance_queries import get_customer_actual_performance
+from src.models.finance_queries import (
+    get_customer_actual_performance,
+    list_counterparty_balances,
+)
 from src.services.exceptions import ServiceError
 from src.services.party_service import CustomerService
 from src.ui.dialogs import CustomerDialog
@@ -127,11 +130,17 @@ class CustomerTab(QWidget):
         
         performance = get_customer_actual_performance(cid)
         quotes = performance["history"]
+        balance = next(
+            (item["balance_cents"] for item in list_counterparty_balances("customer")
+             if item["id"] == cid),
+            0,
+        )
         
         self.customer_stats_label.setText(
             f"客户: {customer_name} | 实际出库: {performance['total_quotes']}单 | "
             f"净销售: {format_yuan(performance['total_amount_cents'])} | "
-            f"实际毛利: {format_yuan(performance['total_profit_cents'])}"
+            f"实际毛利: {format_yuan(performance['total_profit_cents'])} | "
+            f"客户余额: {format_yuan(balance)}"
             + (" | 账本启用前历史不完整，未计入实际口径" if not performance["history_complete"] else "")
         )
         
