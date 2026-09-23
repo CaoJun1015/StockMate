@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -11,6 +12,22 @@ from contextlib import closing
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.models.schema import SCHEMA_VERSION
+
+
+def transient_mei_dirs():
+    root = Path(tempfile.gettempdir()).resolve()
+    return {
+        path.resolve()
+        for path in root.glob("_MEI*")
+        if path.is_dir() and path.parent == root
+    }
+
+
+def cleanup_created_mei(existing):
+    root = Path(tempfile.gettempdir()).resolve()
+    for path in transient_mei_dirs() - existing:
+        if path.parent == root:
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def process_ids_for_executable(exe):
@@ -36,7 +53,18 @@ def stop_created_processes(pids):
     script = (
         "$ids = $env:STOCKMATE_VALIDATION_PIDS -split ',' | "
         "ForEach-Object { [int]$_ }; "
-        "Stop-Process -Id $ids -Force -ErrorAction Stop"
+        "$processes = Get-Process -Id $ids -ErrorAction SilentlyContinue; "
+        "$processes | ForEach-Object { "
+        "  if ($_.MainWindowHandle -ne 0) { [void]$_.CloseMainWindow() } "
+        "}; "
+        "$deadline = (Get-Date).AddSeconds(5); "
+        "do { "
+        "  Start-Sleep -Milliseconds 250; "
+        "  $remaining = @(Get-Process -Id $ids -ErrorAction SilentlyContinue); "
+        "} while ($remaining.Count -gt 0 -and (Get-Date) -lt $deadline); "
+        "if ($remaining.Count -gt 0) { "
+        "  Stop-Process -Id ($remaining | ForEach-Object Id) -Force -ErrorAction Stop "
+        "}"
     )
     subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -49,13 +77,16 @@ def stop_created_processes(pids):
 def main():
     exe = Path(sys.argv[1]).resolve(strict=True)
     existing_pids = process_ids_for_executable(exe)
+    existing_mei = transient_mei_dirs()
     with tempfile.TemporaryDirectory(prefix="diaohuo-startup-") as folder:
         startup = subprocess.STARTUPINFO()
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup.wShowWindow = 0
         process = subprocess.Popen(
             [str(exe)], startupinfo=startup,
-            env={**os.environ, "DIAOHUO_DATA_DIR": folder, "QT_QPA_PLATFORM": "offscreen"},
+            # Use the native Windows platform so CloseMainWindow can request a
+            # graceful Qt shutdown and let the PyInstaller bootloader clean _MEI.
+            env={**os.environ, "DIAOHUO_DATA_DIR": folder, "QT_QPA_PLATFORM": "windows"},
         )
         print(f"Isolated test PID: {process.pid}", flush=True)
         try:
@@ -82,6 +113,7 @@ def main():
         finally:
             stop_created_processes(process_ids_for_executable(exe) - existing_pids)
             process.wait(timeout=10)
+            cleanup_created_mei(existing_mei)
 
 
 if __name__ == "__main__":
