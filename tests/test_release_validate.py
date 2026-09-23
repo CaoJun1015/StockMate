@@ -9,6 +9,7 @@ from scripts.release_validate import (
     find_executable,
     write_portable_metadata,
 )
+from scripts import validate_packaged_startup
 
 
 def test_release_validator_uses_the_built_exe_name_and_rejects_ambiguity(tmp_path):
@@ -43,3 +44,16 @@ def test_portable_metadata_matches_the_copied_executable(tmp_path):
     metadata = __import__("json").loads((tmp_path / "version.json").read_text(encoding="utf-8"))
     assert metadata["candidate_status"] == "local-validation-only"
     assert metadata["sha256"] == report["artifact"]["sha256"]
+
+
+def test_packaged_startup_cleanup_removes_only_new_mei_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr(validate_packaged_startup.tempfile, "gettempdir", lambda: str(tmp_path))
+    existing = tmp_path / "_MEI_existing"
+    created = tmp_path / "_MEI_created"
+    existing.mkdir()
+    created.mkdir()
+
+    validate_packaged_startup.cleanup_created_mei({existing.resolve()})
+
+    assert existing.exists()
+    assert not created.exists()
