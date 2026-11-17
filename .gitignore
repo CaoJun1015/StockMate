@@ -21,6 +21,11 @@ Thumbs.db
 *.log.*
 
 # Database
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.conversion.json
 data/*.db
 data/*.db-*
 data/**/*.db
@@ -48,3 +53,5 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+test_output/
+release-candidates/

@@ -141,16 +141,14 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.price_diff_btn)
         top_bar.addWidget(self.quote_assist_btn)
         top_bar.addWidget(self.shipment_flow_btn)
-        _add_sep(top_bar)
-        top_bar.addWidget(self.import_btn)
-        top_bar.addWidget(self.broadcast_btn)
-        top_bar.addWidget(self.export_btn)
-        top_bar.addWidget(self.statement_btn)
-        top_bar.addWidget(self.export_json_btn)
-        top_bar.addWidget(self.import_json_btn)
-        _add_sep(top_bar)
-        top_bar.addWidget(self.log_btn)
         main_layout.addLayout(top_bar)
+        file_bar = QHBoxLayout()
+        for button in (self.import_btn, self.broadcast_btn, self.export_btn,
+                       self.statement_btn, self.export_json_btn, self.import_json_btn,
+                       self.log_btn):
+            file_bar.addWidget(button)
+        file_bar.addStretch()
+        main_layout.addLayout(file_bar)
 
         # Tab 页面
         self.tabs = QTabWidget()

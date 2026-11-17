@@ -114,6 +114,9 @@ class PaymentService:
         with transaction(self.db_path) as conn:
             LedgerPostingService.require_enabled(conn, pay_date)
             if account_id is None:
+                from src.services.simple_finance_service import default_flow_account
+                account_id = default_flow_account(conn)
+            if account_id is None:
                 raise ValidationError("请选择收款资金账户")
             account = LedgerPostingService.require_cash_account(conn, account_id)
             if not get_active_entity(conn, "customers", customer_id):
@@ -190,6 +193,9 @@ class PaymentService:
             raise ValidationError("付款金额必须大于 0")
         with transaction(self.db_path) as conn:
             LedgerPostingService.require_enabled(conn, pay_date)
+            if account_id is None:
+                from src.services.simple_finance_service import default_flow_account
+                account_id = default_flow_account(conn)
             if account_id is None:
                 raise ValidationError("请选择付款资金账户")
             account = LedgerPostingService.require_cash_account(conn, account_id)

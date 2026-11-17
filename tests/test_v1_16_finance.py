@@ -431,7 +431,7 @@ def test_audit_filters_and_replacement_status(tmp_path):
     assert rows[0]["source_id"] == str(replacement)
 
 
-def test_finance_tab_has_five_pages(qapp, tmp_path):
+def test_finance_tab_has_four_business_pages(qapp, tmp_path):
     from src.ui.finance_tab import FinanceTab
 
     path = tmp_path / "ui.db"
@@ -439,7 +439,7 @@ def test_finance_tab_has_five_pages(qapp, tmp_path):
     _enabled(path)
     tab = FinanceTab(db_path=path)
     tab.refresh()
-    assert tab.section_tabs.count() == 5
+    assert tab.section_tabs.count() == 4
     assert [
-        tab.section_tabs.tabText(index) for index in range(5)
-    ] == ["经营总览", "日常收支", "应收应付", "利润分析", "流水审计"]
+        tab.section_tabs.tabText(index) for index in range(4)
+    ] == ["应收应付", "日常收支", "利润分析", "流水审计"]

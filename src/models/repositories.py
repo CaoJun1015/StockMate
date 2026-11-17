@@ -470,8 +470,8 @@ def insert_customer(
     default_tax_rate: float | None = None,
 ) -> int:
     cursor = conn.execute(
-        "INSERT INTO customers(name,wechat,qq,phone,note,default_tax_rate) "
-        "VALUES (?,?,?,?,?,?)",
+        "INSERT INTO customers(name,wechat,qq,phone,note,default_tax_rate,balance_cents) "
+        "VALUES (?,?,?,?,?,?,0)",
         (name, wechat, qq, phone, note, default_tax_rate),
     )
     return int(cursor.lastrowid)
@@ -505,7 +505,7 @@ def insert_supplier(
     note: str = "",
 ) -> int:
     cursor = conn.execute(
-        "INSERT INTO suppliers(name,wechat,qq,phone,note) VALUES (?,?,?,?,?)",
+        "INSERT INTO suppliers(name,wechat,qq,phone,note,balance_cents) VALUES (?,?,?,?,?,0)",
         (name, wechat, qq, phone, note),
     )
     return int(cursor.lastrowid)
@@ -653,10 +653,13 @@ def sync_quote_payment_state(conn: sqlite3.Connection, quote_id: int) -> None:
     received = row["received_amount_cents"]
     paid = "是" if received >= total else "否"
     status = row["status"]
-    if received >= total:
+    shipped = conn.execute("SELECT 1 FROM shipment_snapshots WHERE quote_id=?", (quote_id,)).fetchone()
+    if status == "已取消":
+        pass
+    elif received >= total and (status in ("已出库", "已收款") or shipped):
         status = "已收款"
     elif status == "已收款":
-        status = "已出库" if row["sn_list"] else "待确认"
+        status = "已出库" if shipped or row["sn_list"] else "待确认"
     conn.execute(
         "UPDATE quotes SET paid=?, status=? WHERE id=?",
         (paid, status, quote_id),

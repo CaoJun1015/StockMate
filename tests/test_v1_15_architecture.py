@@ -418,11 +418,14 @@ def test_reporting_and_export_tools_read_cents_model(tmp_path):
 
 def test_finance_tab_exposes_audit_subpage(qapp, tmp_path):
     from src.ui.finance_tab import FinanceTab
+    from PyQt6.QtCore import QDate
 
     path = tmp_path / "ui.db"
     _seed_flow(path)
     tab = FinanceTab(db_path=path)
+    tab.audit_from.setDate(QDate(2000, 1, 1))
+    tab.audit_to.setDate(QDate(2099, 1, 1))
     tab.refresh()
-    assert tab.section_tabs.count() == 5
-    assert tab.section_tabs.tabText(4) == "流水审计"
+    assert tab.section_tabs.count() == 4
+    assert tab.section_tabs.tabText(3) == "流水审计"
     assert tab.audit_table.rowCount() >= 2

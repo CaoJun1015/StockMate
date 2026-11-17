@@ -230,10 +230,17 @@ def list_operating_entries(
     status: str | None = None,
     source_id: str | int | None = None,
     keyword: str | None = None,
-    limit: int = 1000,
+    limit: int | None = 1000,
+    business_cash_only: bool = False,
+    exclude_opening: bool = False,
     db_path=None,
 ) -> list[dict]:
     conditions = ["1=1"]
+    if business_cash_only:
+        conditions.append("e.event_type IN ('customer_receipt','supplier_payment','customer_receipt_reversal','supplier_payment_reversal','sales_return','purchase_return')")
+        conditions.append("EXISTS(SELECT 1 FROM ledger_lines cash_line JOIN ledger_accounts cash_account ON cash_account.id=cash_line.account_id WHERE cash_line.entry_id=e.id AND cash_account.is_system=0)")
+    if exclude_opening:
+        conditions.append("e.source_type!='simple_opening'")
     params: list[object] = []
     if date_from:
         conditions.append("e.entry_date>=?")
@@ -257,7 +264,7 @@ def list_operating_entries(
         )
         token = f"%{keyword}%"
         params.extend([token, token, token, token])
-    params.append(limit)
+    params.append(-1 if limit is None else limit)
     conn = connect(db_path, read_only=True)
     try:
         return [

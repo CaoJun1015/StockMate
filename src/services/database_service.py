@@ -19,6 +19,8 @@ def reconcile_database(db_path=None) -> ReconciliationReport:
 def initialize_database(db_path=None) -> tuple[bool, str]:
     path = Path(db_path or get_database_path())
     migration_backup = migrate_database(path)
+    from src.services.simple_finance_service import ensure_simple_finance
+    ensure_simple_finance(path)
     report = reconcile_database(path)
     reconciliation_note = (
         "自动对账通过"

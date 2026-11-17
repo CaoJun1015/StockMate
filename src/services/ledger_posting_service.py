@@ -41,7 +41,9 @@ class LedgerPostingService:
         if not enabled_at:
             raise ValidationError("请先在账款管理中完成财务启用")
         normalized = LedgerPostingService.validate_date(entry_date)
-        if normalized < enabled_at:
+        from src.models.simple_finance_repository import is_simple_ready
+        simple_ready = is_simple_ready(conn)
+        if normalized < enabled_at and not simple_ready:
             raise ValidationError(f"业务日期不能早于财务启用日 {enabled_at}")
         return settings
 

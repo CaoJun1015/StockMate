@@ -4,6 +4,7 @@
 调货助手 PyInstaller 打包配置
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -12,6 +13,19 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.version import APP_VERSION
+
+# Keep unrelated tools (Poppler, libheif, etc.) out of DLL resolution.
+# Qt uses Windows ICU exports; Poppler's same-named icuuc.dll has a
+# different ABI and causes QtWidgets import to fail before app startup.
+from PyQt6.QtCore import QLibraryInfo
+
+windows_root = Path(os.environ.get('SystemRoot', r'C:\Windows')).resolve()
+os.environ['PATH'] = os.pathsep.join([
+    QLibraryInfo.path(QLibraryInfo.LibraryPath.BinariesPath),
+    str(Path(sys.base_prefix)),
+    str(windows_root / 'System32'),
+    str(windows_root),
+])
 
 block_cipher = None
 
@@ -51,16 +65,22 @@ a = Analysis(
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+# Fail the build if dependency collection ever escapes this installation.
+allowed_roots = [Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(), windows_root]
+unexpected = [(name, source) for name, source, _ in a.binaries
+              if not any(Path(source).resolve().is_relative_to(root) for root in allowed_roots)]
+if unexpected:
+    raise RuntimeError(f'Unexpected external DLL dependencies: {unexpected}')
+
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
-    name=f'调货助手 v{APP_VERSION}',
+    name=f'调货助手 v{APP_VERSION} 简洁版',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

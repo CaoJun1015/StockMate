@@ -7,10 +7,12 @@
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&logo=windows&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.16-brightgreen?style=flat-square)
+![Version](https://img.shields.io/badge/version-v1.16.1-brightgreen?style=flat-square)
 ![GitHub](https://img.shields.io/badge/GitHub-CaoJun1015-181717?style=flat-square&logo=github&logoColor=white)
 
 从上游价格表解析、报价、出库、收款到对账，一站式管理你的调货生意。
+
+本分支为 **v1.16.1 简洁版**：财务页面保留应收应付、日常收支、利润分析和流水审计，自动准备记账所需的内部账户，无需手动启用或选择资金账户。包含历史收付款状态修复和 Windows Qt DLL 打包修复。构建与验证步骤见 [v1.16.1 简洁版说明](docs/v1.16.1-simple-finance-qt.md)。
 
 [功能介绍](#功能) · [快速开始](#快速开始) · [智能技能](#智能技能skills) · [项目结构](#项目结构) · [更新日志](#版本历史)
 
@@ -28,7 +30,7 @@
 | 🚚 出库管理 | 选择批次扣减库存，录入 SN，支持条码枪扫描输入 |
 | 👤 客户管理 | 客户联系方式 + 购买历史 + 欠款跟踪 |
 | 🏭 上游管理 | 供应商联系方式 + 采购历史 |
-| 💳 经营记账 | 资金账户、日常收支、应收应付、预收预付、退货退款、利润与账务审计 |
+| 💳 财务记账 | 应收应付、日常收支、预收预付、退货退款、利润分析与流水审计，无需选择资金账户 |
 | 📊 客户对账单 | 按客户 + 日期范围生成对账单，导出 Excel |
 | 📝 报价记录 | 全流程状态追踪：待确认 → 已报价 → 已出库 → 已收款 |
 | 💾 数据安全 | 自动备份、库存与账务对账、SQLite 备份验证恢复、JSON 全量导入导出 |

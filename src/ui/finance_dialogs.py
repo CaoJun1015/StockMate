@@ -29,6 +29,7 @@ from src.models.queries import list_customers, list_suppliers
 from src.services.finance_service import DEFAULT_ACCOUNT_NAMES
 from src.services.party_service import SupplierService
 from src.utils.money import cents_to_yuan, format_yuan
+from src.services.simple_finance_service import flow_account_id
 
 
 def _restore_last_account(combo: QComboBox) -> None:
@@ -92,11 +93,8 @@ class PaymentDialog(QDialog):
             layout.addRow(QLabel(f"当前往来余额：¥ {preview_pending:.2f}"))
         self.amount_spin = _money_spin()
         layout.addRow("金额：", self.amount_spin)
-        self.account_combo = QComboBox()
-        for account in list_financial_accounts(db_path=db_path):
-            self.account_combo.addItem(account["name"], account["id"])
-        _restore_last_account(self.account_combo)
-        layout.addRow("资金账户：", self.account_combo)
+        self.account_id = flow_account_id(db_path)
+        self.method = "业务收支"
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setCalendarPopup(True)
         layout.addRow("日期：", self.date_edit)
@@ -111,17 +109,16 @@ class PaymentDialog(QDialog):
         layout.addRow(buttons)
 
     def _accept(self):
-        if self.account_combo.currentData() is None:
-            QMessageBox.warning(self, "提示", "请选择资金账户")
+        if self.amount_spin.value() <= 0:
+            QMessageBox.warning(self, "提示", "金额必须大于 0")
             return
-        _remember_account(self.account_combo)
         self.accept()
 
     def get_data(self):
         return {
             "amount": self.amount_spin.value(),
-            "account_id": self.account_combo.currentData(),
-            "method": self.account_combo.currentText(),
+            "account_id": self.account_id,
+            "method": self.method,
             "pay_date": self.date_edit.date().toString("yyyy-MM-dd"),
             "remark": self.remark_edit.text().strip(),
         }
@@ -139,9 +136,8 @@ class PaymentEditDialog(PaymentDialog):
         self.amount_spin.setValue(
             float(cents_to_yuan(payment.get("amount_cents", 0)))
         )
-        index = self.account_combo.findData(payment.get("account_id"))
-        if index >= 0:
-            self.account_combo.setCurrentIndex(index)
+        self.account_id = payment.get("account_id") or self.account_id
+        self.method = payment.get("method") or self.method
         value = QDate.fromString(payment.get("pay_date", ""), "yyyy-MM-dd")
         if value.isValid():
             self.date_edit.setDate(value)
@@ -169,11 +165,7 @@ class BatchDialog(QDialog):
         self.settlement_combo = QComboBox()
         self.settlement_combo.addItem("赊购", "credit")
         self.settlement_combo.addItem("立即付款", "paid")
-        self.account_combo = QComboBox()
-        self.account_combo.addItem("—", None)
-        for account in list_financial_accounts(db_path=db_path):
-            self.account_combo.addItem(account["name"], account["id"])
-        _restore_last_account(self.account_combo)
+        self.account_id = flow_account_id(db_path)
         self.remark_edit = QLineEdit()
         self.sn_edit = QLineEdit()
         layout.addRow("采购单价：", self.price_spin)
@@ -181,11 +173,8 @@ class BatchDialog(QDialog):
         layout.addRow("入库日期：", self.date_edit)
         layout.addRow("供应商：", self.supplier_combo)
         layout.addRow("结算方式：", self.settlement_combo)
-        layout.addRow("付款账户：", self.account_combo)
         layout.addRow("备注：", self.remark_edit)
         layout.addRow("序列号：", self.sn_edit)
-        self.settlement_combo.currentIndexChanged.connect(self._sync_account)
-        self._sync_account()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
@@ -194,25 +183,13 @@ class BatchDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
 
-    def _sync_account(self):
-        paid = self.settlement_combo.currentData() == "paid"
-        self.account_combo.setEnabled(paid)
-
     def _accept(self):
-        if (
-            self.settlement_combo.currentData() == "paid"
-            and self.account_combo.currentData() is None
-        ):
-            QMessageBox.warning(self, "提示", "立即付款必须选择资金账户")
-            return
         if (
             self.settlement_combo.currentData() == "credit"
             and not self.supplier_combo.currentText().strip()
         ):
             QMessageBox.warning(self, "提示", "赊购必须选择供应商")
             return
-        if self.settlement_combo.currentData() == "paid":
-            _remember_account(self.account_combo)
         self.accept()
 
     def get_data(self):
@@ -228,206 +205,7 @@ class BatchDialog(QDialog):
             "supplier_id": supplier_id,
             "sn_list": self.sn_edit.text().strip(),
             "settlement_mode": self.settlement_combo.currentData(),
-            "account_id": self.account_combo.currentData(),
-        }
-
-
-class FinanceSetupDialog(QDialog):
-    def __init__(self, parent=None, *, db_path=None):
-        super().__init__(parent)
-        self.setWindowTitle("启用经营记账")
-        self.resize(620, 480)
-        layout = QVBoxLayout(self)
-        state = get_finance_setup_state(db_path)
-        layout.addWidget(
-            QLabel(
-                "启用后，入库、出库和收付款将自动记账。\n"
-                f"期初应收：{format_yuan(state['opening_receivable_cents'])}；"
-                f"期初应付：{format_yuan(state['opening_payable_cents'])}；"
-                f"期初库存：{format_yuan(state['opening_inventory_cents'])}"
-            )
-        )
-        form = QFormLayout()
-        self.enabled_date = QDateEdit(QDate.currentDate())
-        self.enabled_date.setCalendarPopup(True)
-        form.addRow("财务启用日：", self.enabled_date)
-        layout.addLayout(form)
-        self.accounts_table = QTableWidget(len(DEFAULT_ACCOUNT_NAMES), 2)
-        self.accounts_table.setHorizontalHeaderLabels(["账户名称", "期初余额"])
-        for row, name in enumerate(DEFAULT_ACCOUNT_NAMES):
-            self.accounts_table.setItem(row, 0, QTableWidgetItem(name))
-            spin = _money_spin(allow_negative=True)
-            spin.setValue(0)
-            self.accounts_table.setCellWidget(row, 1, spin)
-        layout.addWidget(self.accounts_table)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def get_data(self):
-        accounts = []
-        for row in range(self.accounts_table.rowCount()):
-            item = self.accounts_table.item(row, 0)
-            name = item.text().strip() if item else ""
-            if name:
-                accounts.append(
-                    {
-                        "name": name,
-                        "opening_yuan": self.accounts_table.cellWidget(
-                            row, 1
-                        ).value(),
-                    }
-                )
-        return {
-            "enabled_at": self.enabled_date.date().toString("yyyy-MM-dd"),
-            "accounts": accounts,
-        }
-
-
-class ManualEntryDialog(QDialog):
-    def __init__(self, kind: str, parent=None, *, db_path=None):
-        super().__init__(parent)
-        self.kind = kind
-        self.setWindowTitle("记收入" if kind == "income" else "记费用")
-        layout = QFormLayout(self)
-        self.amount_spin = _money_spin()
-        self.account_combo = QComboBox()
-        for row in list_financial_accounts(db_path=db_path):
-            self.account_combo.addItem(row["name"], row["id"])
-        _restore_last_account(self.account_combo)
-        self.category_combo = QComboBox()
-        for row in list_finance_categories(kind, db_path=db_path):
-            self.category_combo.addItem(row["name"], row["id"])
-        self.date_edit = QDateEdit(QDate.currentDate())
-        self.date_edit.setCalendarPopup(True)
-        self.customer_combo = QComboBox()
-        self.customer_combo.addItem("—", None)
-        for row in list_customers(db_path=db_path):
-            self.customer_combo.addItem(row["name"], row["id"])
-        self.supplier_combo = QComboBox()
-        self.supplier_combo.addItem("—", None)
-        for row in list_suppliers(db_path=db_path):
-            self.supplier_combo.addItem(row["name"], row["id"])
-        self.quote_spin = QSpinBox()
-        self.quote_spin.setRange(0, 999_999_999)
-        self.quote_spin.setSpecialValueText("—")
-        self.remark_edit = QLineEdit()
-        layout.addRow("金额：", self.amount_spin)
-        layout.addRow("资金账户：", self.account_combo)
-        layout.addRow("分类：", self.category_combo)
-        layout.addRow("日期：", self.date_edit)
-        layout.addRow("关联客户：", self.customer_combo)
-        layout.addRow("关联供应商：", self.supplier_combo)
-        layout.addRow("关联报价 ID：", self.quote_spin)
-        layout.addRow("备注：", self.remark_edit)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def get_data(self):
-        _remember_account(self.account_combo)
-        return {
-            "amount": self.amount_spin.value(),
-            "account_id": self.account_combo.currentData(),
-            "category_id": self.category_combo.currentData(),
-            "entry_date": self.date_edit.date().toString("yyyy-MM-dd"),
-            "customer_id": self.customer_combo.currentData(),
-            "supplier_id": self.supplier_combo.currentData(),
-            "quote_id": self.quote_spin.value() or None,
-            "remark": self.remark_edit.text().strip(),
-        }
-
-
-class TransferDialog(QDialog):
-    def __init__(self, parent=None, *, db_path=None):
-        super().__init__(parent)
-        self.setWindowTitle("账户转账")
-        layout = QFormLayout(self)
-        accounts = list_financial_accounts(db_path=db_path)
-        self.from_combo = QComboBox()
-        self.to_combo = QComboBox()
-        for row in accounts:
-            self.from_combo.addItem(row["name"], row["id"])
-            self.to_combo.addItem(row["name"], row["id"])
-        _restore_last_account(self.from_combo)
-        if self.to_combo.count() > 1:
-            self.to_combo.setCurrentIndex(1)
-        self.amount_spin = _money_spin()
-        self.date_edit = QDateEdit(QDate.currentDate())
-        self.date_edit.setCalendarPopup(True)
-        self.remark_edit = QLineEdit()
-        layout.addRow("转出账户：", self.from_combo)
-        layout.addRow("转入账户：", self.to_combo)
-        layout.addRow("金额：", self.amount_spin)
-        layout.addRow("日期：", self.date_edit)
-        layout.addRow("备注：", self.remark_edit)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def get_data(self):
-        _remember_account(self.from_combo)
-        return {
-            "from_account_id": self.from_combo.currentData(),
-            "to_account_id": self.to_combo.currentData(),
-            "amount": self.amount_spin.value(),
-            "entry_date": self.date_edit.date().toString("yyyy-MM-dd"),
-            "remark": self.remark_edit.text().strip(),
-        }
-
-
-class AdjustmentDialog(QDialog):
-    def __init__(self, parent=None, *, db_path=None, reconcile=False):
-        super().__init__(parent)
-        self.setWindowTitle("账户核对" if reconcile else "资金调整")
-        self.reconcile = reconcile
-        layout = QFormLayout(self)
-        self.account_combo = QComboBox()
-        for row in list_financial_accounts(db_path=db_path):
-            self.account_combo.addItem(row["name"], row["id"])
-        _restore_last_account(self.account_combo)
-        self.amount_spin = _money_spin(allow_negative=True)
-        self.amount_spin.setValue(0)
-        self.date_edit = QDateEdit(QDate.currentDate())
-        self.date_edit.setCalendarPopup(True)
-        self.reason_edit = QLineEdit()
-        layout.addRow("资金账户：", self.account_combo)
-        layout.addRow("实际余额：" if reconcile else "调整金额：", self.amount_spin)
-        layout.addRow("日期：", self.date_edit)
-        layout.addRow("原因：", self.reason_edit)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def _accept(self):
-        if not self.reason_edit.text().strip():
-            QMessageBox.warning(self, "提示", "必须填写原因")
-            return
-        self.accept()
-
-    def get_data(self):
-        _remember_account(self.account_combo)
-        return {
-            "account_id": self.account_combo.currentData(),
-            "amount": self.amount_spin.value(),
-            "entry_date": self.date_edit.date().toString("yyyy-MM-dd"),
-            "reason": self.reason_edit.text().strip(),
+            "account_id": self.account_id,
         }
 
 
@@ -446,17 +224,13 @@ class ReturnDialog(QDialog):
         self.refund_spin = _money_spin()
         self.refund_spin.setMinimum(0)
         self.refund_spin.setValue(0)
-        self.account_combo = QComboBox()
-        self.account_combo.addItem("保留往来余额，不立即退款", None)
-        for row in list_financial_accounts(db_path=db_path):
-            self.account_combo.addItem(row["name"], row["id"])
-        _restore_last_account(self.account_combo)
+        self.account_id = flow_account_id(db_path)
         self.reason_edit = QLineEdit()
         layout.addRow("退货数量：", self.quantity_spin)
         layout.addRow("日期：", self.date_edit)
         layout.addRow(self.restock_check)
         layout.addRow("实际退款：", self.refund_spin)
-        layout.addRow("退款账户：", self.account_combo)
+        layout.addRow(QLabel("退款填 0 表示保留往来余额，不立即退款。"))
         layout.addRow("原因：", self.reason_edit)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -467,13 +241,9 @@ class ReturnDialog(QDialog):
         layout.addRow(buttons)
 
     def _accept(self):
-        if self.refund_spin.value() > 0 and self.account_combo.currentData() is None:
-            QMessageBox.warning(self, "提示", "实际退款必须选择资金账户")
-            return
         if not self.reason_edit.text().strip():
             QMessageBox.warning(self, "提示", "必须填写退货原因")
             return
-        _remember_account(self.account_combo)
         self.accept()
 
     def get_data(self):
@@ -482,6 +252,6 @@ class ReturnDialog(QDialog):
             "date": self.date_edit.date().toString("yyyy-MM-dd"),
             "restock": self.restock_check.isChecked(),
             "refund": self.refund_spin.value(),
-            "account_id": self.account_combo.currentData(),
+            "account_id": self.account_id,
             "reason": self.reason_edit.text().strip(),
         }
