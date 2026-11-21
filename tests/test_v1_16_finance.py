@@ -76,6 +76,57 @@ def _sale(path, *, quantity=2):
     return product, customer, supplier, account, batch, quote
 
 
+def test_opening_finance_tab_refreshes_sorted_counterparties(qapp, isolated_default_database):
+    from PyQt6.QtCore import Qt
+    from src.main import MainWindow
+    from src.utils.money import format_whole_yuan
+
+    path = isolated_default_database
+    window = MainWindow()
+    try:
+        window.show()
+        finance = window.finance_tab
+        for table in (finance.receivable_table, finance.payable_table):
+            table.sortItems(0, Qt.SortOrder.AscendingOrder)
+
+        product, customer, supplier = _seed(path)
+        with transaction(path) as conn:
+            other_customer = conn.execute(
+                "INSERT INTO customers(name) VALUES ('客户B')"
+            ).lastrowid
+            other_supplier = conn.execute(
+                "INSERT INTO suppliers(name) VALUES ('供应商B')"
+            ).lastrowid
+
+        for buyer, seller, cost, sale in (
+            (customer, supplier, 100_000, 130_000),
+            (other_customer, other_supplier, 200_000, 230_000),
+        ):
+            batch = InventoryService(path).receive_batch(
+                product_id=product, supplier_id=seller, purchase_price_cents=cost,
+                quantity=1, date="2026-11-17",
+            )
+            quote = OrderService(path).create_quote(
+                batch_id=batch, customer_id=buyer, quote_price_cents=sale,
+                quote_quantity=1, quote_date="2026-11-17",
+            )
+            InventoryService(path).ship_quote(quote, shipped_date="2026-11-17")
+
+        window.tabs.setCurrentWidget(finance)
+        assert finance.receivable_table.isSortingEnabled()
+        assert finance.payable_table.isSortingEnabled()
+        for table, expected in (
+            (finance.receivable_table, {"客户A": 130_000, "客户B": 230_000}),
+            (finance.payable_table, {"供应商A": 100_000, "供应商B": 200_000}),
+        ):
+            assert {
+                table.item(i, 0).text(): table.item(i, 1).text()
+                for i in range(table.rowCount())
+            } == {name: format_whole_yuan(amount) for name, amount in expected.items()}
+    finally:
+        window.close()
+
+
 def test_fresh_schema_v4_contains_balanced_ledger(tmp_path):
     path = tmp_path / "fresh.db"
     assert migrate_database(path) is None

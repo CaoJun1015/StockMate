@@ -28,7 +28,7 @@ from src.models.finance_queries import (
 from src.models.queries import list_customers, list_suppliers
 from src.services.finance_service import DEFAULT_ACCOUNT_NAMES
 from src.services.party_service import SupplierService
-from src.utils.money import cents_to_yuan, format_yuan
+from src.utils.money import cents_to_yuan, format_whole_yuan, format_yuan, yuan_to_cents
 from src.services.simple_finance_service import flow_account_id
 
 
@@ -72,6 +72,7 @@ class PaymentDialog(QDialog):
         quote=None,
         preview_pending=None,
         *,
+        cent_precision=False,
         db_path=None,
     ):
         super().__init__(parent)
@@ -86,12 +87,21 @@ class PaymentDialog(QDialog):
             layout.addRow(
                 QLabel(
                     f"客户：{quote.get('customer_name','')}　"
-                    f"总额：{format_yuan(total)}　待收：{format_yuan(total-received)}"
+                    f"总额：{format_whole_yuan(total)}　待收：{format_whole_yuan(total-received)}"
                 )
             )
         elif preview_pending is not None:
-            layout.addRow(QLabel(f"当前往来余额：¥ {preview_pending:.2f}"))
-        self.amount_spin = _money_spin()
+            cents = yuan_to_cents(preview_pending)
+            label = QLabel(f"当前往来余额：{format_whole_yuan(cents)}")
+            label.setToolTip(format_yuan(cents))
+            layout.addRow(label)
+        if cent_precision:
+            self.amount_spin = _money_spin()
+        else:
+            self.amount_spin = QSpinBox()
+            self.amount_spin.setRange(0, 999_999_999)
+            self.amount_spin.setPrefix("¥ ")
+            self.amount_spin.selectAll()
         layout.addRow("金额：", self.amount_spin)
         self.account_id = flow_account_id(db_path)
         self.method = "业务收支"
@@ -130,11 +140,13 @@ class PaymentEditDialog(PaymentDialog):
             parent,
             title="更正收付款",
             pay_type=(payment or {}).get("type", "receivable"),
+            cent_precision=bool((payment or {}).get("amount_cents", 0) % 100),
             db_path=db_path,
         )
         payment = payment or {}
         self.amount_spin.setValue(
-            float(cents_to_yuan(payment.get("amount_cents", 0)))
+            cents_to_yuan(payment["amount_cents"]) if payment.get("amount_cents", 0) % 100
+            else payment.get("amount_cents", 0) // 100
         )
         self.account_id = payment.get("account_id") or self.account_id
         self.method = payment.get("method") or self.method

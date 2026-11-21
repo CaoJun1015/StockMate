@@ -120,8 +120,8 @@ def test_no_account_setup_or_manual_entry_ui_and_audit_selection(qapp,tmp_path):
         assert not hasattr(d,'account_combo')
         assert d.account_id==flow_account_id(p)
         d.close()
-    dialog=PaymentDialog(db_path=p);dialog.amount_spin.setValue(12601.01)
-    assert dialog.get_data()['amount']==12601.01
+    dialog=PaymentDialog(db_path=p);dialog.amount_spin.setValue(12601)
+    assert dialog.get_data()['amount']==12601
     w.close()
 
 def test_export_contains_all_receipts_but_no_bank_balance(tmp_path):

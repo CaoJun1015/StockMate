@@ -23,5 +23,10 @@ def cents_to_yuan(value: int | None) -> float:
     return float(cents_to_decimal(value))
 
 
+def format_whole_yuan(value: int) -> str:
+    rounded = cents_to_decimal(value).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"¥{int(rounded):,}"
+
+
 def format_yuan(value: int | None, *, decimals: int = 2) -> str:
     return f"¥{cents_to_decimal(value):,.{decimals}f}"

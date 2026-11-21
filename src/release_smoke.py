@@ -25,6 +25,14 @@ def run(output):
     window=MainWindow();window.resize(1450,900);window.show();app.processEvents()
     window.tabs.setCurrentWidget(window.finance_tab)
     tab=window.finance_tab
+    app.processEvents()
+    assert tab.refresh_receivable_btn.isVisible()
+    tab.receivable_table.setRowCount(0)
+    tab.payable_table.setRowCount(0)
+    tab.refresh_receivable_btn.click()
+    for kind, table in [('customer', tab.receivable_table), ('supplier', tab.payable_table)]:
+        expected = list_counterparty_balances(kind)
+        assert expected and table.rowCount() == len(expected)
     tab.daily_from.setDate(QDate(2000,1,1));tab.daily_to.setDate(QDate(2099,1,1))
     tab.audit_from.setDate(QDate(2000,1,1));tab.audit_to.setDate(QDate(2099,1,1))
     tab.profit_from.setDate(QDate(2000,1,1));tab.profit_to.setDate(QDate(2099,1,1))
