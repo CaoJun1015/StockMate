@@ -29,7 +29,7 @@ from src.models.finance_queries import (
 from src.models.queries import list_customers, list_suppliers
 from src.services.finance_service import DEFAULT_ACCOUNT_NAMES
 from src.services.party_service import SupplierService
-from src.utils.money import cents_to_yuan, format_yuan
+from src.utils.money import cents_to_yuan, format_yuan, yuan_to_cents
 
 
 def _restore_last_account(combo: QComboBox) -> None:
@@ -72,6 +72,7 @@ class PaymentDialog(QDialog):
         quote=None,
         preview_pending=None,
         *,
+        cent_precision=False,
         db_path=None,
     ):
         super().__init__(parent)
@@ -92,8 +93,19 @@ class PaymentDialog(QDialog):
                 )
             )
         elif preview_pending is not None:
-            layout.addRow(QLabel(f"当前往来余额：¥ {preview_pending:.0f}"))
-        self.amount_spin = _money_spin()
+            cents = yuan_to_cents(preview_pending)
+            label = QLabel(f"当前往来余额：{format_yuan(cents)}")
+            label.setToolTip(format_yuan(cents, decimals=2))
+            layout.addRow(label)
+        if cent_precision:
+            self.amount_spin = _money_spin()
+            self.amount_spin.setDecimals(2)
+            self.amount_spin.setMaximum(999_999_999.99)
+        else:
+            self.amount_spin = QSpinBox()
+            self.amount_spin.setRange(0, 999_999_999)
+            self.amount_spin.setPrefix("¥ ")
+            self.amount_spin.selectAll()
         layout.addRow("金额：", self.amount_spin)
         self.account_combo = QComboBox()
         for account in list_financial_accounts(db_path=db_path):
@@ -114,6 +126,9 @@ class PaymentDialog(QDialog):
         layout.addRow(buttons)
 
     def _accept(self):
+        if self.amount_spin.value() <= 0:
+            QMessageBox.warning(self, "提示", "金额必须大于 0")
+            return
         if self.account_combo.currentData() is None:
             QMessageBox.warning(self, "提示", "请选择资金账户")
             return
@@ -136,11 +151,13 @@ class PaymentEditDialog(PaymentDialog):
             parent,
             title="更正收付款",
             pay_type=(payment or {}).get("type", "receivable"),
+            cent_precision=bool((payment or {}).get("amount_cents", 0) % 100),
             db_path=db_path,
         )
         payment = payment or {}
         self.amount_spin.setValue(
-            float(cents_to_yuan(payment.get("amount_cents", 0)))
+            cents_to_yuan(payment["amount_cents"]) if payment.get("amount_cents", 0) % 100
+            else payment.get("amount_cents", 0) // 100
         )
         index = self.account_combo.findData(payment.get("account_id"))
         if index >= 0:

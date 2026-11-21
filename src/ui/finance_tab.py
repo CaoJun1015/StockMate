@@ -116,17 +116,10 @@ class FinanceTab(QWidget):
         self._build_audit_page()
         # MainWindow aliases remain for one local compatibility cycle.
         self.payment_flow_table = self.daily_table
-        self.refresh_receivable_btn = QPushButton("刷新", self)
-        self.refresh_payable_btn = QPushButton("刷新", self)
+        self.refresh_payable_btn = self.refresh_receivable_btn
         self.refresh_flow_btn = QPushButton("刷新", self)
-        for button in (
-            self.refresh_receivable_btn,
-            self.refresh_payable_btn,
-            self.refresh_flow_btn,
-        ):
-            button.setObjectName("ghostBtn")
-            button.clicked.connect(self.refresh)
-            button.hide()
+        self.refresh_flow_btn.clicked.connect(self.refresh)
+        self.refresh_flow_btn.hide()
 
     def _build_dashboard_page(self):
         page = QWidget()
@@ -213,7 +206,15 @@ class FinanceTab(QWidget):
         page = QWidget()
         layout = QGridLayout(page)
         layout.addWidget(QLabel("客户应收 / 预收"), 0, 0)
-        layout.addWidget(QLabel("供应商应付 / 预付"), 0, 1)
+        supplier_header = QHBoxLayout()
+        supplier_header.addWidget(QLabel("供应商应付 / 预付"))
+        supplier_header.addStretch()
+        self.refresh_receivable_btn = QPushButton("刷新")
+        self.refresh_receivable_btn.setObjectName("ghostBtn")
+        self.refresh_receivable_btn.setToolTip("刷新客户应收和供应商应付")
+        self.refresh_receivable_btn.clicked.connect(self._refresh_counterparties)
+        supplier_header.addWidget(self.refresh_receivable_btn)
+        layout.addLayout(supplier_header, 0, 1)
         self.receivable_table = self._table(
             ["客户", "往来余额", "状态", "未结订单", "账龄", "联系方式", "操作"]
         )
@@ -369,6 +370,7 @@ class FinanceTab(QWidget):
                 balance = row["balance_cents"]
                 self.receivable_table.setItem(index, 0, QTableWidgetItem(row["name"]))
                 amount = NumericTableWidgetItem(format_yuan(abs(balance)), abs(balance))
+                amount.setToolTip(format_yuan(abs(balance), decimals=2))
                 amount.setForeground(QColor("#D32F2F" if balance > 0 else "#388E3C"))
                 self.receivable_table.setItem(index, 1, amount)
                 self.receivable_table.setItem(
@@ -408,9 +410,9 @@ class FinanceTab(QWidget):
             for index, row in enumerate(suppliers):
                 balance = row["balance_cents"]
                 self.payable_table.setItem(index, 0, QTableWidgetItem(row["name"]))
-                self.payable_table.setItem(
-                    index, 1, NumericTableWidgetItem(format_yuan(abs(balance)), abs(balance))
-                )
+                amount = NumericTableWidgetItem(format_yuan(abs(balance)), abs(balance))
+                amount.setToolTip(format_yuan(abs(balance), decimals=2))
+                self.payable_table.setItem(index, 1, amount)
                 self.payable_table.setItem(
                     index, 2, QTableWidgetItem("应付" if balance > 0 else "预付")
                 )
