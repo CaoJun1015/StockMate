@@ -62,8 +62,8 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/CaoJun1015/diaohuo-assistant.git
-cd diaohuo-assistant
+git clone https://github.com/CaoJun1015/StockMate.git
+cd StockMate
 
 # 安装依赖
 pip install -r requirements.txt
@@ -78,21 +78,11 @@ python run.py
 # 在 Python 3.11 的干净环境中安装固定构建清单
 python -m pip install -r requirements-release.lock
 
-# 完整回归、隔离 PyInstaller 打包、DLL 来源和 EXE 临时库启动检查
+# 隔离 PyInstaller 打包、DLL 来源和 EXE 临时库启动检查
 python scripts/release_validate.py
 ```
 
 验证后的本地候选包和 JSON 报告位于 `release-candidates/`。报告会记录实际 EXE 名、提交、工作区状态、依赖版本、schema 和 SHA-256；脏工作区只标记为本地验证，不能作为正式发布候选。
-
-### v1.17 第四批交付（2026-09-17）
-
-- 出库支持条码枪 Enter 连续扫码、多行粘贴及唯一 SN 自动批次分配。
-- 销售退货显示净可退数，并在提交前预览回库、成本、应收与退款影响。
-- 报价记录可只读查询单台 SN 的入库、出库、退货、再售链路和异常证据。
-- 搜索使用 250ms 防抖；报价记录稳定分页，汇总和导出仍覆盖完整筛选结果。
-- 大量报价 Excel 导出在后台执行，避免界面阻塞；JSON、Excel、批量报价图片和对账文本均采用安全替换写入。
-
-完整范围、性能数据、提交和人工验收限制见 [第四批交付总结](docs/v1.17_第四批交付总结.md)。
 
 ---
 
@@ -172,7 +162,7 @@ diaohuo-assistant/
 
 **如果这个项目对你有帮助，欢迎点个 ⭐ Star 支持一下！**
 
-[MIT License](LICENSE) · [报告问题](https://github.com/CaoJun1015/diaohuo-assistant/issues)
+[MIT License](LICENSE) · [报告问题](https://github.com/CaoJun1015/StockMate/issues)
 
 </div>
 

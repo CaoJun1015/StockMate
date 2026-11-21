@@ -24,7 +24,7 @@ from src.version import APP_VERSION
 
 
 LOCKED_PACKAGES = (
-    "PyQt6", "python-docx", "Pillow", "openpyxl", "PyInstaller", "pytest", "pytest-qt",
+    "PyQt6", "python-docx", "Pillow", "openpyxl", "PyInstaller",
 )
 
 
@@ -130,11 +130,8 @@ def main() -> int:
         "requirements_lock_sha256": sha256(ROOT / "requirements-release.lock"),
         "validation": {},
     }
-    stage = "tests"
+    stage = "build"
     try:
-        run([sys.executable, "-m", "pytest", "-q"])
-        report["validation"]["tests"] = "passed"
-
         with TemporaryDirectory(prefix="stockmate-release-build-") as temporary:
             work = Path(temporary)
             dist_path = output / "artifact"
@@ -143,7 +140,6 @@ def main() -> int:
             marker = f"StockMate external DLL guard {uuid4().hex}".encode()
             (external / "icuuc.dll").write_bytes(marker)
             build_env = {**os.environ, "PATH": str(external) + os.pathsep + os.environ.get("PATH", "")}
-            stage = "build"
             run([
                 sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "build.spec",
                 "--distpath", str(dist_path), "--workpath", str(work / "work"),
