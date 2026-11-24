@@ -8,6 +8,7 @@ from uuid import uuid4
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from src.utils.quote_profit import quote_profit, summarize_quotes
 from src.utils.money import cents_to_yuan
 
 
@@ -45,8 +46,8 @@ def export_quotes_to_excel(quotes, output_path=None):
 
     # 表头
     headers = ["日期", "客户", "机型系列", "CPU", "内存", "硬盘", "显卡",
-               "上游", "购入价", "数量", "对外报价", "净金额", "毛利", "状态",
-               "已收款", "待收款", "SN", "备注", "是否打款"]
+               "上游", "报价批次进价", "数量", "对外报价", "净金额", "毛利", "状态",
+               "已收款", "待收款", "SN", "备注", "是否打款", "毛利口径"]
     
     header_font = Font(bold=True, size=11, color="FFFFFF")
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
@@ -72,20 +73,15 @@ def export_quotes_to_excel(quotes, output_path=None):
     profit_font_bad = Font(size=10, color="D32F2F", bold=True)
     alt_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
 
-    total_purchase = 0
-    total_quote = 0
 
     for row_idx, q in enumerate(quotes, 2):
         purchase_price = q.get("purchase_price_cents", 0) or 0
         quote_price = q.get("quote_price_cents", 0) or 0
         quantity = q.get("quote_quantity", 1) or 1
         net_total = q.get("net_total_cents", quote_price * quantity) or 0
-        net_quantity = max(quantity - (q.get("returned_quantity", 0) or 0), 0)
-        profit = (quote_price - purchase_price) * net_quantity
+        basis, profit = quote_profit(q)
         received = q.get("received_amount_cents", 0) or 0
 
-        total_purchase += purchase_price * net_quantity
-        total_quote += net_total
 
         row_data = [
             q.get("quote_date", ""),
@@ -100,13 +96,14 @@ def export_quotes_to_excel(quotes, output_path=None):
             quantity,
             cents_to_yuan(quote_price),
             cents_to_yuan(net_total),
-            cents_to_yuan(profit),
+            cents_to_yuan(profit) if profit is not None else None,
             q.get("status", "待确认"),
             cents_to_yuan(received),
             cents_to_yuan(max(net_total - received, 0)) if net_total > received else "已结清",
             q.get("sn_list", "") or "",
             q.get("remark", ""),
             q.get("paid", "否"),
+            basis,
         ]
 
         for col_idx, val in enumerate(row_data, 1):
@@ -119,9 +116,9 @@ def export_quotes_to_excel(quotes, output_path=None):
 
         # 毛利列特殊着色
         profit_cell = ws.cell(row=row_idx, column=13)
-        if profit > 0:
+        if profit is not None and profit > 0:
             profit_cell.font = profit_font_good
-        elif profit < 0:
+        elif profit is not None and profit < 0:
             profit_cell.font = profit_font_bad
 
         # 状态列着色
@@ -137,17 +134,18 @@ def export_quotes_to_excel(quotes, output_path=None):
 
     # 汇总行
     summary_row = len(quotes) + 2
-    ws.cell(row=summary_row, column=8, value="合计").font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=9, value=cents_to_yuan(total_purchase)).font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=11, value="").font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=12, value=cents_to_yuan(total_quote)).font = Font(bold=True, size=10)
-    ws.cell(row=summary_row, column=13, value=cents_to_yuan(total_quote - total_purchase)).font = Font(bold=True, size=10, color="008000")
-
-    for col_idx in range(1, len(headers) + 1):
-        ws.cell(row=summary_row, column=col_idx).border = thin_border
+    totals = summarize_quotes(quotes)
+    ws.cell(summary_row, 8, "实际合计")
+    ws.cell(summary_row, 9, cents_to_yuan(totals["cost"]))
+    ws.cell(summary_row, 12, cents_to_yuan(totals["sales"]))
+    ws.cell(summary_row, 13, cents_to_yuan(totals["actual"]))
+    ws.cell(summary_row + 1, 8, "预计合计")
+    ws.cell(summary_row + 1, 13, cents_to_yuan(totals["estimated"]))
+    ws.cell(summary_row + 2, 8, "待核对笔数")
+    ws.cell(summary_row + 2, 10, totals["pending_count"])
 
     # 列宽
-    col_widths = [12, 12, 16, 14, 8, 8, 10, 10, 10, 8, 10, 10, 10, 10, 10, 10, 15, 20, 10]
+    col_widths = [12, 12, 16, 14, 8, 8, 10, 10, 10, 8, 10, 10, 10, 10, 10, 10, 15, 20, 10, 12]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[chr(64 + i)].width = w
 

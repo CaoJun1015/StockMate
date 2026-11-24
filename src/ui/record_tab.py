@@ -1,5 +1,5 @@
 """报价记录 Tab"""
-from datetime import datetime, date as date_type
+from datetime import date
 from math import ceil
 
 from PyQt6.QtWidgets import (
@@ -20,7 +20,7 @@ from src.models.queries import (
     list_batches,
     list_products,
     list_shipment_allocations,
-    search_quotes,
+    search_quotes, quote_page,
 )
 from src.services.exceptions import ServiceError
 from src.services.inventory_service import InventoryService
@@ -34,7 +34,7 @@ from src.utils.follow_up import get_stale_quotes, format_reminder_text
 from src.utils.monthly_report import get_monthly_report, format_report_text
 from src.utils.shipment_flow import parse_sn_input, validate_sn, validate_sn_list, generate_shipment_receipt
 from src.utils.money import format_yuan, yuan_to_cents
-from src.utils.tax import calc_tax_adjusted_profit_cents
+from src.utils.quote_profit import quote_profit
 from src.ui.dialogs import ShipmentDialog, SNLifecycleDialog, QuoteEditDialog
 from src.ui.finance_dialogs import PaymentDialog, ReturnDialog
 from src.ui.utils import refreshing_table
@@ -59,7 +59,8 @@ class RecordTab(QWidget):
         self._search_timer.timeout.connect(self._refresh_debounced_search)
         self._last_filter_key = None
         self._columns_sized = False
-        self._all_quotes = []
+        self._page_quotes = []
+        self._total_count = 0
         self._page = 0
         self._page_size = 250
         self._build_ui()
@@ -164,10 +165,10 @@ class RecordTab(QWidget):
 
         self.record_table = QTableWidget()
         self.record_table.setAlternatingRowColors(True)
-        self.record_table.setColumnCount(17)
+        self.record_table.setColumnCount(18)
         self.record_table.setHorizontalHeaderLabels(
             ["ID", "日期", "客户", "机型", "CPU", "内存", "硬盘", "显卡", "上游",
-             "购入价", "数量", "对外报价", "状态", "已收款", "SN", "备注", "打款"]
+             "报价批次进价", "数量", "对外报价", "状态", "已收款", "SN", "备注", "打款", "订单毛利"]
         )
         self.record_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.record_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -180,6 +181,7 @@ class RecordTab(QWidget):
         self.selection_label.setObjectName("summaryLabel")
         layout.addWidget(self.selection_label)
         self.stats_label = QLabel()
+        self.stats_label.setWordWrap(True)
         self.stats_label.setObjectName("summaryLabel")
         layout.addWidget(self.stats_label)
 
@@ -193,33 +195,34 @@ class RecordTab(QWidget):
         self.refresh_records(skip_if_unchanged=True)
 
     def _change_page(self, offset):
-        pages = max(1, ceil(len(self._all_quotes) / self._page_size))
+        pages = max(1, ceil(self._total_count / self._page_size))
         page = min(max(self._page + offset, 0), pages - 1)
         if page != self._page:
-            self._page = page
-            self.refresh_records(quotes_override=self._all_quotes)
+            self.refresh_records(page=page)
 
-    def refresh_records(self, *, skip_if_unchanged=False, quotes_override=None):
-        keyword = self.record_search.text().strip()
-        date_from = self.date_from.date().toString("yyyy-MM-dd")
-        date_to = self.date_to.date().toString("yyyy-MM-dd")
-        status_filter = self.status_filter.currentText()
-        filter_key = (keyword, date_from, date_to, status_filter)
-        if skip_if_unchanged and filter_key == self._last_filter_key:
+    def _filters(self):
+        status = self.status_filter.currentText()
+        return (self.record_search.text().strip(), self.date_from.date().toString("yyyy-MM-dd"),
+                self.date_to.date().toString("yyyy-MM-dd"), None if status == "全部状态" else status)
+
+    def refresh_records(self, *, skip_if_unchanged=False, page=None):
+        filters = self._filters()
+        if skip_if_unchanged and filters == self._last_filter_key:
             return
-        if quotes_override is None:
-            quotes = search_quotes(keyword, date_from, date_to)
-            if status_filter != "全部状态":
-                quotes = [q for q in quotes if q.get("status", "待确认") == status_filter]
-            self._last_filter_key = filter_key
-            self._all_quotes = quotes
-            self._page = 0
-        else:
-            quotes = quotes_override
-        pages = max(1, ceil(len(quotes) / self._page_size))
-        self._page = min(self._page, pages - 1)
-        visible_quotes = quotes[self._page * self._page_size:(self._page + 1) * self._page_size]
-        self.page_label.setText(f"第 {self._page + 1}/{pages} 页（共 {len(quotes)} 条）")
+        refresh_totals = page is None or filters != self._last_filter_key
+        self._page = 0 if refresh_totals else page
+        visible_quotes, totals = quote_page(*filters, limit=self._page_size,
+            offset=self._page * self._page_size, include_summary=refresh_totals)
+        if self._page and not visible_quotes:
+            self.refresh_records()
+            return
+        self._page_quotes = visible_quotes
+        self._last_filter_key = filters
+        if totals is not None:
+            self._total_count = totals["count"]
+            self._show_summary(totals)
+        pages = max(1, ceil(self._total_count / self._page_size))
+        self.page_label.setText(f"第 {self._page + 1}/{pages} 页（共 {self._total_count} 条）")
         self.previous_page_btn.setEnabled(self._page > 0)
         self.next_page_btn.setEnabled(self._page + 1 < pages)
 
@@ -234,8 +237,6 @@ class RecordTab(QWidget):
 
         with refreshing_table(self.record_table, key_column=0):
             self.record_table.setRowCount(len(visible_quotes))
-            total_cost = 0
-            total_sale = 0
             for i, q in enumerate(visible_quotes):
                 status = q.get("status", "待确认")
                 received = q.get("received_amount_cents", 0) or 0
@@ -287,25 +288,23 @@ class RecordTab(QWidget):
                 self.record_table.setItem(i, 15, QTableWidgetItem(merged_remark))
                 self.record_table.setItem(i, 16, QTableWidgetItem(q.get("paid", "否")))
 
-                total_cost += (q.get("purchase_price_cents", 0) or 0) * max(
-                    quote_quantity - (q.get("returned_quantity", 0) or 0), 0
-                )
-                total_sale += total_amount
+                basis, profit = quote_profit(q)
+                text = {"待核对": "实际毛利待核对", "不适用": "—"}.get(basis)
+                if profit is not None:
+                    text = f"{basis}毛利 {format_yuan(profit, decimals=2)}"
+                self.record_table.setItem(i, 17, QTableWidgetItem(text))
 
                 # 收款提醒：已出库超过7天未收满的订单，整行红色高亮
                 if status == "已出库" and received < total_amount and total_amount > 0:
-                    from datetime import date, datetime
-                    quote_date = q.get("quote_date", "")
-                    if quote_date:
-                        try:
-                            quote_dt = datetime.strptime(quote_date, "%Y-%m-%d").date()
-                            if (date.today() - quote_dt).days > 7:
-                                for col in range(self.record_table.columnCount()):
-                                    item = self.record_table.item(i, col)
-                                    if item:
-                                        item.setForeground(QColor("#D32F2F"))
-                        except ValueError:
-                            pass
+                    try:
+                        shipped = date.fromisoformat(q.get("shipped_date") or "")
+                    except ValueError:
+                        continue
+                    if (date.today() - shipped).days > 7:
+                        for col in range(self.record_table.columnCount()):
+                            item = self.record_table.item(i, col)
+                            if item:
+                                item.setForeground(QColor("#D32F2F"))
 
         if not self._columns_sized:
             self.record_table.resizeColumnsToContents()
@@ -314,30 +313,15 @@ class RecordTab(QWidget):
             self.record_table.setColumnWidth(14, 120)
             self._columns_sized = True
 
-        # 税后利润统计
-        tax_total_cost = 0
-        tax_total_sale = 0
-        total_tax_profit = 0
-        for q in quotes:
-            purchase_price = q.get("purchase_price_cents", 0) or 0
-            quote_price = q.get("quote_price_cents", 0) or 0
-            quantity = q.get("quote_quantity", 1) or 1
-            tax_rate = q.get("tax_rate")
-            purchase_tax_inclusive = q.get("purchase_tax_inclusive", 0) or 0
-            quote_tax_inclusive = q.get("quote_tax_inclusive", 0) or 0
-            net_quantity = max(quantity - (q.get("returned_quantity", 0) or 0), 0)
-            tax_total_cost += purchase_price * net_quantity
-            tax_total_sale += q.get("net_total_cents", quote_price * quantity) or 0
-            total_tax_profit += calc_tax_adjusted_profit_cents(
-                purchase_price, quote_price, net_quantity, tax_rate,
-                purchase_tax_inclusive, quote_tax_inclusive,
-            )
-        profit = total_tax_profit
-        self.stats_label.setText(
-            f"共 {len(quotes)} 条记录  |  总购入: {format_yuan(tax_total_cost)}  |  "
-            f"总报价: {format_yuan(tax_total_sale)}  |  毛利: {format_yuan(profit)}"
-        )
         self._update_action_states()
+
+    def _show_summary(self, totals):
+        self.stats_label.setText(
+            f"共 {self._total_count} 条  |  净销售额 {format_yuan(totals['sales'], decimals=2)}  |  "
+            f"净成本 {format_yuan(totals['cost'], decimals=2)}  |  实际毛利 {format_yuan(totals['actual'], decimals=2)}"
+            f"（{totals['actual_count']} 单）  |  预计毛利 {format_yuan(totals['estimated'], decimals=2)}"
+            f"（{totals['estimated_count']} 单）  |  待核对 {totals['pending_count']} 单"
+        )
 
     def _update_action_states(self):
         """Keep visible actions aligned with the selected order state."""
@@ -358,7 +342,7 @@ class RecordTab(QWidget):
 
         if quote_id:
             selected_quote = next(
-                (quote for quote in self._all_quotes if str(quote.get("id")) == quote_id),
+                (quote for quote in self._page_quotes if str(quote.get("id")) == quote_id),
                 None,
             )
             if selected_quote:
@@ -794,22 +778,18 @@ class RecordTab(QWidget):
     # 导出 Excel
     # -------------------------------------------------------
     def on_export_records_excel(self):
-        filter_key = (
-            self.record_search.text().strip(),
-            self.date_from.date().toString("yyyy-MM-dd"),
-            self.date_to.date().toString("yyyy-MM-dd"), self.status_filter.currentText(),
-        )
-        if filter_key != self._last_filter_key:
-            self.refresh_records()
-        quotes = self._all_quotes
-        if not quotes:
-            QMessageBox.warning(self, "提示", "当前筛选条件下没有报价记录")
-            return
+        keyword, start, end, status = self._filters()
+        def export_filtered():
+            quotes = search_quotes(keyword, start, end, status=status)
+            if not quotes:
+                raise ValueError("当前筛选条件下没有报价记录")
+            return export_quotes_to_excel(quotes)
+
         owner = self.window()
         self.export_records_btn.setEnabled(False)
         self.export_records_btn.setText("正在导出…")
         started = start_background_task(
-            owner, "quote-excel", lambda: export_quotes_to_excel(quotes),
+            owner, "quote-excel", export_filtered,
             lambda output: self._finish_quote_export(output),
             lambda message: self._fail_quote_export(message),
         )
