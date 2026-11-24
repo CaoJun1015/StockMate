@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from src.models.connection import connect
+from src.utils.quote_profit import summarize_quotes
 from src.models.finance_queries import (
     collect_finance_reconciliation_snapshot,
     get_customer_actual_performance,
@@ -47,6 +48,7 @@ def export_backup_data(db_path=None) -> dict[str, list[dict]]:
     """Return canonical schema rows for JSON backup without derived yuan fields."""
     conn = connect(db_path, read_only=True)
     try:
+        conn.execute("BEGIN")
         return {
             table: [
                 dict(row)
@@ -350,13 +352,7 @@ def get_quote_detail(quote_id: int, db_path=None) -> dict | None:
         conn.close()
 
 
-def search_quotes(
-    keyword: str = "",
-    date_from: str = "",
-    date_to: str = "",
-    customer_id: int | None = None,
-    db_path=None,
-) -> list[dict]:
+def _quote_query(keyword, date_from, date_to, customer_id, status, limit=None, offset=0):
     conditions = [
         "q.deleted_at IS NULL",
         "b.deleted_at IS NULL",
@@ -381,39 +377,95 @@ def search_quotes(
     if customer_id is not None:
         conditions.append("q.customer_id=?")
         params.append(customer_id)
+    if status:
+        conditions.append("q.status=?")
+        params.append(status)
+    pagination = ""
+    if limit is not None:
+        pagination = "LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+    sql = f"""
+    WITH matched AS (
+        SELECT q.id
+        FROM quotes q
+        JOIN batches b ON q.batch_id=b.id
+        JOIN products p ON b.product_id=p.id
+        LEFT JOIN customers c ON q.customer_id=c.id
+        LEFT JOIN suppliers s ON b.supplier_id=s.id
+        WHERE {" AND ".join(conditions)}
+        ORDER BY q.quote_date DESC,q.id DESC
+        {pagination}
+    ), posted AS (
+        SELECT l.quote_id,
+               SUM(CASE WHEN a.code='SALES' THEN l.credit_cents-l.debit_cents END) AS actual_sales_cents,
+               SUM(CASE WHEN a.code='COGS' THEN l.debit_cents-l.credit_cents END) AS actual_cost_cents,
+               MAX(CASE WHEN a.code='SALES' AND l.entry_id=ss.ledger_entry_id THEN 1 END) AS has_sale,
+               MAX(CASE WHEN a.code='COGS' AND l.entry_id=ss.ledger_entry_id THEN 1 END) AS has_cost
+        -- Start from the selected quote IDs so paging never scans a whole ledger account.
+        FROM matched m
+        CROSS JOIN shipment_snapshots ss ON ss.quote_id=m.id
+        CROSS JOIN ledger_lines l ON l.quote_id=m.id
+        CROSS JOIN ledger_accounts a ON a.id=l.account_id
+        WHERE a.code IN ('SALES','COGS')
+        GROUP BY l.quote_id
+    )
+    SELECT CASE WHEN posted.has_sale AND (posted.has_cost OR ss.cost_cents=0)
+                THEN posted.actual_sales_cents END AS actual_sales_cents,
+           CASE WHEN posted.has_sale AND (posted.has_cost OR ss.cost_cents=0)
+                THEN COALESCE(posted.actual_cost_cents,0) END AS actual_cost_cents,
+           ss.shipped_date,q.id,q.quote_price_cents,q.quote_quantity,
+           q.quote_date,q.remark,q.paid,q.status,
+           q.received_amount_cents,q.sn_list,q.tax_rate,
+           q.purchase_tax_inclusive,q.quote_tax_inclusive,
+           COALESCE((SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+                     WHERE sr.quote_id=q.id),0) AS returned_revenue_cents,
+           COALESCE((SELECT SUM(sr.quantity) FROM sales_returns sr
+                     WHERE sr.quote_id=q.id),0) AS returned_quantity,
+           q.quote_price_cents*q.quote_quantity-COALESCE((
+               SELECT SUM(sr.revenue_cents) FROM sales_returns sr
+               WHERE sr.quote_id=q.id),0) AS net_total_cents,
+           p.series,p.cpu,p.ram,p.storage,p.gpu,p.screen,p.note,
+           b.purchase_price_cents,b.remark AS batch_remark,
+           b.id AS batch_id,b.sn_list AS batch_sn_list,
+           c.name AS customer_name,c.id AS customer_id,
+           s.name AS supplier_name
+    FROM quotes q
+    LEFT JOIN posted ON posted.quote_id=q.id
+    LEFT JOIN shipment_snapshots ss ON ss.quote_id=q.id
+    JOIN batches b ON q.batch_id=b.id
+    JOIN products p ON b.product_id=p.id
+    LEFT JOIN customers c ON q.customer_id=c.id
+    LEFT JOIN suppliers s ON b.supplier_id=s.id
+    WHERE q.id IN (SELECT id FROM matched)
+    """
+    return sql, params
+
+
+def search_quotes(keyword="", date_from="", date_to="", customer_id=None, db_path=None, *, status=None):
+    sql, params = _quote_query(keyword, date_from, date_to, customer_id, status)
     conn = connect(db_path, read_only=True)
     try:
-        return [
-            dict(row)
-            for row in conn.execute(
-                f"""
-                SELECT q.id,q.quote_price_cents,q.quote_quantity,
-                       q.quote_date,q.remark,q.paid,q.status,
-                       q.received_amount_cents,q.sn_list,q.tax_rate,
-                       q.purchase_tax_inclusive,q.quote_tax_inclusive,
-                       COALESCE((SELECT SUM(sr.revenue_cents) FROM sales_returns sr
-                                 WHERE sr.quote_id=q.id),0) AS returned_revenue_cents,
-                       COALESCE((SELECT SUM(sr.quantity) FROM sales_returns sr
-                                 WHERE sr.quote_id=q.id),0) AS returned_quantity,
-                       q.quote_price_cents*q.quote_quantity-COALESCE((
-                           SELECT SUM(sr.revenue_cents) FROM sales_returns sr
-                           WHERE sr.quote_id=q.id),0) AS net_total_cents,
-                       p.series,p.cpu,p.ram,p.storage,p.gpu,p.screen,p.note,
-                       b.purchase_price_cents,b.remark AS batch_remark,
-                       b.id AS batch_id,b.sn_list AS batch_sn_list,
-                       c.name AS customer_name,c.id AS customer_id,
-                       s.name AS supplier_name
-                FROM quotes q
-                JOIN batches b ON q.batch_id=b.id
-                JOIN products p ON b.product_id=p.id
-                LEFT JOIN customers c ON q.customer_id=c.id
-                LEFT JOIN suppliers s ON b.supplier_id=s.id
-                WHERE {" AND ".join(conditions)}
-                ORDER BY q.quote_date DESC,q.id DESC
-                """,
-                params,
-            ).fetchall()
-        ]
+        return [dict(row) for row in conn.execute(sql + " ORDER BY q.quote_date DESC,q.id DESC", params)]
+    finally:
+        conn.close()
+
+
+def quote_page(keyword, date_from, date_to, status, *, limit, offset, include_summary, db_path=None):
+    """Read page details and, on refresh, the filtered totals from one snapshot."""
+    filters = (keyword, date_from, date_to, None, status)
+    conn = connect(db_path, read_only=True)
+    try:
+        conn.execute("BEGIN")
+        totals = None
+        if include_summary:
+            source, params = _quote_query(*filters)
+            projection = """SELECT status, purchase_price_cents, quote_price_cents, quote_quantity,
+                tax_rate, purchase_tax_inclusive, quote_tax_inclusive, actual_sales_cents,
+                actual_cost_cents FROM ("""
+            totals = summarize_quotes(dict(row) for row in conn.execute(projection + source + ")", params))
+        sql, params = _quote_query(*filters, limit=limit, offset=offset)
+        rows = conn.execute(sql + " ORDER BY q.quote_date DESC,q.id DESC", params)
+        return [dict(row) for row in rows], totals
     finally:
         conn.close()
 
@@ -914,21 +966,24 @@ def get_customer_price_history_query(
 
 
 def list_stale_quotes(status: str, cutoff: str, today: str, db_path=None) -> list[dict]:
+    reference_date = "ss.shipped_date" if status == "已出库" else "q.quote_date"
+    cutoff_operator = "<" if status == "已出库" else "<="
     conn = connect(db_path, read_only=True)
     try:
         return [
             dict(row)
             for row in conn.execute(
-                """
+                f"""
                 SELECT q.id,q.quote_date,q.quote_price_cents,q.quote_quantity,q.remark,
                        p.series,p.cpu,p.ram,p.storage,p.gpu,c.name AS customer_name,
-                       CAST(julianday(?) - julianday(q.quote_date) AS INTEGER) AS days_ago
+                       CAST(julianday(?) - julianday({reference_date}) AS INTEGER) AS days_ago
                 FROM quotes q
+                LEFT JOIN shipment_snapshots ss ON ss.quote_id=q.id
                 JOIN batches b ON q.batch_id=b.id
                 JOIN products p ON b.product_id=p.id
                 LEFT JOIN customers c ON q.customer_id=c.id
-                WHERE q.status=? AND q.quote_date<=? AND q.deleted_at IS NULL
-                ORDER BY q.quote_date
+                WHERE q.status=? AND {reference_date}{cutoff_operator}? AND q.deleted_at IS NULL
+                ORDER BY {reference_date}
                 """,
                 (today, status, cutoff),
             ).fetchall()

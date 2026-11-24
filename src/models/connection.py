@@ -49,7 +49,7 @@ def connect(db_path: str | os.PathLike[str] | None = None, *, read_only: bool = 
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path)
     else:
-        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
